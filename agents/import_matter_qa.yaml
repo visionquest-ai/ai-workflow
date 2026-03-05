@@ -1,0 +1,163 @@
+# TEA YAML Agent - Import Matter Q&A Agent
+# Story: 15.2 - ImportMatter YAML Workflow Agent
+# Updated: Story 16.1 - Added context_node_id support
+#
+# Purpose: Orchestrates the full Q&A pipeline for a matter using only TEA
+# built-in patterns and the graphology custom action.
+# Fetches questions from graphology, runs parallel LLM calls,
+# and persists responses back to the graph.
+#
+# Key constraint: ZERO inline Python — all logic via `uses:` actions
+#
+# Rate Limiting (NFR-QA1):
+#   - max_concurrency: controls how many LLM calls run simultaneously
+#   - ratelimit.wrap: controls how fast requests are spaced (RPM/RPS)
+#   Both are configurable via settings.parallel and settings.rate_limiters.
+#
+# Usage modes:
+#   1. Via /run-agent (app.py pre-fetches context):
+#      POST /run-agent { "agent": "import_matter_qa", "workflow_id": "...", "context_node_id": "..." }
+#
+#   2. Direct TEA engine with context_node_id (agent self-fetches):
+#      input: { "workflow_id": "...", "matter_id": "...", "context_node_id": "..." }
+#
+#   3. Direct TEA engine with pre-loaded matter_context:
+#      input: { "workflow_id": "...", "matter_id": "...", "matter_context": "..." }
+
+name: import_matter_qa
+description: |
+  Executes all active prompts for the ImportMatter workflow.
+  Fetches questions from graphology via GraphQL, runs parallel LLM calls,
+  and persists responses back to the graph.
+
+settings:
+  llm:
+    model: gpt-5.2-chat
+    temperature: 0
+  parallel:
+    max_concurrency: 20
+  rate_limiters:
+    llm_qa:
+      rpm: 1000
+  opik:
+    project_name: "import-matter-qa"
+
+state_schema:
+  # Input (required)
+  workflow_id: str
+
+  # Input (optional — provide context_node_id OR matter_context)
+  context_node_id: str         # If set, agent fetches the node via graphology.get_node
+  matter_id: str               # Defaults to context_node_id if not provided
+  matter_context: str          # Text content of the matter document (JSON, markdown, plain text)
+  system_prompt: str           # Custom system prompt for LLM calls
+
+  # Intermediate
+  context_result: dict         # Result from graphology.get_node (when using context_node_id)
+  fetch_result: dict           # Result from graphology.get_questions
+  parallel_results: list       # Raw results from dynamic_parallel fan-out
+  answers: list                # Mapped responses from collect_answers
+  answer_count: int            # Count of collected answers
+
+  # Output
+  save_result: dict            # Result from graphology.save_responses
+  execution_ids: list          # Created PromptExecution IDs
+
+nodes:
+  # Node 0: Fetch context node if context_node_id is provided and matter_context is empty
+  # When called via /run-agent, matter_context is pre-populated so this is skipped.
+  - name: fetch_context
+    uses: graphology.get_node
+    with:
+      node_id: "{{ state.context_node_id }}"
+      graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
+    output: context_result
+
+  # Node 1: Fetch all active questions for the workflow
+  - name: fetch_questions
+    uses: graphology.get_questions
+    with:
+      workflow_id: "{{ state.workflow_id }}"
+      graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
+    output: fetch_result
+
+  # Node 2: Fan out parallel LLM calls — one per question
+  # Each branch gets the prompt item injected as `prompt` in state.
+  # max_concurrency controls how many branches run simultaneously.
+  # ratelimit.wrap inside the action controls time-based rate limiting (RPM).
+  # Partial failures are handled: failed branches produce ParallelFlowResult
+  # with success=False, which collect_answers maps to status="failed".
+  - name: answer_questions
+    type: dynamic_parallel
+    items: "{{ state.fetch_result.questions }}"
+    item_var: prompt
+    max_concurrency: "{{ settings.parallel.max_concurrency | default(10) }}"
+    fan_in: collect_answers
+    action:
+      uses: ratelimit.wrap
+      with:
+        action: llm.call
+        limiter: llm_qa
+        rpm: "{{ settings.rate_limiters.llm_qa.rpm | default(60) }}"
+        args:
+          model: "{{ settings.llm.model }}"
+          temperature: "{{ settings.llm.temperature }}"
+          messages:
+            - role: system
+              content: >-
+                {{ state.system_prompt | default(
+                  'You are an expert legal analyst. You will be given a matter document '
+                  'as context and a specific question about that matter. Answer the question '
+                  'based on the provided context with clear, detailed, and well-structured '
+                  'responses. Focus on the specific aspects requested.',
+                  true
+                ) }}
+            - role: user
+              content: >-
+                {% set context = state.matter_context or (state.context_result.data_json if state.context_result else '') %}{% if context %}MATTER CONTEXT:
+
+                {{ context }}
+
+                ---
+
+                QUESTION: {{ state.prompt.content }}{% else %}{{ state.prompt.content }}{% endif %}
+      output: llm_result
+
+  # Node 3: Fan-in — collect parallel results and map to response format
+  # Transforms ParallelFlowResult list into the format expected by
+  # graphology.save_responses (versionId, llmRequest, llmResponse, status).
+  - name: collect_answers
+    is_fan_in: true
+    uses: graphology.collect_answers
+    output: answers
+
+  # Node 4: Persist all responses to the graph
+  - name: save_responses
+    uses: graphology.save_responses
+    with:
+      workflow_id: "{{ state.workflow_id }}"
+      matter_id: "{{ state.matter_id or state.context_node_id }}"
+      responses: "{{ state.answers.answers }}"
+      graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
+    output: save_result
+
+edges:
+  - from: __start__
+    to: fetch_context
+    condition: "{{ state.context_node_id and not state.matter_context }}"
+  - from: __start__
+    to: fetch_questions
+    condition: "{{ state.matter_context or not state.context_node_id }}"
+  - from: fetch_context
+    to: fetch_questions
+  - from: fetch_questions
+    to: answer_questions
+  - from: answer_questions
+    to: collect_answers
+  - from: collect_answers
+    to: save_responses
+  - from: save_responses
+    to: __end__
+
+config:
+  raise_exceptions: false
