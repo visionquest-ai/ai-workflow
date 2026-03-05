@@ -1,0 +1,3 @@
+[submodule "the_edge_agent"]
+	path = the_edge_agent
+	url = https://github.com/fabceolin/the_edge_agent
