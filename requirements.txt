@@ -2,3 +2,4 @@ fastapi>=0.100.0
 uvicorn>=0.20.0
 requests>=2.28.0
 the-edge-agent>=0.9.90
+openai>=1.0.0
