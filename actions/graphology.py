@@ -553,8 +553,18 @@ query IntrospectRootQueryFields {
         name
         type {
           name
+          kind
           ofType {
             name
+            kind
+            ofType {
+              name
+              kind
+              ofType {
+                name
+                kind
+              }
+            }
           }
         }
       }
@@ -605,12 +615,13 @@ def _get_root_query_fields(url: str, api_key: str = None) -> Dict[str, str]:
     result = {}
     for field in fields:
         field_name = field.get("name", "")
+        # Unwrap NON_NULL/LIST wrappers to find the actual type name
+        # e.g., NON_NULL(LIST(NON_NULL(Workflow))) → "Workflow"
         type_info = field.get("type", {})
-        # Type name can be directly on type or wrapped in ofType (for [Type!]!)
         type_name = type_info.get("name")
-        if not type_name:
-            of_type = type_info.get("ofType") or {}
-            type_name = of_type.get("name")
+        while not type_name and type_info.get("ofType"):
+            type_info = type_info["ofType"]
+            type_name = type_info.get("name")
         if type_name and not field_name.startswith("__"):
             result[field_name] = type_name
     return result

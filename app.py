@@ -27,6 +27,7 @@ if ACTIONS_DIR not in sys.path:
 # Import get_node from graphology actions
 from graphology import get_node, register_actions
 
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 @asynccontextmanager
@@ -135,13 +136,22 @@ def _load_and_run_agent(
 
         final_state = None
         for event in graph.invoke(input_state):
+            logger.info(f"TEA event type: {type(event).__name__}")
             final_state = event
 
         execution_ids = []
         if final_state and isinstance(final_state, dict):
-            save_result = final_state.get("save_result", {})
+            # TEA returns {"type": ..., "state": {...}, "output": ...}
+            # The actual agent state is nested under "state" key
+            agent_state = final_state.get("state", final_state)
+            save_result = agent_state.get("save_result", {})
             if isinstance(save_result, dict):
                 execution_ids = save_result.get("executionIds", [])
+            logger.info(f"Final state keys: {list(final_state.keys())}")
+            logger.info(f"Agent state keys: {list(agent_state.keys()) if isinstance(agent_state, dict) else 'N/A'}")
+            logger.info(f"save_result: {save_result}")
+        else:
+            logger.warning(f"Unexpected final_state type: {type(final_state)}, value: {str(final_state)[:500]}")
 
         return {
             "success": True,
