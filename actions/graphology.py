@@ -681,6 +681,7 @@ def _find_node_type(
     """
     # Check priority types first to avoid brute-forcing all ~250 types
     PRIORITY_TYPES = [
+        "ApplicationFormFile",
         "Submission", "Matter", "Company", "Workflow", "Prompt",
         "PromptExecution", "PromptVersion", "Step", "PromptOutput",
     ]
@@ -790,6 +791,108 @@ def get_node(
 
 
 # =============================================================================
+# update_node ACTION
+# =============================================================================
+
+def _pluralize(name: str) -> str:
+    """Simple pluralization for GraphQL type names."""
+    if name.endswith("s"):
+        return name + "es"
+    if name.endswith("y") and not name.endswith(("ay", "ey", "oy", "uy")):
+        return name[:-1] + "ies"
+    return name + "s"
+
+
+def update_node(
+    state: Dict[str, Any],
+    node_id: str,
+    node_type: str,
+    updates: Dict[str, Any],
+    **kwargs,
+) -> Dict[str, Any]:
+    """
+    Update scalar fields on a graph node by ID via GraphQL mutation.
+
+    TEA Custom Action: graphology.update_node
+
+    Uses the Neo4j GraphQL convention: update<PluralType>(where: {id: $id},
+    update: {field_SET: value}) to update scalar fields.
+
+    Args:
+        state: Current agent state
+        node_id: ID of the node to update
+        node_type: GraphQL type name (e.g. "ApplicationFormFile")
+        updates: Dict of field names to new values (e.g. {"payload": "..."})
+        graphql_url: (optional kwarg) GraphQL endpoint URL
+
+    Returns:
+        Dict with success, updated field count
+    """
+    logger.info(f"graphology.update_node: node_id={node_id}, type={node_type}, fields={list(updates.keys())}")
+
+    if not node_id:
+        return {"success": False, "error": "node_id is required"}
+    if not node_type:
+        return {"success": False, "error": "node_type is required"}
+    if not updates:
+        return {"success": False, "error": "updates dict is required and must not be empty"}
+
+    url = _get_graphql_url(kwargs, state)
+    api_key = _get_graphql_api_key(kwargs, state)
+
+    # Build _SET update fields
+    update_fields = {}
+    for field_name, value in updates.items():
+        update_fields[f"{field_name}_SET"] = value
+
+    # Build mutation
+    plural_type = _pluralize(node_type)
+    # Mutation name: update + PluralType (e.g. updateApplicationFormFiles)
+    mutation_name = f"update{plural_type}"
+    # Return fields: the updated scalar fields we set
+    return_fields = " ".join(updates.keys()) + " id"
+
+    # Use lowercase first char for the result field accessor
+    result_field = plural_type[0].lower() + plural_type[1:]
+
+    mutation = f"""
+    mutation UpdateNode($where: {node_type}Where!, $update: {node_type}UpdateInput!) {{
+      {mutation_name}(where: $where, update: $update) {{
+        {result_field} {{ {return_fields} }}
+      }}
+    }}
+    """
+
+    variables = {
+        "where": {"id": node_id},
+        "update": update_fields,
+    }
+
+    try:
+        data = _execute_graphql(url, mutation, variables, api_key=api_key)
+    except (ConnectionError, RuntimeError) as e:
+        logger.error(f"graphology.update_node failed: {e}")
+        return {"success": False, "error": str(e)}
+
+    results = data.get(mutation_name, {}).get(result_field, [])
+    if not results:
+        return {"success": False, "error": f"No node returned after update: {node_id}"}
+
+    logger.info(
+        f"graphology.update_node: Updated {len(updates)} field(s) on "
+        f"{node_type} {node_id}"
+    )
+
+    return {
+        "success": True,
+        "node_id": node_id,
+        "node_type": node_type,
+        "updated_fields": list(updates.keys()),
+        "data": results[0],
+    }
+
+
+# =============================================================================
 # ACTION REGISTRATION
 # =============================================================================
 
@@ -805,9 +908,11 @@ def register_actions(registry: Dict[str, Callable], engine: Any) -> None:
     registry["graphology.save_responses"] = save_workflow_responses
     registry["graphology.collect_answers"] = collect_parallel_answers
     registry["graphology.get_node"] = get_node
+    registry["graphology.update_node"] = update_node
 
     logger.info(
         "Graphology actions registered: "
         "graphology.get_questions, graphology.save_responses, "
-        "graphology.collect_answers, graphology.get_node"
+        "graphology.collect_answers, graphology.get_node, "
+        "graphology.update_node"
     )
