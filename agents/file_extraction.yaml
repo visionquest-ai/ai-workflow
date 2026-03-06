@@ -1,0 +1,183 @@
+# TEA YAML Agent - File Extraction Agent
+#
+# Purpose: Extracts structured data from ApplicationFormFile nodes using LlamaExtract.
+# Fetches the file via storageUrl, sends to LlamaExtract (BALANCED mode),
+# and persists the extraction result back to the node's payload field via GraphQL.
+#
+# Usage:
+#   POST /run-agent {
+#     "agent": "file_extraction",
+#     "workflow_id": "<workflow-id>",
+#     "context_node_id": "<ApplicationFormFile-node-id>"
+#   }
+
+name: file_extraction
+description: |
+  Extracts structured data from an ApplicationFormFile using LlamaExtract.
+  Reads storageUrl, sends to LlamaExtract with BALANCED mode,
+  and saves the result to the payload field on the same node.
+
+settings:
+  llamaextract:
+    mode: BALANCED
+    timeout: 300
+    max_retries: 3
+
+state_schema:
+  # Input (required)
+  workflow_id: str
+  context_node_id: str
+
+  # Intermediate
+  context_result: dict       # Result from graphology.get_node
+  storage_url: str           # Extracted from node data (gs:// or http://)
+  directory_name: str        # Extracted from node data
+  file_base64: str           # Base64-encoded file content for LlamaExtract
+  file_mime_type: str        # MIME type of the file
+  extract_result: dict       # Result from llamaextract.extract
+  payload_json: str          # Serialized extraction result
+
+  # Output
+  update_result: dict        # Result from graphology.update_node
+
+nodes:
+  # Step 1: Fetch the ApplicationFormFile node to get storageUrl and directoryName
+  - name: fetch_file_node
+    uses: graphology.get_node
+    with:
+      node_id: "{{ state.context_node_id }}"
+      graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
+    output: context_result
+
+  # Step 2: Extract storageUrl and directoryName, download file from GCS
+  - name: extract_and_download
+    run: |
+      import base64
+      import os
+
+      data = state.get("context_result", {}).get("data", {})
+      storage_url = data.get("storageUrl", "")
+      directory_name = data.get("directoryName", "")
+      mime_type = data.get("mimeType", "application/octet-stream")
+      node_type = state.get("context_result", {}).get("node_type", "")
+
+      if not storage_url:
+          return {"error": "ApplicationFormFile has no storageUrl", "storage_url": "", "directory_name": ""}
+
+      if node_type != "ApplicationFormFile":
+          return {"error": f"Expected ApplicationFormFile, got {node_type}", "storage_url": "", "directory_name": ""}
+
+      # If storage_url is gs://, download via GCS and encode as base64
+      if storage_url.startswith("gs://"):
+          try:
+              import fsspec
+              fs = fsspec.filesystem("gs")
+              with fs.open(storage_url, "rb") as f:
+                  file_bytes = f.read()
+              file_b64 = base64.b64encode(file_bytes).decode("utf-8")
+              data_uri = f"data:{mime_type};base64,{file_b64}"
+              return {
+                  "storage_url": data_uri,
+                  "directory_name": directory_name or "",
+                  "file_mime_type": mime_type,
+              }
+          except Exception as e:
+              return {"error": f"Failed to download from GCS: {e}", "storage_url": "", "directory_name": ""}
+
+      # HTTP/HTTPS URLs can be passed directly to LlamaExtract
+      return {"storage_url": storage_url, "directory_name": directory_name or "", "file_mime_type": mime_type}
+
+  # Step 3: Send file to LlamaExtract for processing
+  - name: run_extraction
+    uses: llamaextract.extract
+    with:
+      file: "{{ state.storage_url }}"
+      mode: "{{ settings.llamaextract.mode }}"
+      timeout: "{{ settings.llamaextract.timeout }}"
+      max_retries: "{{ settings.llamaextract.max_retries }}"
+      use_rest: true
+      schema:
+        type: object
+        properties:
+          title:
+            type: string
+            description: "Document title or heading"
+          sections:
+            type: array
+            items:
+              type: object
+              properties:
+                heading:
+                  type: string
+                content:
+                  type: string
+          tables:
+            type: array
+            items:
+              type: object
+              properties:
+                caption:
+                  type: string
+                headers:
+                  type: array
+                  items:
+                    type: string
+                rows:
+                  type: array
+                  items:
+                    type: array
+                    items:
+                      type: string
+          metadata:
+            type: object
+            properties:
+              author:
+                type: string
+              date:
+                type: string
+              category:
+                type: string
+    output: extract_result
+
+  # Step 4: Serialize extraction result to JSON string
+  - name: prepare_payload
+    run: |
+      import json
+      extract_result = state.get("extract_result", {})
+      if extract_result.get("success"):
+          payload = json.dumps(extract_result.get("data", {}))
+      else:
+          payload = json.dumps({"error": extract_result.get("error", "Extraction failed"), "status": "failed"})
+      return {"payload_json": payload}
+
+  # Step 5: Save extraction result back to the node via GraphQL
+  - name: save_payload
+    uses: graphology.update_node
+    with:
+      node_id: "{{ state.context_node_id }}"
+      node_type: "ApplicationFormFile"
+      updates:
+        payload: "{{ state.payload_json }}"
+      graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
+    output: update_result
+
+edges:
+  - from: __start__
+    to: fetch_file_node
+  - from: fetch_file_node
+    to: extract_and_download
+  - from: extract_and_download
+    to: run_extraction
+    condition: "{{ state.storage_url }}"
+  - from: extract_and_download
+    to: __end__
+    condition: "{{ not state.storage_url }}"
+  - from: run_extraction
+    to: prepare_payload
+  - from: prepare_payload
+    to: save_payload
+  - from: save_payload
+    to: __end__
+
+config:
+  raise_exceptions: false
