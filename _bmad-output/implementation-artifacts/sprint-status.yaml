@@ -53,3 +53,10 @@ development_status:
   14-2-file-extraction-agent-hardening: review
   14-3-docker-and-deployment-readiness: done
   epic-14-retrospective: optional
+
+  # Epic 1: Law Firm Website Scraper Agent
+  epic-1: in-progress
+  1-1-fetch-legalfirm-node-and-validate-input: done
+  1-2-scrape-website-via-scrapegraphai: done
+  1-3-persist-extraction-result-to-websitepayload: done
+  epic-1-retrospective: optional

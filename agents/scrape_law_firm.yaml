@@ -1,0 +1,242 @@
+# TEA YAML Agent - Law Firm Website Scraper
+#
+# Purpose: Fetches a LegalFirm node by ID, validates it has a website URL,
+# scrapes the site via ScrapeGraphAI, extracts structured firm data,
+# and persists the result to the websitePayload field via GraphQL.
+#
+# Reference: Based on agents/file_extraction.yaml patterns (NFR5)
+#
+# Usage:
+#   POST /run-agent {
+#     "agent": "scrape_law_firm",
+#     "context_node_id": "<LegalFirm-node-id>"
+#   }
+
+name: scrape_law_firm
+description: |
+  Fetches a LegalFirm node from Graphology, validates it has a website URL,
+  and extracts key fields for downstream scraping and persistence.
+
+state_schema:
+  # Input (required)
+  context_node_id: str
+
+  # Intermediate
+  context_result: dict       # Result from graphology.get_node
+  website_url: str           # Extracted website URL
+
+  # Scraping
+  scrape_result: dict        # Result from web.ai_scrape
+  scrape_data_json: str      # Serialized extraction for persistence
+  scrape_failed: bool        # Whether scrape failed (for finalize logic)
+
+  # Persistence
+  update_result: dict        # Result from graphology.update_node
+
+  # Output
+  status: str                # success, error
+  error: str                 # Error message if failed
+  completed: bool            # Completion signal
+
+nodes:
+  # Step 1: Fetch the LegalFirm node from Graphology
+  - name: fetch_node
+    uses: graphology.get_node
+    with:
+      node_id: "{{ state.context_node_id }}"
+      graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
+    output: context_result
+
+  # Step 2: Validate input — check node type, website presence
+  - name: validate_input
+    run: |
+      context_result = state.get("context_result", {})
+
+      # Check if graphology call itself failed (server down, 503, etc.)
+      if not context_result.get("success", True):
+          error_msg = context_result.get("error", "Failed to fetch node from graphology")
+          return {"error": error_msg, "status": "error", "completed": True}
+
+      node_type = context_result.get("node_type", "")
+      if node_type != "LegalFirm":
+          return {"error": f"Expected LegalFirm, got {node_type}", "status": "error", "completed": True}
+
+      data = context_result.get("data", {})
+      website = data.get("website", "")
+      if not website:
+          return {"error": "LegalFirm has no website URL", "status": "error", "completed": True}
+
+      # Success — extract fields for downstream use
+      return {
+          "website_url": website,
+          "status": "success",
+      }
+
+  # Step 3: Scrape the law firm website using ScrapeGraphAI
+  - name: scrape_website
+    uses: web.ai_scrape
+    with:
+      url: "{{ state.website_url }}"
+      prompt: >
+        Extract comprehensive law firm information from this website.
+        Look for: firm name, founding year, contact details, partners/lawyers,
+        office locations, practice areas, awards, and any available biographical
+        information about key personnel. Check the About, Team, Contact, and
+        Practice Areas pages if available.
+      output_schema:
+        type: object
+        properties:
+          firmName:
+            type: string
+            description: Official registered name of the law firm
+          foundedYear:
+            type: string
+            description: Year the firm was founded in YYYY format, or null
+          website:
+            type: string
+            description: Official website URL
+          linkedin:
+            type: string
+            description: LinkedIn profile URL, or null
+          businessModel:
+            type: string
+            description: "One of: corporate-firm, boutique-firm, full-service, specialist, virtual, alternative-legal-provider"
+          description:
+            type: string
+            description: Brief 2-3 sentence description of the firm
+          country:
+            type: string
+            description: ISO 3166-1 alpha-3 country code (e.g., BRA, USA)
+          city:
+            type: string
+            description: Headquarters city
+          state:
+            type: string
+            description: ISO 3166-2 state/region code (e.g., BR-SP)
+          totalLawyers:
+            type: integer
+            description: Total number of lawyers, or null
+          totalPartners:
+            type: integer
+            description: Total number of partners, or null
+          mainEmail:
+            type: string
+            description: Main contact email address
+          mainPhone:
+            type: string
+            description: Main contact phone number
+          managingPartners:
+            type: array
+            items:
+              type: object
+              properties:
+                title:
+                  type: string
+                firstName:
+                  type: string
+                surname:
+                  type: string
+                email:
+                  type: string
+                phone:
+                  type: string
+                role:
+                  type: string
+                isManagingPartner:
+                  type: boolean
+                biography:
+                  type: string
+                employmentStartDate:
+                  type: string
+          offices:
+            type: array
+            items:
+              type: object
+              properties:
+                city:
+                  type: string
+                state:
+                  type: string
+                country:
+                  type: string
+                address:
+                  type: string
+                phone:
+                  type: string
+                isHeadOffice:
+                  type: boolean
+          practiceAreas:
+            type: array
+            items:
+              type: string
+          awards:
+            type: array
+            items:
+              type: string
+    output: scrape_result
+
+  # Step 4: Process scrape result — handle success/error/partial
+  - name: process_scrape_result
+    run: |
+      import json
+
+      scrape_result = state.get("scrape_result", {})
+
+      # Check if the scrape call failed — serialize error for persistence (AC #2)
+      if not scrape_result.get("success"):
+          error_msg = scrape_result.get("error", "ScrapeGraphAI scrape failed")
+          error_payload = json.dumps({"error": error_msg, "status": "failed"})
+          return {"scrape_data_json": error_payload, "scrape_failed": True, "status": "error", "error": error_msg}
+
+      # Success (full or partial) — serialize data to JSON (AC #1)
+      data = scrape_result.get("data", {})
+      scrape_data_json = json.dumps(data, ensure_ascii=False)
+
+      return {"scrape_data_json": scrape_data_json, "scrape_failed": False, "status": "success"}
+
+  # Step 5: Save extraction result to LegalFirm node via GraphQL
+  - name: save_payload
+    uses: graphology.update_node
+    with:
+      node_id: "{{ state.context_node_id }}"
+      node_type: "LegalFirm"
+      updates:
+        websitePayload: "{{ state.scrape_data_json }}"
+      graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
+    output: update_result
+
+  # Step 6: Finalize — determine completion status
+  - name: finalize
+    run: |
+      update_result = state.get("update_result", {})
+      scrape_failed = state.get("scrape_failed", False)
+
+      if update_result.get("success"):
+          if scrape_failed:
+              return {"completed": True, "status": "error", "error": "Scrape failed but error persisted to node"}
+          return {"completed": True, "status": "success"}
+      else:
+          return {"completed": True, "status": "error", "error": update_result.get("error", "Failed to save payload")}
+
+edges:
+  - from: __start__
+    to: fetch_node
+  - from: fetch_node
+    to: validate_input
+  - from: validate_input
+    to: __end__
+    condition: "{{ state.completed }}"
+  - from: validate_input
+    to: scrape_website
+    condition: "{{ not state.completed }}"
+  - from: scrape_website
+    to: process_scrape_result
+  - from: process_scrape_result
+    to: save_payload
+  - from: save_payload
+    to: finalize
+  - from: finalize
+    to: __end__
+
+config:
+  raise_exceptions: false
