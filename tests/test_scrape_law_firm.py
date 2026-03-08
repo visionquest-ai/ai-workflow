@@ -86,8 +86,8 @@ class TestYamlStructureCompliance:
     """AC6: Verify agent file follows file_extraction.yaml conventions."""
 
     def test_has_required_top_level_sections(self, agent_def):
-        """Agent YAML has name, description, state_schema, nodes, edges, config."""
-        required = ["name", "description", "state_schema", "nodes", "edges", "config"]
+        """Agent YAML has name, description, state_schema, nodes, config."""
+        required = ["name", "description", "state_schema", "nodes", "config"]
         for key in required:
             assert key in agent_def, f"Missing required top-level key: {key}"
 
@@ -160,68 +160,40 @@ class TestYamlStructureCompliance:
         assert node is not None, "Missing process_scrape_result node"
         assert "run" in node, "process_scrape_result must be a run: block"
 
-    def test_edges_start_to_fetch(self, agent_def):
-        """__start__ -> fetch_node edge exists."""
-        edges = agent_def["edges"]
-        assert any(e["from"] == "__start__" and e["to"] == "fetch_node" for e in edges)
+    def test_node_order_implicit_chaining(self, agent_def):
+        """Nodes are in correct order for implicit chaining (goto replaces edges)."""
+        node_names = [n["name"] for n in agent_def["nodes"]]
+        expected_order = [
+            "fetch_node", "validate_input", "scrape_website",
+            "process_scrape_result", "save_payload", "finalize",
+        ]
+        assert node_names == expected_order
 
-    def test_edges_fetch_to_validate(self, agent_def):
-        """fetch_node -> validate_input edge exists."""
-        edges = agent_def["edges"]
-        assert any(e["from"] == "fetch_node" and e["to"] == "validate_input" for e in edges)
+    def test_validate_input_goto_end_on_completed(self, agent_def):
+        """validate_input has conditional goto __end__ when completed."""
+        node = _get_node(agent_def, "validate_input")
+        goto = node.get("goto")
+        assert isinstance(goto, list), "validate_input must have conditional goto list"
+        end_rule = next((r for r in goto if r.get("to") == "__end__"), None)
+        assert end_rule is not None, "Missing goto __end__ rule"
+        assert "completed" in end_rule.get("if", ""), "goto __end__ must check completed"
 
-    def test_edges_validate_error_to_end(self, agent_def):
-        """validate_input -> __end__ edge exists for error path (completed=true)."""
-        edges = agent_def["edges"]
-        assert any(
-            e["from"] == "validate_input"
-            and e["to"] == "__end__"
-            and "state.completed" in e.get("condition", "")
-            and "not" not in e.get("condition", "")
-            for e in edges
-        )
+    def test_validate_input_goto_scrape_fallback(self, agent_def):
+        """validate_input has fallback goto scrape_website."""
+        node = _get_node(agent_def, "validate_input")
+        goto = node["goto"]
+        fallback = goto[-1]
+        assert fallback.get("to") == "scrape_website"
+        assert "if" not in fallback, "Fallback goto must be unconditional"
 
-    def test_edges_validate_success_to_scrape(self, agent_def):
-        """AC6/Task 4.1: validate_input success path routes to scrape_website (not __end__)."""
-        edges = agent_def["edges"]
-        assert any(
-            e["from"] == "validate_input"
-            and e["to"] == "scrape_website"
-            and "not state.completed" in e.get("condition", "")
-            for e in edges
-        )
+    def test_finalize_goto_end(self, agent_def):
+        """finalize has goto __end__."""
+        node = _get_node(agent_def, "finalize")
+        assert node.get("goto") == "__end__"
 
-    def test_edges_scrape_to_process(self, agent_def):
-        """Task 4.2: scrape_website -> process_scrape_result edge exists."""
-        edges = agent_def["edges"]
-        assert any(
-            e["from"] == "scrape_website" and e["to"] == "process_scrape_result"
-            for e in edges
-        )
-
-    def test_edges_process_to_save_payload(self, agent_def):
-        """AC5/Task 5.1+5.2: process_scrape_result routes to save_payload (both paths)."""
-        edges = agent_def["edges"]
-        assert any(
-            e["from"] == "process_scrape_result" and e["to"] == "save_payload"
-            for e in edges
-        )
-
-    def test_edges_save_payload_to_finalize(self, agent_def):
-        """AC5/Task 5.3: save_payload -> finalize edge exists."""
-        edges = agent_def["edges"]
-        assert any(
-            e["from"] == "save_payload" and e["to"] == "finalize"
-            for e in edges
-        )
-
-    def test_edges_finalize_to_end(self, agent_def):
-        """AC5/Task 5.4: finalize -> __end__ edge exists."""
-        edges = agent_def["edges"]
-        assert any(
-            e["from"] == "finalize" and e["to"] == "__end__"
-            for e in edges
-        )
+    def test_no_legacy_edges_section(self, agent_def):
+        """Agent uses goto (not deprecated edges section)."""
+        assert "edges" not in agent_def, "Agent should use goto instead of deprecated edges"
 
     def test_has_save_payload_node(self, agent_def):
         """AC5: save_payload uses graphology.update_node with correct params."""
@@ -617,38 +589,27 @@ class TestSavePayloadStructure:
 # Edge wiring tests (Story 1.3 — AC #5, Task 6.6)
 # =============================================================================
 
-class TestEdgeWiringStory13:
-    """Task 6.6: Verify edge wiring after story 1.3 changes."""
+class TestFlowWiringStory13:
+    """Task 6.6: Verify flow wiring after story 1.3 (uses goto + implicit chaining)."""
 
-    def test_process_scrape_result_no_longer_routes_to_end(self, agent_def):
-        """Task 6.6: process_scrape_result should NOT route to __end__ anymore."""
-        edges = agent_def["edges"]
-        assert not any(
-            e["from"] == "process_scrape_result" and e["to"] == "__end__"
-            for e in edges
-        )
+    def test_process_scrape_result_no_goto_to_end(self, agent_def):
+        """Task 6.6: process_scrape_result should NOT route to __end__."""
+        node = _get_node(agent_def, "process_scrape_result")
+        assert node.get("goto") is None, "process_scrape_result should use implicit chaining to save_payload"
 
-    def test_validate_input_error_still_routes_to_end(self, agent_def):
-        """Task 5.5: validate_input error → __end__ unchanged."""
-        edges = agent_def["edges"]
-        assert any(
-            e["from"] == "validate_input" and e["to"] == "__end__"
-            for e in edges
-        )
+    def test_validate_input_error_routes_to_end(self, agent_def):
+        """Task 5.5: validate_input error → __end__ via goto."""
+        node = _get_node(agent_def, "validate_input")
+        goto = node.get("goto")
+        assert isinstance(goto, list)
+        assert any(r.get("to") == "__end__" for r in goto)
 
-    def test_full_flow_edges(self, agent_def):
-        """Verify complete flow: __start__ → fetch → validate → scrape → process → save → finalize → __end__."""
-        edges = agent_def["edges"]
-        expected_pairs = [
-            ("__start__", "fetch_node"),
-            ("fetch_node", "validate_input"),
-            ("validate_input", "scrape_website"),
-            ("scrape_website", "process_scrape_result"),
-            ("process_scrape_result", "save_payload"),
-            ("save_payload", "finalize"),
-            ("finalize", "__end__"),
-        ]
-        for from_node, to_node in expected_pairs:
-            assert any(
-                e["from"] == from_node and e["to"] == to_node for e in edges
-            ), f"Missing edge: {from_node} -> {to_node}"
+    def test_full_flow_order(self, agent_def):
+        """Verify complete flow order via implicit chaining + goto."""
+        node_names = [n["name"] for n in agent_def["nodes"]]
+        expected = ["fetch_node", "validate_input", "scrape_website",
+                     "process_scrape_result", "save_payload", "finalize"]
+        assert node_names == expected
+        # finalize explicitly goes to __end__
+        finalize = _get_node(agent_def, "finalize")
+        assert finalize.get("goto") == "__end__"

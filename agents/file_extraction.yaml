@@ -71,6 +71,10 @@ nodes:
 
   # Step 2: Download file from GCS and convert Word docs to PDF
   - name: extract_and_download
+    goto:
+      - if: "not state.storage_url"
+        to: __end__
+      - to: resolve_agent
     run: |
       import os
       import tempfile
@@ -164,6 +168,10 @@ nodes:
 
   # Step 3: Resolve LlamaExtract agent name from directoryName
   - name: resolve_agent
+    goto:
+      - if: "not state.agent_name_used"
+        to: __end__
+      - to: run_extraction
     run: |
       import os
       import re
@@ -253,38 +261,13 @@ nodes:
 
   # Step 7: Finalize
   - name: finalize
+    goto: __end__
     run: |
       update_result = state.get("update_result", {})
       if update_result.get("success"):
           return {"completed": True, "status": "success"}
       else:
           return {"completed": True, "status": "error", "error": update_result.get("error", "Failed to save payload")}
-
-edges:
-  - from: __start__
-    to: fetch_file_node
-  - from: fetch_file_node
-    to: extract_and_download
-  - from: extract_and_download
-    to: resolve_agent
-    condition: "{{ state.storage_url }}"
-  - from: extract_and_download
-    to: __end__
-    condition: "{{ not state.storage_url }}"
-  - from: resolve_agent
-    to: run_extraction
-    condition: "{{ state.agent_name_used }}"
-  - from: resolve_agent
-    to: __end__
-    condition: "{{ not state.agent_name_used }}"
-  - from: run_extraction
-    to: prepare_payload
-  - from: prepare_payload
-    to: save_payload
-  - from: save_payload
-    to: finalize
-  - from: finalize
-    to: __end__
 
 config:
   raise_exceptions: false

@@ -49,6 +49,10 @@ nodes:
 
   # Step 2: Validate input — check node type, website presence
   - name: validate_input
+    goto:
+      - if: "state.completed"
+        to: __end__
+      - to: scrape_website
     run: |
       context_result = state.get("context_result", {})
 
@@ -207,6 +211,7 @@ nodes:
 
   # Step 6: Finalize — determine completion status
   - name: finalize
+    goto: __end__
     run: |
       update_result = state.get("update_result", {})
       scrape_failed = state.get("scrape_failed", False)
@@ -217,26 +222,6 @@ nodes:
           return {"completed": True, "status": "success"}
       else:
           return {"completed": True, "status": "error", "error": update_result.get("error", "Failed to save payload")}
-
-edges:
-  - from: __start__
-    to: fetch_node
-  - from: fetch_node
-    to: validate_input
-  - from: validate_input
-    to: __end__
-    condition: "{{ state.completed }}"
-  - from: validate_input
-    to: scrape_website
-    condition: "{{ not state.completed }}"
-  - from: scrape_website
-    to: process_scrape_result
-  - from: process_scrape_result
-    to: save_payload
-  - from: save_payload
-    to: finalize
-  - from: finalize
-    to: __end__
 
 config:
   raise_exceptions: false
