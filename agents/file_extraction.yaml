@@ -75,7 +75,6 @@ nodes:
   - name: extract_and_download
     run: |
       import os
-      import subprocess
       import tempfile
 
       data = state.get("context_result", {}).get("data", {})
@@ -132,18 +131,12 @@ nodes:
       # Convert Word docs to PDF — LlamaExtract has a bug parsing docx (parse_job_id=None, 0 pages extracted)
       if ext in (".doc", ".docx"):
           try:
-              outdir = os.path.dirname(local_path)
-              result = subprocess.run(
-                  ["soffice", "--headless", "--convert-to", "pdf", "--outdir", outdir, local_path],
-                  capture_output=True, text=True, timeout=60
-              )
+              from docx2pdf import convert
               pdf_path = local_path.rsplit(".", 1)[0] + ".pdf"
-              if os.path.exists(pdf_path):
-                  os.unlink(local_path)
-                  local_path = pdf_path
-                  mime_type = "application/pdf"
-              else:
-                  return {"error": f"PDF conversion failed: {result.stderr}", "storage_url": "", "status": "error", "completed": True}
+              convert(local_path, pdf_path)
+              os.unlink(local_path)
+              local_path = pdf_path
+              mime_type = "application/pdf"
           except Exception as e:
               return {"error": f"PDF conversion error: {e}", "storage_url": "", "status": "error", "completed": True}
 
