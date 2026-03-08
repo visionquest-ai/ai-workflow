@@ -136,9 +136,17 @@ nodes:
       # Convert Word docs to PDF — LlamaExtract has a bug parsing docx (parse_job_id=None, 0 pages extracted)
       if ext in (".doc", ".docx"):
           try:
-              from docx2pdf import convert
+              import subprocess
+              pdf_dir = os.path.dirname(local_path)
+              result = subprocess.run(
+                  ["libreoffice", "--headless", "--convert-to", "pdf", "--outdir", pdf_dir, local_path],
+                  capture_output=True, text=True, timeout=120
+              )
+              if result.returncode != 0:
+                  raise RuntimeError(f"LibreOffice exited {result.returncode}: {result.stderr}")
               pdf_path = local_path.rsplit(".", 1)[0] + ".pdf"
-              convert(local_path, pdf_path)
+              if not os.path.exists(pdf_path):
+                  raise RuntimeError(f"PDF not created. stdout: {result.stdout}")
               os.unlink(local_path)
               local_path = pdf_path
               mime_type = "application/pdf"
