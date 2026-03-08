@@ -35,10 +35,10 @@ settings:
     model: gpt-5.2-chat
     temperature: 0
   parallel:
-    max_concurrency: 20
+    max_concurrency: 5
   rate_limiters:
     llm_qa:
-      rpm: 1000
+      rpm: 60
   opik:
     project_name: "import-matter-qa"
 
