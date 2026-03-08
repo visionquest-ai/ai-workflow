@@ -1,8 +1,13 @@
 # TEA YAML Agent - File Extraction Agent
 #
 # Purpose: Extracts structured data from ApplicationFormFile nodes using LlamaExtract.
-# Fetches the file via storageUrl, sends to LlamaExtract (BALANCED mode),
+# Fetches the file via storageUrl, converts Word docs (.doc/.docx) to PDF,
+# sends to a pre-created LlamaExtract agent (selected by directoryName),
 # and persists the extraction result back to the node's payload field via GraphQL.
+#
+# Reference: Based on spa-base/firebase/functions-agents/agents/file_extraction_agent.yaml
+# Agent naming: rankellix-{base_name}-{mode} (same agents as spa-base)
+# Upload script: spa-base/scripts/rankellix/upload_to_llamaextract.py
 #
 # Usage:
 #   POST /run-agent {
@@ -14,14 +19,28 @@
 name: file_extraction
 description: |
   Extracts structured data from an ApplicationFormFile using LlamaExtract.
-  Reads storageUrl, sends to LlamaExtract with BALANCED mode,
-  and saves the result to the payload field on the same node.
+  Reads storageUrl, downloads from GCS, converts Word docs to PDF,
+  resolves the LlamaExtract agent from directoryName, extracts,
+  and saves the result to payload.
 
 settings:
   llamaextract:
     mode: BALANCED
     timeout: 300
     max_retries: 3
+
+variables:
+  # Mapping from directoryName to LlamaExtract agent base name
+  # Agent name format: rankellix-{base_name}-{mode}
+  # Agents created via: spa-base/scripts/rankellix/upload_to_llamaextract.py
+  agent_base_names:
+    chambers: chambers-partners
+    iflr1000: iflr-1000
+    legal500: the-legal-500
+    "legal 500": the-legal-500
+    itr: itr-world-tax
+    leadersleague: leaders-league
+    "leaders league": leaders-league
 
 state_schema:
   # Input (required)
@@ -30,15 +49,18 @@ state_schema:
 
   # Intermediate
   context_result: dict       # Result from graphology.get_node
-  storage_url: str           # Extracted from node data (gs:// or http://)
+  storage_url: str           # Local file path after download
   directory_name: str        # Extracted from node data
-  file_base64: str           # Base64-encoded file content for LlamaExtract
   file_mime_type: str        # MIME type of the file
+  agent_name_used: str       # Resolved LlamaExtract agent name
   extract_result: dict       # Result from llamaextract.extract
   payload_json: str          # Serialized extraction result
 
   # Output
   update_result: dict        # Result from graphology.update_node
+  status: str                # success, error
+  error: str                 # Error message if failed
+  completed: bool            # Completion signal
 
 nodes:
   # Step 1: Fetch the ApplicationFormFile node to get storageUrl and directoryName
@@ -49,108 +71,167 @@ nodes:
       graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
     output: context_result
 
-  # Step 2: Extract storageUrl and directoryName, download file from GCS
+  # Step 2: Download file from GCS and convert Word docs to PDF
   - name: extract_and_download
     run: |
-      import base64
       import os
+      import subprocess
+      import tempfile
 
       data = state.get("context_result", {}).get("data", {})
       storage_url = data.get("storageUrl", "")
       directory_name = data.get("directoryName", "")
+      file_name = data.get("fileName", "")
       mime_type = data.get("mimeType", "application/octet-stream")
       node_type = state.get("context_result", {}).get("node_type", "")
 
       if not storage_url:
-          return {"error": "ApplicationFormFile has no storageUrl", "storage_url": "", "directory_name": ""}
+          return {"error": "ApplicationFormFile has no storageUrl", "storage_url": "", "status": "error", "completed": True}
 
       if node_type != "ApplicationFormFile":
-          return {"error": f"Expected ApplicationFormFile, got {node_type}", "storage_url": "", "directory_name": ""}
+          return {"error": f"Expected ApplicationFormFile, got {node_type}", "storage_url": "", "status": "error", "completed": True}
 
-      # If storage_url is gs://, download via GCS and encode as base64
+      if not directory_name:
+          return {"error": "ApplicationFormFile has no directoryName — cannot resolve LlamaExtract agent", "storage_url": "", "status": "error", "completed": True}
+
+      # Determine file extension from fileName or storageUrl
+      ext = ""
+      for source in [file_name, storage_url]:
+          if "." in source:
+              ext = "." + source.rsplit(".", 1)[-1].lower()
+              break
+
+      # Download from GCS
+      local_path = None
       if storage_url.startswith("gs://"):
           try:
               import fsspec
               fs = fsspec.filesystem("gs")
+              tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
               with fs.open(storage_url, "rb") as f:
-                  file_bytes = f.read()
-              file_b64 = base64.b64encode(file_bytes).decode("utf-8")
-              data_uri = f"data:{mime_type};base64,{file_b64}"
-              return {
-                  "storage_url": data_uri,
-                  "directory_name": directory_name or "",
-                  "file_mime_type": mime_type,
-              }
+                  tmp.write(f.read())
+              tmp.close()
+              local_path = tmp.name
           except Exception as e:
-              return {"error": f"Failed to download from GCS: {e}", "storage_url": "", "directory_name": ""}
+              return {"error": f"Failed to download from GCS: {e}", "storage_url": "", "status": "error", "completed": True}
 
-      # HTTP/HTTPS URLs can be passed directly to LlamaExtract
-      return {"storage_url": storage_url, "directory_name": directory_name or "", "file_mime_type": mime_type}
+      elif storage_url.startswith(("http://", "https://")):
+          try:
+              import requests
+              resp = requests.get(storage_url, timeout=60)
+              resp.raise_for_status()
+              tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+              tmp.write(resp.content)
+              tmp.close()
+              local_path = tmp.name
+          except Exception as e:
+              return {"error": f"Failed to download from URL: {e}", "storage_url": "", "status": "error", "completed": True}
+      else:
+          return {"error": f"Unsupported storage URL scheme: {storage_url}", "storage_url": "", "status": "error", "completed": True}
 
-  # Step 3: Send file to LlamaExtract for processing
+      # Convert Word docs to PDF — LlamaExtract has a bug parsing docx (parse_job_id=None, 0 pages extracted)
+      if ext in (".doc", ".docx"):
+          try:
+              outdir = os.path.dirname(local_path)
+              result = subprocess.run(
+                  ["soffice", "--headless", "--convert-to", "pdf", "--outdir", outdir, local_path],
+                  capture_output=True, text=True, timeout=60
+              )
+              pdf_path = local_path.rsplit(".", 1)[0] + ".pdf"
+              if os.path.exists(pdf_path):
+                  os.unlink(local_path)
+                  local_path = pdf_path
+                  mime_type = "application/pdf"
+              else:
+                  return {"error": f"PDF conversion failed: {result.stderr}", "storage_url": "", "status": "error", "completed": True}
+          except Exception as e:
+              return {"error": f"PDF conversion error: {e}", "storage_url": "", "status": "error", "completed": True}
+
+      return {
+          "storage_url": local_path,
+          "directory_name": directory_name,
+          "file_mime_type": mime_type,
+      }
+
+  # Step 3: Resolve LlamaExtract agent name from directoryName
+  - name: resolve_agent
+    run: |
+      import os
+      import re
+
+      directory_name = (state.get("directory_name") or "").lower().strip()
+      extraction_mode = "balanced"
+
+      # Map directoryName to agent base name (same as spa-base)
+      base_name_map = {
+          "chambers": "chambers-partners",
+          "iflr1000": "iflr-1000",
+          "legal500": "the-legal-500",
+          "legal 500": "the-legal-500",
+          "itr": "itr-world-tax",
+          "leadersleague": "leaders-league",
+          "leaders league": "leaders-league",
+      }
+
+      base_name = base_name_map.get(directory_name)
+      if not base_name:
+          supported = list(base_name_map.keys())
+          return {
+              "status": "error",
+              "error": f"Unknown directory: '{directory_name}'. Supported: {supported}",
+              "agent_name_used": "",
+              "completed": True
+          }
+
+      # Build agent name: [prefix-]rankellix-{base_name}-{mode}
+      prefix = os.environ.get("AGENT_NAME_PREFIX", "").strip()
+      if prefix and not re.match(r'^[a-z0-9-]+$', prefix):
+          return {
+              "status": "error",
+              "error": f"Invalid AGENT_NAME_PREFIX '{prefix}': must match ^[a-z0-9-]+$",
+              "agent_name_used": "",
+              "completed": True
+          }
+
+      if prefix:
+          agent_name = f"{prefix}-rankellix-{base_name}-{extraction_mode}"
+      else:
+          agent_name = f"rankellix-{base_name}-{extraction_mode}"
+
+      return {"agent_name_used": agent_name, "status": "agent_selected"}
+
+  # Step 4: Extract using LlamaExtract SDK with agent_name
   - name: run_extraction
     uses: llamaextract.extract
     with:
       file: "{{ state.storage_url }}"
+      agent_name: "{{ state.agent_name_used }}"
       mode: "{{ settings.llamaextract.mode }}"
       timeout: "{{ settings.llamaextract.timeout }}"
       max_retries: "{{ settings.llamaextract.max_retries }}"
-      use_rest: true
-      schema:
-        type: object
-        properties:
-          title:
-            type: string
-            description: "Document title or heading"
-          sections:
-            type: array
-            items:
-              type: object
-              properties:
-                heading:
-                  type: string
-                content:
-                  type: string
-          tables:
-            type: array
-            items:
-              type: object
-              properties:
-                caption:
-                  type: string
-                headers:
-                  type: array
-                  items:
-                    type: string
-                rows:
-                  type: array
-                  items:
-                    type: array
-                    items:
-                      type: string
-          metadata:
-            type: object
-            properties:
-              author:
-                type: string
-              date:
-                type: string
-              category:
-                type: string
     output: extract_result
 
-  # Step 4: Serialize extraction result to JSON string
+  # Step 5: Serialize extraction result and clean up temp files
   - name: prepare_payload
     run: |
       import json
+      import os
+
       extract_result = state.get("extract_result", {})
+
+      # Clean up temp file
+      storage_url = state.get("storage_url", "")
+      if storage_url and storage_url.startswith("/tmp/") and os.path.exists(storage_url):
+          os.unlink(storage_url)
+
       if extract_result.get("success"):
           payload = json.dumps(extract_result.get("data", {}))
+          return {"payload_json": payload, "status": "success"}
       else:
           payload = json.dumps({"error": extract_result.get("error", "Extraction failed"), "status": "failed"})
-      return {"payload_json": payload}
+          return {"payload_json": payload, "status": "error", "error": extract_result.get("error", "Extraction failed")}
 
-  # Step 5: Save extraction result back to the node via GraphQL
+  # Step 6: Save extraction result back to the node via GraphQL
   - name: save_payload
     uses: graphology.update_node
     with:
@@ -161,22 +242,39 @@ nodes:
       graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
     output: update_result
 
+  # Step 7: Finalize
+  - name: finalize
+    run: |
+      update_result = state.get("update_result", {})
+      if update_result.get("success"):
+          return {"completed": True, "status": "success"}
+      else:
+          return {"completed": True, "status": "error", "error": update_result.get("error", "Failed to save payload")}
+
 edges:
   - from: __start__
     to: fetch_file_node
   - from: fetch_file_node
     to: extract_and_download
   - from: extract_and_download
-    to: run_extraction
+    to: resolve_agent
     condition: "{{ state.storage_url }}"
   - from: extract_and_download
     to: __end__
     condition: "{{ not state.storage_url }}"
+  - from: resolve_agent
+    to: run_extraction
+    condition: "{{ state.agent_name_used }}"
+  - from: resolve_agent
+    to: __end__
+    condition: "{{ not state.agent_name_used }}"
   - from: run_extraction
     to: prepare_payload
   - from: prepare_payload
     to: save_payload
   - from: save_payload
+    to: finalize
+  - from: finalize
     to: __end__
 
 config:
