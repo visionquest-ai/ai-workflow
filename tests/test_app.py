@@ -1,5 +1,5 @@
 """
-Tests for ai-workflow FastAPI service (Story 16.1, Task 2).
+Tests for ai-workflow FastAPI service.
 
 Test Categories:
 - Health endpoint
@@ -7,12 +7,15 @@ Test Categories:
 - Run agent endpoint validation (AC2, AC5)
 - Agent loading (AC6)
 - Error handling
+- Async agent execution (Story 14.1)
 
 Usage:
     pytest tests/test_app.py -v
 """
 
 import os
+import threading
+import time
 import pytest
 from unittest.mock import patch, MagicMock
 from fastapi.testclient import TestClient
@@ -289,3 +292,278 @@ class TestContextNodeFetch:
 
         assert result["success"] is False
         assert "Workflow not found" in result["error"]
+
+
+# =============================================================================
+# Story 14.1: Async Agent Endpoint Tests
+# =============================================================================
+
+class TestAsyncRequestModel:
+    """Task 1: async_mode field and job store infrastructure."""
+
+    def test_async_mode_defaults_to_false(self, set_env):
+        """T14: RunAgentRequest.async_mode defaults to False (AC7)."""
+        from app import RunAgentRequest
+        req = RunAgentRequest(agent="test", workflow_id="wf-1", context_node_id="n-1")
+        assert req.async_mode is False
+
+    def test_async_mode_accepts_true(self, set_env):
+        """T15: RunAgentRequest.async_mode can be set to True (AC2)."""
+        from app import RunAgentRequest
+        req = RunAgentRequest(
+            agent="test", workflow_id="wf-1", context_node_id="n-1", async_mode=True
+        )
+        assert req.async_mode is True
+
+    def test_job_status_enum_values(self, set_env):
+        """T16: JobStatus enum has ACCEPTED, RUNNING, SUCCESS, ERROR (AC3)."""
+        from app import JobStatus
+        assert JobStatus.ACCEPTED.value == "accepted"
+        assert JobStatus.RUNNING.value == "running"
+        assert JobStatus.SUCCESS.value == "success"
+        assert JobStatus.ERROR.value == "error"
+
+    def test_job_store_exists(self, set_env):
+        """T17: _job_store module-level dict exists."""
+        from app import _job_store
+        assert isinstance(_job_store, dict)
+
+    def test_generate_job_id_returns_uuid_string(self, set_env):
+        """T18: _generate_job_id() returns a UUID string."""
+        from app import _generate_job_id
+        job_id = _generate_job_id()
+        assert isinstance(job_id, str)
+        assert len(job_id) == 36  # UUID4 format: 8-4-4-4-12
+
+    def test_generate_job_id_unique(self, set_env):
+        """T19: _generate_job_id() returns unique IDs."""
+        from app import _generate_job_id
+        ids = {_generate_job_id() for _ in range(100)}
+        assert len(ids) == 100
+
+
+class TestAsyncExecution:
+    """Task 2: Async execution path (AC2, AC7)."""
+
+    def test_sync_mode_unchanged(self, client, auth_headers):
+        """T20: POST without async_mode works identically (AC7)."""
+        with patch("app._load_and_run_agent") as mock_run:
+            mock_run.return_value = {
+                "success": True,
+                "status": "success",
+                "context_node_type": "ApplicationFormFile",
+                "payload": {"key": "value"},
+            }
+            response = client.post(
+                "/run-agent",
+                json={
+                    "agent": "file_extraction",
+                    "workflow_id": "wf-1",
+                    "context_node_id": "node-1",
+                },
+                headers=auth_headers,
+            )
+            assert response.status_code == 200
+            data = response.json()
+            assert data["success"] is True
+            assert data["status"] == "success"
+
+    def test_sync_mode_explicit_false(self, client, auth_headers):
+        """T21: POST with async_mode=false works identically (AC7)."""
+        with patch("app._load_and_run_agent") as mock_run:
+            mock_run.return_value = {
+                "success": True,
+                "status": "success",
+                "context_node_type": "ApplicationFormFile",
+            }
+            response = client.post(
+                "/run-agent",
+                json={
+                    "agent": "file_extraction",
+                    "workflow_id": "wf-1",
+                    "context_node_id": "node-1",
+                    "async_mode": False,
+                },
+                headers=auth_headers,
+            )
+            assert response.status_code == 200
+            data = response.json()
+            assert data["success"] is True
+
+    def test_async_mode_returns_202_with_job_id(self, client, auth_headers):
+        """T22: POST with async_mode=true returns 202 with job_id (AC2)."""
+        with patch("app._load_and_run_agent") as mock_run:
+            mock_run.return_value = {"success": True, "status": "success"}
+            response = client.post(
+                "/run-agent",
+                json={
+                    "agent": "file_extraction",
+                    "workflow_id": "wf-1",
+                    "context_node_id": "node-1",
+                    "async_mode": True,
+                },
+                headers=auth_headers,
+            )
+            assert response.status_code == 202
+            data = response.json()
+            assert "job_id" in data
+            assert data["status"] == "accepted"
+            assert len(data["job_id"]) == 36  # UUID format
+
+    def test_async_mode_launches_background_thread(self, client, auth_headers):
+        """T23: Async mode launches a thread that calls _load_and_run_agent."""
+        with patch("app._load_and_run_agent") as mock_run:
+            call_event = threading.Event()
+            def tracked_agent(*args, **kwargs):
+                call_event.set()
+                return {"success": True, "status": "success"}
+            mock_run.side_effect = tracked_agent
+
+            response = client.post(
+                "/run-agent",
+                json={
+                    "agent": "file_extraction",
+                    "workflow_id": "wf-1",
+                    "context_node_id": "node-1",
+                    "async_mode": True,
+                },
+                headers=auth_headers,
+            )
+            assert response.status_code == 202
+            assert call_event.wait(timeout=5), "Background thread did not call _load_and_run_agent"
+            mock_run.assert_called_once_with(
+                agent="file_extraction",
+                workflow_id="wf-1",
+                context_node_id="node-1",
+            )
+
+
+class TestJobStatusEndpoint:
+    """Task 3: Job status polling (AC3, AC4, AC6)."""
+
+    def test_job_poll_running(self, client, auth_headers):
+        """T24: GET /run-agent/jobs/{job_id} returns running status (AC3)."""
+        with patch("app._load_and_run_agent") as mock_run:
+            # Use events for deterministic thread sync
+            agent_entered = threading.Event()
+            barrier = threading.Event()
+            def slow_agent(*args, **kwargs):
+                agent_entered.set()
+                barrier.wait(timeout=5)
+                return {"success": True, "status": "success"}
+            mock_run.side_effect = slow_agent
+
+            # Submit async job
+            response = client.post(
+                "/run-agent",
+                json={
+                    "agent": "file_extraction",
+                    "workflow_id": "wf-1",
+                    "context_node_id": "node-1",
+                    "async_mode": True,
+                },
+                headers=auth_headers,
+            )
+            job_id = response.json()["job_id"]
+
+            # Wait for thread to enter agent (deterministic, no sleep)
+            assert agent_entered.wait(timeout=5), "Thread did not start agent"
+            poll = client.get(f"/run-agent/jobs/{job_id}", headers=auth_headers)
+            assert poll.status_code == 200
+            data = poll.json()
+            assert data["status"] == "running"
+            assert data["job_id"] == job_id
+            assert "result" not in data
+
+            barrier.set()  # Unblock
+
+    def test_job_poll_success(self, client, auth_headers):
+        """T25: GET /run-agent/jobs/{job_id} returns success with result (AC3)."""
+        with patch("app._load_and_run_agent") as mock_run:
+            done_event = threading.Event()
+            def completing_agent(*args, **kwargs):
+                result = {
+                    "success": True,
+                    "status": "success",
+                    "context_node_type": "ApplicationFormFile",
+                    "payload": {"extracted": True},
+                }
+                done_event.set()
+                return result
+            mock_run.side_effect = completing_agent
+
+            response = client.post(
+                "/run-agent",
+                json={
+                    "agent": "file_extraction",
+                    "workflow_id": "wf-1",
+                    "context_node_id": "node-1",
+                    "async_mode": True,
+                },
+                headers=auth_headers,
+            )
+            job_id = response.json()["job_id"]
+
+            assert done_event.wait(timeout=5), "Agent thread did not complete"
+            # Small yield to let _run_agent_job finish storing the result
+            time.sleep(0.05)
+
+            poll = client.get(f"/run-agent/jobs/{job_id}", headers=auth_headers)
+            assert poll.status_code == 200
+            data = poll.json()
+            assert data["status"] == "success"
+            assert data["job_id"] == job_id
+            assert data["result"]["success"] is True
+            assert data["result"]["payload"]["extracted"] is True
+
+    def test_job_poll_error(self, client, auth_headers):
+        """T26: GET /run-agent/jobs/{job_id} returns error with result (AC3)."""
+        with patch("app._load_and_run_agent") as mock_run:
+            done_event = threading.Event()
+            def failing_agent(*args, **kwargs):
+                result = {"success": False, "error": "Agent execution failed"}
+                done_event.set()
+                return result
+            mock_run.side_effect = failing_agent
+
+            response = client.post(
+                "/run-agent",
+                json={
+                    "agent": "file_extraction",
+                    "workflow_id": "wf-1",
+                    "context_node_id": "node-1",
+                    "async_mode": True,
+                },
+                headers=auth_headers,
+            )
+            job_id = response.json()["job_id"]
+
+            assert done_event.wait(timeout=5), "Agent thread did not complete"
+            time.sleep(0.05)
+
+            poll = client.get(f"/run-agent/jobs/{job_id}", headers=auth_headers)
+            assert poll.status_code == 200
+            data = poll.json()
+            assert data["status"] == "error"
+            assert data["result"]["error"] == "Agent execution failed"
+
+    def test_job_poll_requires_auth(self, client):
+        """T27: GET /run-agent/jobs/{job_id} requires x-api-key (AC4)."""
+        poll = client.get("/run-agent/jobs/some-job-id")
+        assert poll.status_code == 401
+
+    def test_job_poll_invalid_auth(self, client):
+        """T28: GET /run-agent/jobs/{job_id} rejects invalid key (AC4)."""
+        poll = client.get(
+            "/run-agent/jobs/some-job-id",
+            headers={"x-api-key": "wrong-key"},
+        )
+        assert poll.status_code == 401
+
+    def test_unknown_job_returns_404(self, client, auth_headers):
+        """T29: GET /run-agent/jobs/{unknown_id} returns 404 (AC6)."""
+        poll = client.get(
+            "/run-agent/jobs/00000000-0000-0000-0000-000000000000",
+            headers=auth_headers,
+        )
+        assert poll.status_code == 404

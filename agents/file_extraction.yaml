@@ -77,12 +77,19 @@ nodes:
       import os
       import tempfile
 
-      data = state.get("context_result", {}).get("data", {})
+      context_result = state.get("context_result", {})
+
+      # Check if graphology call itself failed (server down, 503, etc.)
+      if not context_result.get("success", True):
+          error_msg = context_result.get("error", "Failed to fetch node from graphology")
+          return {"error": error_msg, "storage_url": "", "status": "error", "completed": True}
+
+      data = context_result.get("data", {})
       storage_url = data.get("storageUrl", "")
       directory_name = data.get("directoryName", "")
       file_name = data.get("fileName", "")
       mime_type = data.get("mimeType", "application/octet-stream")
-      node_type = state.get("context_result", {}).get("node_type", "")
+      node_type = context_result.get("node_type", "")
 
       if not storage_url:
           return {"error": "ApplicationFormFile has no storageUrl", "storage_url": "", "status": "error", "completed": True}
@@ -138,6 +145,8 @@ nodes:
               local_path = pdf_path
               mime_type = "application/pdf"
           except Exception as e:
+              if local_path and os.path.exists(local_path):
+                  os.unlink(local_path)
               return {"error": f"PDF conversion error: {e}", "storage_url": "", "status": "error", "completed": True}
 
       return {
@@ -153,7 +162,7 @@ nodes:
       import re
 
       directory_name = (state.get("directory_name") or "").lower().strip()
-      extraction_mode = "balanced"
+      extraction_mode = (settings.get("llamaextract", {}).get("mode", "BALANCED")).lower()
 
       # Map directoryName to agent base name (same as spa-base)
       base_name_map = {
