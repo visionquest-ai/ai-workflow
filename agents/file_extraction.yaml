@@ -12,7 +12,6 @@
 # Usage:
 #   POST /run-agent {
 #     "agent": "file_extraction",
-#     "workflow_id": "<workflow-id>",
 #     "context_node_id": "<ApplicationFormFile-node-id>"
 #   }
 
@@ -44,7 +43,6 @@ variables:
 
 state_schema:
   # Input (required)
-  workflow_id: str
   context_node_id: str
 
   # Intermediate

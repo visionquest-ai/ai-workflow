@@ -23,7 +23,7 @@ from typing import Optional
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 # Add the actions directory to path so graphology module is importable
 ACTIONS_DIR = os.environ.get("ACTIONS_DIR", str(Path(__file__).parent / "actions"))
@@ -57,9 +57,19 @@ AGENTS_DIR = os.environ.get("AGENTS_DIR", str(Path(__file__).parent / "agents"))
 
 class RunAgentRequest(BaseModel):
     agent: str
-    workflow_id: str
-    context_node_id: str
+    workflow_id: Optional[str] = None
+    context_node_id: Optional[str] = None
+    application_form_id: Optional[str] = None
     async_mode: bool = False
+
+    @model_validator(mode="after")
+    def resolve_node_id(self):
+        """Accept application_form_id as alias for context_node_id."""
+        if self.application_form_id and not self.context_node_id:
+            self.context_node_id = self.application_form_id
+        if not self.context_node_id:
+            raise ValueError("Either context_node_id or application_form_id is required")
+        return self
 
 
 class JobStatus(str, Enum):
@@ -117,10 +127,10 @@ def _validate_workflow(workflow_id: str) -> dict:
 
 def _load_and_run_agent(
     agent: str,
-    workflow_id: str,
+    workflow_id: Optional[str],
     context_node_id: str,
-    agents_dir: str = None,
-    actions_dir: str = None,
+    agents_dir: Optional[str] = None,
+    actions_dir: Optional[str] = None,
 ) -> dict:
     """
     Load a YAML agent and run it with context node data.
@@ -144,10 +154,11 @@ def _load_and_run_agent(
     if not node_result.get("success"):
         return {"success": False, "error": node_result.get("error", "Unknown error")}
 
-    # AC3b: Validate workflow
-    wf_result = _validate_workflow(workflow_id)
-    if not wf_result.get("success"):
-        return {"success": False, "error": wf_result.get("error", "Unknown error")}
+    # AC3b: Validate workflow (skip if not provided — some agents don't need it)
+    if workflow_id:
+        wf_result = _validate_workflow(workflow_id)
+        if not wf_result.get("success"):
+            return {"success": False, "error": wf_result.get("error", "Unknown error")}
 
     context_node_type = node_result["node_type"]
     node_data = node_result["data"]
@@ -211,7 +222,7 @@ def _load_and_run_agent(
 # ASYNC JOB HELPERS
 # =============================================================================
 
-def _run_agent_job(job_id: str, agent: str, workflow_id: str, context_node_id: str):
+def _run_agent_job(job_id: str, agent: str, workflow_id: Optional[str], context_node_id: str):
     """Run agent in background thread, updating job store with result."""
     with _job_lock:
         _job_store[job_id]["status"] = JobStatus.RUNNING
@@ -262,6 +273,7 @@ def run_agent(
     Supports sync (default) and async modes (AC2, AC7).
     """
     _check_api_key(x_api_key)
+    assert request.context_node_id  # guaranteed by model_validator
 
     if request.async_mode:
         job_id = _generate_job_id()
