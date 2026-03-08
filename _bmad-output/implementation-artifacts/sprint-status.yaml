@@ -51,5 +51,5 @@ development_status:
   epic-14: in-progress
   14-1-async-agent-endpoint: done
   14-2-file-extraction-agent-hardening: review
-  14-3-docker-and-deployment-readiness: ready-for-dev
+  14-3-docker-and-deployment-readiness: done
   epic-14-retrospective: optional

@@ -1,0 +1,11 @@
+.env
+__pycache__
+.git
+.gitignore
+_bmad*
+tests/
+the_edge_agent/docs/
+the_edge_agent/rust/
+the_edge_agent/.git
+.venv
+*.md
