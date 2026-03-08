@@ -159,6 +159,7 @@ nodes:
           "storage_url": local_path,
           "directory_name": directory_name,
           "file_mime_type": mime_type,
+          "_extraction_mode": "balanced",
       }
 
   # Step 3: Resolve LlamaExtract agent name from directoryName
@@ -168,7 +169,7 @@ nodes:
       import re
 
       directory_name = (state.get("directory_name") or "").lower().strip()
-      extraction_mode = (settings.get("llamaextract", {}).get("mode", "BALANCED")).lower()
+      extraction_mode = (state.get("_extraction_mode") or "balanced")
 
       # Map directoryName to agent base name (same as spa-base)
       base_name_map = {
