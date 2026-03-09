@@ -64,3 +64,11 @@ development_status:
   # Epic 2: AI Workflow Trigger System Pilot
   # MOVED to graphology repo — all implementation is in graphology
   # See: ~/src/graphology/_bmad-output/implementation-artifacts/18-1-trigger-system-pilot.md
+
+  # Epic 15: File Extraction Button Trigger with PathNode Input Mapping
+  # Implementation in graphology repo — extends trigger system with MANUAL type + PathNode resolution
+  epic-15: in-progress
+  15-1-bootstrap-triggers-workflow-and-manual-trigger-type: done
+  15-2-pathnode-input-mapping-resolution: review
+  15-3-seed-file-extraction-button-trigger: backlog
+  epic-15-retrospective: optional
