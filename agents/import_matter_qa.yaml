@@ -33,7 +33,7 @@ description: |
 settings:
   llm:
     model: gpt-5.2-chat
-    temperature: 0
+    temperature: 1
   parallel:
     max_concurrency: 5
   rate_limiters:
