@@ -199,6 +199,17 @@ def _load_and_run_agent(
         agent_status = agent_state.get("status", "unknown")
         agent_error = agent_state.get("error")
 
+        # Infer success from agent output when no explicit status field exists.
+        # YAML agents like import_matter_qa populate save_result on completion
+        # but do not set a top-level "status" key in state.
+        if agent_status == "unknown" and not agent_error:
+            # Check for evidence of successful completion in agent state
+            save_result = agent_state.get("save_result")
+            if save_result and isinstance(save_result, dict) and save_result.get("success"):
+                agent_status = "success"
+            elif agent_state.get("answers") or agent_state.get("save_result"):
+                agent_status = "success"
+
         result = {
             "success": agent_status == "success",
             "status": agent_status,
