@@ -6,6 +6,7 @@ the node run blocks directly with mocked dependencies. This validates:
 - Story 1.1: validate_input node (fetch, node type, website presence)
 - Story 1.2: scrape_website + process_scrape_result nodes
 - Story 1.3: save_payload + finalize nodes, error payload persistence, edge wiring
+- Story 1.4: scrape status tracking (set_status_running, set_status_final, scrape_status_value)
 - AC1: Happy path — successful scrape persisted to websitePayload
 - AC2: Error scrape result persisted for visibility
 - AC3: GraphQL mutation failure handling
@@ -100,6 +101,8 @@ class TestYamlStructureCompliance:
             "context_node_id", "context_result", "website_url",
             "scrape_result", "scrape_data_json", "scrape_failed",
             "update_result",
+            "set_running_result", "set_final_status_result",
+            "scrape_status_value",
             "status", "error", "completed",
         ]
         for field in required_fields:
@@ -161,11 +164,12 @@ class TestYamlStructureCompliance:
         assert "run" in node, "process_scrape_result must be a run: block"
 
     def test_node_order_implicit_chaining(self, agent_def):
-        """Nodes are in correct order for implicit chaining (goto replaces edges)."""
+        """Nodes are in correct order for implicit chaining (Story 1.4 updated)."""
         node_names = [n["name"] for n in agent_def["nodes"]]
         expected_order = [
-            "fetch_node", "validate_input", "scrape_website",
-            "process_scrape_result", "save_payload", "finalize",
+            "fetch_node", "validate_input", "set_status_running",
+            "scrape_website", "process_scrape_result", "save_payload",
+            "finalize", "set_status_final",
         ]
         assert node_names == expected_order
 
@@ -178,18 +182,18 @@ class TestYamlStructureCompliance:
         assert end_rule is not None, "Missing goto __end__ rule"
         assert "completed" in end_rule.get("if", ""), "goto __end__ must check completed"
 
-    def test_validate_input_goto_scrape_fallback(self, agent_def):
-        """validate_input has fallback goto scrape_website."""
+    def test_validate_input_goto_set_status_running_fallback(self, agent_def):
+        """validate_input has fallback goto set_status_running (Story 1.4)."""
         node = _get_node(agent_def, "validate_input")
         goto = node["goto"]
         fallback = goto[-1]
-        assert fallback.get("to") == "scrape_website"
+        assert fallback.get("to") == "set_status_running"
         assert "if" not in fallback, "Fallback goto must be unconditional"
 
-    def test_finalize_goto_end(self, agent_def):
-        """finalize has goto __end__."""
+    def test_finalize_no_goto_end(self, agent_def):
+        """finalize no longer goes directly to __end__ (Story 1.4: goes to set_status_final via implicit chaining)."""
         node = _get_node(agent_def, "finalize")
-        assert node.get("goto") == "__end__"
+        assert node.get("goto") is None, "finalize should use implicit chaining to set_status_final"
 
     def test_no_legacy_edges_section(self, agent_def):
         """Agent uses goto (not deprecated edges section)."""
@@ -508,6 +512,14 @@ class TestFinalizeNode:
         assert result["status"] == "error"
         assert "Failed to save payload" in result["error"]
 
+    def test_missing_scrape_failed_defaults_to_false(self, agent_def):
+        """Edge case: scrape_failed absent from state defaults to False (success path)."""
+        state = {"update_result": {"success": True}}
+        result = _exec_node(agent_def, "finalize", state)
+        assert result["completed"] is True
+        assert result["status"] == "success"
+        assert result["scrape_status_value"] == "completed"
+
     def test_finalize_checks_update_result_success(self, agent_def):
         """AC5/Task 6.7: finalize node checks update_result.success."""
         node = _get_node(agent_def, "finalize")
@@ -604,12 +616,191 @@ class TestFlowWiringStory13:
         assert isinstance(goto, list)
         assert any(r.get("to") == "__end__" for r in goto)
 
-    def test_full_flow_order(self, agent_def):
-        """Verify complete flow order via implicit chaining + goto."""
+    def test_set_status_final_goes_to_end(self, agent_def):
+        """set_status_final explicitly goes to __end__."""
+        set_status_final = _get_node(agent_def, "set_status_final")
+        assert set_status_final.get("goto") == "__end__"
+
+
+# =============================================================================
+# Story 1.4: Scrape Status Tracking Tests
+# =============================================================================
+
+class TestSetStatusRunningNode:
+    """Story 1.4 — AC #1, #7: set_status_running node tests."""
+
+    def test_node_exists(self, agent_def):
+        """AC1/Task 2.1: set_status_running node exists."""
+        node = _get_node(agent_def, "set_status_running")
+        assert node is not None, "Missing set_status_running node"
+
+    def test_uses_graphology_update_node(self, agent_def):
+        """Task 2.1: set_status_running uses graphology.update_node."""
+        node = _get_node(agent_def, "set_status_running")
+        assert node["uses"] == "graphology.update_node"
+
+    def test_params_scrape_status_running(self, agent_def):
+        """Task 2.2: updates scrapeStatus to 'running'."""
+        node = _get_node(agent_def, "set_status_running")
+        assert node["with"]["updates"]["scrapeStatus"] == "running"
+
+    def test_params_node_id_from_state(self, agent_def):
+        """Task 2.2: node_id comes from state.context_node_id."""
+        node = _get_node(agent_def, "set_status_running")
+        assert "context_node_id" in node["with"]["node_id"]
+
+    def test_params_node_type_legalfirm(self, agent_def):
+        """Task 2.2/4.9: node_type is LegalFirm."""
+        node = _get_node(agent_def, "set_status_running")
+        assert node["with"]["node_type"] == "LegalFirm"
+
+    def test_params_graphql_url(self, agent_def):
+        """Task 2.2: graphql_url from variables.GRAPHOLOGY_URL."""
+        node = _get_node(agent_def, "set_status_running")
+        assert "GRAPHOLOGY_URL" in node["with"]["graphql_url"]
+
+    def test_output_set_running_result(self, agent_def):
+        """Task 2.3: output is set_running_result."""
+        node = _get_node(agent_def, "set_status_running")
+        assert node["output"] == "set_running_result"
+
+    def test_no_conditional_routing(self, agent_def):
+        """Task 2.5/AC7: set_status_running has no conditional goto (best-effort)."""
+        node = _get_node(agent_def, "set_status_running")
+        # Should NOT have goto (implicit chaining to scrape_website)
+        assert node.get("goto") is None, \
+            "set_status_running must not have goto — implicit chaining to scrape_website (AC #7)"
+
+
+class TestSetStatusFinalNode:
+    """Story 1.4 — AC #2, #3, #4: set_status_final node tests."""
+
+    def test_node_exists(self, agent_def):
+        """Task 3.1: set_status_final node exists."""
+        node = _get_node(agent_def, "set_status_final")
+        assert node is not None, "Missing set_status_final node"
+
+    def test_uses_graphology_update_node(self, agent_def):
+        """Task 3.1/4.9: set_status_final uses graphology.update_node."""
+        node = _get_node(agent_def, "set_status_final")
+        assert node["uses"] == "graphology.update_node"
+
+    def test_params_scrape_status_from_state(self, agent_def):
+        """Task 3.4: updates scrapeStatus from state.scrape_status_value."""
+        node = _get_node(agent_def, "set_status_final")
+        assert "scrape_status_value" in node["with"]["updates"]["scrapeStatus"]
+
+    def test_params_node_id_from_state(self, agent_def):
+        """Task 3.4: node_id from state.context_node_id."""
+        node = _get_node(agent_def, "set_status_final")
+        assert "context_node_id" in node["with"]["node_id"]
+
+    def test_params_node_type_legalfirm(self, agent_def):
+        """Task 3.4/4.9: node_type is LegalFirm."""
+        node = _get_node(agent_def, "set_status_final")
+        assert node["with"]["node_type"] == "LegalFirm"
+
+    def test_params_graphql_url(self, agent_def):
+        """Task 3.4: graphql_url from variables.GRAPHOLOGY_URL."""
+        node = _get_node(agent_def, "set_status_final")
+        assert "GRAPHOLOGY_URL" in node["with"]["graphql_url"]
+
+    def test_output_set_final_status_result(self, agent_def):
+        """Task 3.5: output is set_final_status_result."""
+        node = _get_node(agent_def, "set_status_final")
+        assert node["output"] == "set_final_status_result"
+
+    def test_goto_end(self, agent_def):
+        """Task 3.6: set_status_final goes to __end__."""
+        node = _get_node(agent_def, "set_status_final")
+        assert node.get("goto") == "__end__"
+
+    def test_failure_absorbed_by_raise_exceptions_false(self, agent_def):
+        """If set_status_final GraphQL call fails, agent still completes (raise_exceptions: false)."""
+        assert agent_def["config"]["raise_exceptions"] is False, \
+            "raise_exceptions must be false so set_status_final failure doesn't crash the agent"
+        node = _get_node(agent_def, "set_status_final")
+        # Node is a uses: node (no run block) — failure is absorbed by TEA engine
+        assert "run" not in node, "set_status_final should be a uses: node, not a run: block"
+        assert node.get("goto") == "__end__", \
+            "set_status_final must go to __end__ so agent terminates even on failure"
+
+
+class TestEdgeWiringStory14:
+    """Story 1.4 — Edge wiring tests (Tasks 4.6, 4.7, 4.8)."""
+
+    def test_validate_input_success_goes_to_set_status_running(self, agent_def):
+        """Task 4.6: validate_input success path → set_status_running."""
+        node = _get_node(agent_def, "validate_input")
+        goto = node["goto"]
+        fallback = goto[-1]
+        assert fallback.get("to") == "set_status_running"
+
+    def test_set_status_running_chains_to_scrape_website(self, agent_def):
+        """Task 4.6: set_status_running → scrape_website (implicit chaining via node order)."""
         node_names = [n["name"] for n in agent_def["nodes"]]
-        expected = ["fetch_node", "validate_input", "scrape_website",
-                     "process_scrape_result", "save_payload", "finalize"]
-        assert node_names == expected
-        # finalize explicitly goes to __end__
-        finalize = _get_node(agent_def, "finalize")
-        assert finalize.get("goto") == "__end__"
+        running_idx = node_names.index("set_status_running")
+        assert node_names[running_idx + 1] == "scrape_website"
+
+    def test_finalize_goes_to_set_status_final(self, agent_def):
+        """Task 4.7: finalize → set_status_final (not __end__)."""
+        node = _get_node(agent_def, "finalize")
+        # finalize should no longer go directly to __end__
+        assert node.get("goto") != "__end__", \
+            "finalize should go to set_status_final, not __end__"
+
+    def test_set_status_final_goes_to_end(self, agent_def):
+        """Task 4.7: set_status_final → __end__."""
+        node = _get_node(agent_def, "set_status_final")
+        assert node.get("goto") == "__end__"
+
+    def test_validate_input_error_still_goes_to_end(self, agent_def):
+        """Task 4.8: validate_input error path still routes to __end__."""
+        node = _get_node(agent_def, "validate_input")
+        goto = node["goto"]
+        end_rule = next((r for r in goto if r.get("to") == "__end__"), None)
+        assert end_rule is not None
+        assert "completed" in end_rule.get("if", "")
+
+
+class TestFinalizeComputesScrapeStatusValue:
+    """Story 1.4 — AC #2, #3, #4: finalize computes scrape_status_value."""
+
+    def test_success_returns_completed(self, agent_def):
+        """Task 4.3/AC2: Successful scrape + save → scrape_status_value='completed'."""
+        state = {
+            "update_result": {"success": True},
+            "scrape_failed": False,
+        }
+        result = _exec_node(agent_def, "finalize", state)
+        assert result["scrape_status_value"] == "completed"
+        assert result["status"] == "success"
+
+    def test_scrape_failure_returns_failed(self, agent_def):
+        """Task 4.4/AC3: Scrape failed → scrape_status_value='failed'."""
+        state = {
+            "update_result": {"success": True},
+            "scrape_failed": True,
+        }
+        result = _exec_node(agent_def, "finalize", state)
+        assert result["scrape_status_value"] == "failed"
+        assert result["status"] == "error"
+
+    def test_save_payload_failure_returns_failed(self, agent_def):
+        """Task 4.5/AC4: Save failed → scrape_status_value='failed'."""
+        state = {
+            "update_result": {"success": False, "error": "Connection refused"},
+            "scrape_failed": False,
+        }
+        result = _exec_node(agent_def, "finalize", state)
+        assert result["scrape_status_value"] == "failed"
+        assert result["status"] == "error"
+
+    def test_both_failed_returns_failed(self, agent_def):
+        """AC3+AC4: Both scrape and save failed → scrape_status_value='failed'."""
+        state = {
+            "update_result": {"success": False, "error": "Timeout"},
+            "scrape_failed": True,
+        }
+        result = _exec_node(agent_def, "finalize", state)
+        assert result["scrape_status_value"] == "failed"

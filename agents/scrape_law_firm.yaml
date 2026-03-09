@@ -33,6 +33,11 @@ state_schema:
   # Persistence
   update_result: dict        # Result from graphology.update_node
 
+  # Status tracking (Story 1.4)
+  set_running_result: dict          # Result from "running" status update
+  set_final_status_result: dict     # Result from final status update
+  scrape_status_value: str          # Computed: "completed" or "failed"
+
   # Output
   status: str                # success, error
   error: str                 # Error message if failed
@@ -52,7 +57,7 @@ nodes:
     goto:
       - if: "state.completed"
         to: __end__
-      - to: scrape_website
+      - to: set_status_running
     run: |
       context_result = state.get("context_result", {})
 
@@ -75,6 +80,17 @@ nodes:
           "website_url": website,
           "status": "success",
       }
+
+  # Step 2.5: Set scrapeStatus to "running" (best-effort, AC #1, #7)
+  - name: set_status_running
+    uses: graphology.update_node
+    with:
+      node_id: "{{ state.context_node_id }}"
+      node_type: "LegalFirm"
+      updates:
+        scrapeStatus: "running"
+      graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
+    output: set_running_result
 
   # Step 3: Scrape the law firm website using ScrapeGraphAI
   - name: scrape_website
@@ -209,19 +225,30 @@ nodes:
       graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
     output: update_result
 
-  # Step 6: Finalize — determine completion status
+  # Step 6: Finalize — determine completion status and compute scrapeStatus value
   - name: finalize
-    goto: __end__
     run: |
       update_result = state.get("update_result", {})
       scrape_failed = state.get("scrape_failed", False)
 
       if update_result.get("success"):
           if scrape_failed:
-              return {"completed": True, "status": "error", "error": "Scrape failed but error persisted to node"}
-          return {"completed": True, "status": "success"}
+              return {"completed": True, "status": "error", "error": "Scrape failed but error persisted to node", "scrape_status_value": "failed"}
+          return {"completed": True, "status": "success", "scrape_status_value": "completed"}
       else:
-          return {"completed": True, "status": "error", "error": update_result.get("error", "Failed to save payload")}
+          return {"completed": True, "status": "error", "error": update_result.get("error", "Failed to save payload"), "scrape_status_value": "failed"}
+
+  # Step 7: Set final scrapeStatus on LegalFirm node
+  - name: set_status_final
+    goto: __end__
+    uses: graphology.update_node
+    with:
+      node_id: "{{ state.context_node_id }}"
+      node_type: "LegalFirm"
+      updates:
+        scrapeStatus: "{{ state.scrape_status_value }}"
+      graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
+    output: set_final_status_result
 
 config:
   raise_exceptions: false

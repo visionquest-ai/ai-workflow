@@ -59,6 +59,7 @@ development_status:
   1-1-fetch-legalfirm-node-and-validate-input: done
   1-2-scrape-website-via-scrapegraphai: done
   1-3-persist-extraction-result-to-websitepayload: done
+  1-4-scrape-status-tracking: done
   epic-1-retrospective: optional
 
   # Epic 2: AI Workflow Trigger System Pilot
