@@ -70,5 +70,5 @@ development_status:
   epic-15: in-progress
   15-1-bootstrap-triggers-workflow-and-manual-trigger-type: done
   15-2-pathnode-input-mapping-resolution: review
-  15-3-seed-file-extraction-button-trigger: backlog
+  15-3-seed-file-extraction-button-trigger: done
   epic-15-retrospective: optional
