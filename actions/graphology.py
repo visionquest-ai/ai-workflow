@@ -845,15 +845,13 @@ def update_node(
     for field_name, value in updates.items():
         update_fields[f"{field_name}_SET"] = value
 
-    # Build mutation
-    plural_type = _pluralize(node_type)
-    # Mutation name: update + PluralType (e.g. updateApplicationFormFiles)
-    mutation_name = f"update{plural_type}"
+    # Build mutation — Neo4j GraphQL Library v6 uses singular type names
+    mutation_name = f"update{node_type}"
     # Return fields: the updated scalar fields we set
     return_fields = " ".join(updates.keys()) + " id"
 
-    # Use lowercase first char for the result field accessor
-    result_field = plural_type[0].lower() + plural_type[1:]
+    # Result field accessor: lowercase first char of type name (e.g. ApplicationFormFile → applicationFormFile)
+    result_field = node_type[0].lower() + node_type[1:]
 
     mutation = f"""
     mutation UpdateNode($where: {node_type}Where!, $update: {node_type}UpdateInput!) {{

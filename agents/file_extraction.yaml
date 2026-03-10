@@ -198,6 +198,21 @@ nodes:
                   os.unlink(local_path)
               return {"error": f"PDF conversion error: {e}", "storage_url": "", "status": "error", "completed": True}
 
+      # Extract text from converted PDF if not already extracted (e.g., .doc files)
+      if not document_text and local_path and local_path.endswith(".pdf"):
+          try:
+              import pdfplumber
+              with pdfplumber.open(local_path) as pdf:
+                  parts = []
+                  for page in pdf.pages:
+                      text = page.extract_text() or ""
+                      parts.append(text)
+                      if len("\n".join(parts)) >= 3500:
+                          break
+                  document_text = "\n".join(parts)[:3500]
+          except Exception:
+              document_text = ""
+
       return {
           "storage_url": local_path,
           "directory_name": directory_name,
