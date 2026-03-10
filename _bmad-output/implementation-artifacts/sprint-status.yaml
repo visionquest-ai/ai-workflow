@@ -73,3 +73,10 @@ development_status:
   15-2-pathnode-input-mapping-resolution: review
   15-3-seed-file-extraction-button-trigger: done
   epic-15-retrospective: optional
+
+  # Epic 16: Automatic File Classification for Directory & Year Detection
+  epic-16: done
+  16-1-tier-1-2-filename-content-pattern-detection: done
+  16-2-tier-3-llm-classification-agent: done
+  16-3-persist-classification-metadata: done
+  epic-16-retrospective: optional

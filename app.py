@@ -32,6 +32,7 @@ if ACTIONS_DIR not in sys.path:
 
 # Import get_node from graphology actions
 from graphology import get_node, register_actions
+from agents import register_actions as register_agent_actions
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -170,6 +171,7 @@ def _load_and_run_agent(
 
         engine = YAMLEngine()
         register_actions(engine.actions_registry, engine)
+        register_agent_actions(engine.actions_registry, engine)
 
         engine.variables["GRAPHOLOGY_URL"] = os.environ.get("GRAPHOLOGY_URL", "http://localhost:4000")
         engine.variables["GRAPHOLOGY_API_KEY"] = os.environ.get("GRAPHOLOGY_API_KEY", "")

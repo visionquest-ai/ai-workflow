@@ -1,0 +1,266 @@
+# TEA YAML Agent - File Classification Agent (TIER 3)
+#
+# Purpose: LLM-based classification of legal directory documents when
+# TIER 1 (filename) and TIER 2 (content keywords) fail to identify
+# the directory and/or year.
+#
+# Two modes:
+#   1. Unknown directory: Full classification across all 5 directories
+#   2. Known directory: Category/region/year extraction only (when directory
+#      was detected by TIER 1/2 but year was not)
+#
+# Story: 16.2 - TIER 3 LLM Classification Agent
+
+name: file_classification
+description: |
+  LLM-based classification of legal directory documents.
+  Identifies directory, category, region, year, and form status
+  when pattern-based detection (TIER 1+2) fails.
+
+settings:
+  llm:
+    model: gpt-4.1-mini
+    temperature: 0.1
+    max_tokens: 200
+
+state_schema:
+  # Input
+  document_text:
+    type: str
+    description: "First 3500 chars of document for classification"
+  detected_directory:
+    type: str
+    description: "Pre-detected directory from TIER 1/2, or null"
+
+  # Cache
+  cache_result:
+    type: dict
+    description: "Result from cache lookup"
+
+  # Output
+  directory:
+    type: str
+    description: "Classified directory slug"
+  category:
+    type: str
+    description: "Practice area category"
+  region_country:
+    type: str
+    description: "ISO 3166-1 alpha-3 country code"
+  region_state:
+    type: str
+    description: "ISO 3166-2 state code"
+  region_country_display:
+    type: str
+    description: "Country display name"
+  region_state_display:
+    type: str
+    description: "State display name"
+  confidence:
+    type: float
+    description: "Classification confidence 0.0-1.0"
+  year:
+    type: str
+    description: "Detected year"
+  is_empty_form:
+    type: bool
+    description: "Whether document is an empty/blank form"
+  status:
+    type: str
+    description: "success or error"
+  error:
+    type: str
+    description: "Error message if classification failed"
+
+nodes:
+  # Step 0: Check cache before LLM call
+  - name: check_cache
+    uses: agents.cache_get
+    with:
+      document_text: "{{ state.document_text }}"
+    output: cache_result
+
+  # Step 0b: Apply cached result to state fields
+  - name: apply_cache
+    goto: __end__
+    run: |
+      cache_result = state.get("cache_result", {})
+      return {
+          "directory": cache_result.get("directory", ""),
+          "category": cache_result.get("category", ""),
+          "region_country": cache_result.get("region_country", ""),
+          "region_state": cache_result.get("region_state", ""),
+          "region_country_display": cache_result.get("region_country_display", ""),
+          "region_state_display": cache_result.get("region_state_display", ""),
+          "confidence": cache_result.get("confidence", 0.0),
+          "year": cache_result.get("year", ""),
+          "is_empty_form": cache_result.get("is_empty_form", False),
+          "status": "success",
+      }
+
+  # Step 1: Classify document using LLM
+  - name: classify_document
+    uses: ratelimit.wrap
+    with:
+      action: llm.call
+      limiter: llm_classify
+      rpm: 60
+      args:
+        model: "{{ settings.llm.model }}"
+        temperature: "{{ settings.llm.temperature }}"
+        max_tokens: "{{ settings.llm.max_tokens }}"
+        messages:
+          - role: system
+            content: >-
+              {% if state.detected_directory %}You are a legal document classifier. The document is from the {{ state.detected_directory }} legal directory. Extract the practice area category, region (country as ISO 3166-1 alpha-3 code, state as ISO 3166-2 code if applicable), year of the submission/ranking, and whether this is an empty/blank form.
+
+              Return ONLY valid JSON: {"category": "<practice area>", "region_country": "<ISO 3166-1 alpha-3>", "region_state": "<ISO 3166-2 or empty string>", "confidence": <0.0-1.0>, "year": <int or null>, "is_empty_form": <bool>}{% else %}You are a legal document classifier. Analyze the following document text and classify it into one of the supported legal directories.
+
+              SUPPORTED DIRECTORIES:
+              1. chambers (Chambers & Partners) — Indicators: Band rankings (Band 1-4), PAB006/PAM006 reference codes, "Chambers Global/Latin America/Asia/Europe/USA", myaccount.chambers.com
+              2. iflr1000 (IFLR1000) — Indicators: "Market Leader", "Highly Regarded", "Notable Practitioner", "Rising Star", accreditation.euromoney.com, iflr1000.com
+              3. legal500 (The Legal 500) — Indicators: Tier rankings (Tier 1-3), "Hall of Fame", "Next Generation Partner", thelegal500.com, legal500.com
+              4. itr (International Tax Review) — Indicators: "World Tax", "World Transfer Pricing", "Tax Controversy Leaders", itrworldtax.com
+              5. leadersleague (Leaders League) — Indicators: "Décideurs", "Classement", "Peer Feedback", leadersleague.com
+
+              Return ONLY valid JSON: {"directory": "<slug>", "category": "<practice area>", "region_country": "<ISO 3166-1 alpha-3>", "region_state": "<ISO 3166-2 or empty string>", "confidence": <0.0-1.0>, "year": <int or null>, "is_empty_form": <bool>}{% endif %}
+          - role: user
+            content: "{{ state.document_text }}"
+    output: llm_result
+
+  # Step 2: Parse LLM response and resolve ISO codes
+  - name: parse_result
+    run: |
+      import json
+      import re
+
+      llm_result = state.get("llm_result", {})
+      detected_directory = state.get("detected_directory") or ""
+
+      # Unwrap ratelimit.wrap envelope
+      if isinstance(llm_result, dict):
+          llm_success = llm_result.get("success", True)
+          if not llm_success:
+              return {
+                  "status": "error",
+                  "error": llm_result.get("error", "LLM call failed"),
+              }
+          inner = llm_result.get("result", llm_result)
+          if isinstance(inner, dict):
+              raw_text = inner.get("content", inner.get("text", ""))
+          elif isinstance(inner, str):
+              raw_text = inner
+          else:
+              raw_text = str(inner)
+      elif isinstance(llm_result, str):
+          raw_text = llm_result
+      else:
+          return {"status": "error", "error": "Unexpected LLM result type"}
+
+      # Extract JSON from response (may be wrapped in markdown code block)
+      brace_idx = raw_text.find('{')
+      if brace_idx == -1:
+          return {"status": "error", "error": f"No JSON found in LLM response: {raw_text[:200]}"}
+
+      try:
+          decoder = json.JSONDecoder()
+          parsed, _ = decoder.raw_decode(raw_text, brace_idx)
+      except json.JSONDecodeError as e:
+          return {"status": "error", "error": f"Invalid JSON in LLM response: {e}"}
+
+      # Extract fields
+      directory = parsed.get("directory", detected_directory) if not detected_directory else detected_directory
+      category = parsed.get("category", "")
+      region_country = parsed.get("region_country", "")
+      region_state = parsed.get("region_state", "")
+      confidence = float(parsed.get("confidence", 0.0))
+      year_val = parsed.get("year")
+      is_empty_form = bool(parsed.get("is_empty_form", False))
+
+      year = str(year_val) if year_val is not None else ""
+
+      # Resolve ISO codes to display names
+      region_country_display = region_country
+      region_state_display = region_state
+
+      try:
+          import pycountry
+          if region_country:
+              country = pycountry.countries.get(alpha_3=region_country.upper())
+              if country:
+                  region_country_display = country.name
+          if region_state:
+              subdivision = pycountry.subdivisions.get(code=region_state.upper())
+              if subdivision:
+                  region_state_display = subdivision.name
+      except Exception:
+          pass  # Fallback: use raw codes as display names
+
+      return {
+          "directory": (directory or "").lower().strip(),
+          "category": category,
+          "region_country": region_country,
+          "region_state": region_state,
+          "region_country_display": region_country_display,
+          "region_state_display": region_state_display,
+          "confidence": confidence,
+          "year": year,
+          "is_empty_form": is_empty_form,
+      }
+
+  # Step 3: Validate classification result
+  - name: validate_result
+    run: |
+      directory = state.get("directory", "")
+      confidence = state.get("confidence", 0.0)
+      status = state.get("status", "")
+
+      # If parse_result already set error status, propagate
+      if status == "error":
+          return {}
+
+      supported = ["chambers", "iflr1000", "legal500", "itr", "leadersleague"]
+
+      if confidence < 0.5 or not directory:
+          return {
+              "status": "error",
+              "error": "LLM classification inconclusive. Supported: chambers, iflr1000, legal500, itr, leadersleague",
+          }
+
+      if directory not in supported:
+          return {
+              "status": "error",
+              "error": f"LLM returned unsupported directory '{directory}'. Supported: chambers, iflr1000, legal500, itr, leadersleague",
+          }
+
+      return {"status": "success"}
+
+  # Step 4: Store result in cache
+  - name: store_cache
+    uses: agents.cache_set
+    with:
+      document_text: "{{ state.document_text }}"
+    goto: __end__
+
+edges:
+  - from: __start__
+    to: check_cache
+  - from: check_cache
+    to: apply_cache
+    condition: "{{ state.cache_result and state.cache_result.hit }}"
+  - from: check_cache
+    to: classify_document
+    condition: "{{ not state.cache_result or not state.cache_result.hit }}"
+  - from: classify_document
+    to: parse_result
+  - from: parse_result
+    to: validate_result
+  - from: validate_result
+    to: store_cache
+    condition: "{{ state.status == 'success' }}"
+  - from: validate_result
+    to: __end__
+    condition: "{{ state.status != 'success' }}"
+
+config:
+  raise_exceptions: false

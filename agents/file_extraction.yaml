@@ -49,10 +49,21 @@ state_schema:
   context_result: dict       # Result from graphology.get_node
   storage_url: str           # Local file path after download
   directory_name: str        # Extracted from node data
+  file_name: str             # Original filename from node data
+  year: str                  # Year from node data (fast path for year detection)
   file_mime_type: str        # MIME type of the file
   agent_name_used: str       # Resolved LlamaExtract agent name
   extract_result: dict       # Result from llamaextract.extract
   payload_json: str          # Serialized extraction result
+
+  # Detection
+  directory_source: str      # How directory was detected: "input", "filename", "content", "llm"
+  document_text: str         # First 3500 chars extracted from file for content scanning
+  detected_year: str         # Year detected from any tier
+  year_source: str           # How year was detected: "input", "filename", "content", "llm"
+  classification_result: str # Full JSON from LLM classification agent (TIER 3)
+  classification_invoke_result: dict  # Raw result from agents.invoke_agent
+  classification_json: str            # Serialized JSON string of classification metadata for GraphQL persistence
 
   # Output
   update_result: dict        # Result from graphology.update_node
@@ -69,12 +80,12 @@ nodes:
       graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
     output: context_result
 
-  # Step 2: Download file from GCS and convert Word docs to PDF
+  # Step 2: Download file from GCS, extract text for TIER 2, convert Word docs to PDF
   - name: extract_and_download
     goto:
       - if: "not state.storage_url"
         to: __end__
-      - to: resolve_agent
+      - to: detect_directory
     run: |
       import os
       import tempfile
@@ -92,15 +103,13 @@ nodes:
       file_name = data.get("fileName", "")
       mime_type = data.get("mimeType", "application/octet-stream")
       node_type = context_result.get("node_type", "")
+      year = data.get("year", "")
 
       if not storage_url:
           return {"error": "ApplicationFormFile has no storageUrl", "storage_url": "", "status": "error", "completed": True}
 
       if node_type != "ApplicationFormFile":
           return {"error": f"Expected ApplicationFormFile, got {node_type}", "storage_url": "", "status": "error", "completed": True}
-
-      if not directory_name:
-          return {"error": "ApplicationFormFile has no directoryName — cannot resolve LlamaExtract agent", "storage_url": "", "status": "error", "completed": True}
 
       # Determine file extension from fileName or storageUrl
       ext = ""
@@ -137,6 +146,36 @@ nodes:
       else:
           return {"error": f"Unsupported storage URL scheme: {storage_url}", "storage_url": "", "status": "error", "completed": True}
 
+      # Extract text from the downloaded file BEFORE PDF conversion (for TIER 2 content scanning)
+      document_text = ""
+      if ext in (".docx",):
+          try:
+              from docx import Document
+              doc = Document(local_path)
+              parts = []
+              for para in doc.paragraphs:
+                  parts.append(para.text)
+              for table in doc.tables:
+                  for row in table.rows:
+                      for cell in row.cells:
+                          parts.append(cell.text)
+              document_text = "\n".join(parts)[:3500]
+          except Exception:
+              document_text = ""
+      elif ext == ".pdf":
+          try:
+              import pdfplumber
+              with pdfplumber.open(local_path) as pdf:
+                  parts = []
+                  for page in pdf.pages:
+                      text = page.extract_text() or ""
+                      parts.append(text)
+                      if len("\n".join(parts)) >= 3500:
+                          break
+                  document_text = "\n".join(parts)[:3500]
+          except Exception:
+              document_text = ""
+
       # Convert Word docs to PDF — LlamaExtract has a bug parsing docx (parse_job_id=None, 0 pages extracted)
       if ext in (".doc", ".docx"):
           try:
@@ -163,10 +202,214 @@ nodes:
           "storage_url": local_path,
           "directory_name": directory_name,
           "file_mime_type": mime_type,
+          "document_text": document_text,
+          "file_name": file_name,
+          "year": year,
           "_extraction_mode": "balanced",
       }
 
-  # Step 3: Resolve LlamaExtract agent name from directoryName
+  # Step 3: Detect directory and year from filename/content (TIER 1+2)
+  # Routes to invoke_classification (TIER 3) when:
+  #   - TIER 1+2 fail to detect directory_name
+  #   - Directory detected but year is missing
+  - name: detect_directory
+    goto:
+      - if: "state.error"
+        to: __end__
+      - if: "not state.directory_name"
+        to: invoke_classification
+      - if: "state.directory_name and not state.detected_year"
+        to: invoke_classification
+      - to: resolve_agent
+    run: |
+      import re
+
+      directory_name = (state.get("directory_name") or "").strip()
+      directory_source = ""
+      document_text = state.get("document_text") or ""
+      file_name = state.get("file_name") or ""
+      detected_year = ""
+      year_source = ""
+
+      # Fast path: directory already set from node data
+      if directory_name:
+          directory_source = "input"
+      else:
+          # TIER 1: Filename keyword detection
+          fn_lower = file_name.lower()
+
+          filename_patterns = {
+              "chambers": ["chambers", "c&p", "candp"],
+              "iflr1000": ["iflr", "iflr1000"],
+              "legal500": ["legal500", "legal 500", "l500"],
+              "itr": ["itr", "international tax review"],
+              "leadersleague": ["leaders", "league", "leadersleague", "leaders league"],
+          }
+
+          for dir_name, keywords in filename_patterns.items():
+              for keyword in keywords:
+                  if keyword in fn_lower:
+                      directory_name = dir_name
+                      directory_source = "filename"
+                      break
+              if directory_name:
+                  break
+
+          # TIER 2: Content keyword scanning (if TIER 1 missed)
+          if not directory_name and document_text:
+              text_lower = document_text.lower()
+
+              # Note: Generic overlapping keywords like "leading individual", "rising star",
+              # "leading", "excellent" are intentionally omitted to avoid false positives.
+              # Ambiguous cases fall through to TIER 3 LLM classification (Story 16.2).
+              content_patterns = {
+                  "chambers": [
+                      "chambers.com", "myaccount.chambers.com", "chambers and partners",
+                      "chambers & partners", "band 1", "band 2", "band 3", "band 4",
+                      "ranked individual", "leading individual", "recognised practitioner",
+                      "associate to watch", "up and coming", "star individual",
+                      "pab006", "pam006",
+                      "chambers global", "chambers latin america", "chambers asia",
+                      "chambers europe", "chambers usa",
+                  ],
+                  "iflr1000": [
+                      "iflr1000.com", "iflr.com", "accreditation.euromoney.com",
+                      "iflr1000", "market leader", "highly regarded",
+                      "notable practitioner", "rising star",
+                  ],
+                  "legal500": [
+                      "legal500.com", "thelegal500.com", "the legal 500",
+                      "legal 500", "hall of fame",
+                      "next generation partner",
+                      "recommended lawyer", "tier 1", "tier 2", "tier 3",
+                  ],
+                  "itr": [
+                      "itrworldtax.com", "itr world tax", "international tax review",
+                      "world tax", "world transfer pricing",
+                      "tax controversy leaders", "indirect tax leaders",
+                      "women in tax leaders",
+                  ],
+                  "leadersleague": [
+                      "leadersleague.com", "leaders league", "décideurs",
+                      "decideurs", "classement", "peer feedback",
+                      "highly recommended",
+                      "strong reputation",
+                  ],
+              }
+
+              for dir_name, keywords in content_patterns.items():
+                  for keyword in keywords:
+                      if keyword in text_lower:
+                          directory_name = dir_name
+                          directory_source = "content"
+                          break
+                  if directory_name:
+                      break
+
+      # Year detection
+      year_from_node = state.get("year") or ""
+      if year_from_node:
+          detected_year = str(year_from_node)
+          year_source = "input"
+      else:
+          # TIER 1: Year from filename
+          year_matches = re.findall(r'(?<!\d)(20[0-9]{2})(?!\d)', file_name)
+          if year_matches:
+              detected_year = max(year_matches)
+              year_source = "filename"
+          elif document_text:
+              # TIER 2: Year from content
+              year_matches = re.findall(r'(?<!\d)(20[0-9]{2})(?!\d)', document_text)
+              if year_matches:
+                  detected_year = max(year_matches)
+                  year_source = "content"
+
+      return {
+          "directory_name": directory_name.lower() if directory_name else "",
+          "directory_source": directory_source,
+          "detected_year": detected_year,
+          "year_source": year_source,
+      }
+
+  # Step 3b: Invoke TIER 3 LLM classification as sub-agent
+  - name: invoke_classification
+    uses: agents.invoke_agent
+    with:
+      agent_name: "file_classification"
+      input_state:
+        document_text: "{{ state.document_text }}"
+        detected_directory: "{{ state.directory_name or '' }}"
+    output: classification_invoke_result
+
+  # Step 3c: Process classification result
+  - name: process_classification
+    goto:
+      - if: "state.error"
+        to: __end__
+      - to: resolve_agent
+    run: |
+      import json
+
+      invoke_result = state.get("classification_invoke_result", {})
+
+      if not invoke_result.get("success"):
+          return {
+              "error": invoke_result.get("error", "Classification sub-agent failed"),
+              "status": "error",
+              "completed": True,
+          }
+
+      result = invoke_result.get("result", {})
+      cl_status = result.get("status", "")
+      cl_error = result.get("error", "")
+
+      if cl_status == "error":
+          return {
+              "error": cl_error or "LLM classification inconclusive. Supported: chambers, iflr1000, legal500, itr, leadersleague",
+              "status": "error",
+              "completed": True,
+          }
+
+      directory = result.get("directory", "")
+      confidence = result.get("confidence", 0.0)
+
+      if not directory or confidence < 0.5:
+          return {
+              "error": "LLM classification inconclusive. Supported: chambers, iflr1000, legal500, itr, leadersleague",
+              "status": "error",
+              "completed": True,
+          }
+
+      # Store full classification result as JSON
+      classification_result = json.dumps({
+          "directory": directory,
+          "category": result.get("category", ""),
+          "region_country": result.get("region_country", ""),
+          "region_state": result.get("region_state", ""),
+          "region_country_display": result.get("region_country_display", ""),
+          "region_state_display": result.get("region_state_display", ""),
+          "confidence": confidence,
+          "year": result.get("year", ""),
+          "is_empty_form": result.get("is_empty_form", False),
+      })
+
+      # Use LLM-detected directory if not already set
+      new_directory = state.get("directory_name") or directory
+      new_directory_source = state.get("directory_source") or "llm"
+
+      # Use LLM-detected year if not already set
+      detected_year = state.get("detected_year") or result.get("year", "")
+      year_source = state.get("year_source") or ("llm" if result.get("year") else "")
+
+      return {
+          "directory_name": new_directory.lower(),
+          "directory_source": new_directory_source,
+          "detected_year": detected_year,
+          "year_source": year_source,
+          "classification_result": classification_result,
+      }
+
+  # Step 4: Resolve LlamaExtract agent name from directoryName
   - name: resolve_agent
     goto:
       - if: "not state.agent_name_used"
@@ -241,12 +484,44 @@ nodes:
       if storage_url and storage_url.startswith("/tmp/") and os.path.exists(storage_url):
           os.unlink(storage_url)
 
+      # Build classification metadata (independent of extraction success/failure)
+      classification = {
+          "directory": state.get("directory_name", ""),
+          "directory_source": state.get("directory_source", ""),
+          "detected_year": state.get("detected_year"),
+          "year_source": state.get("year_source", ""),
+      }
+
+      # Merge LLM classification fields if available (TIER 3)
+      classification_result = state.get("classification_result")
+      if classification_result:
+          if isinstance(classification_result, str):
+              classification_result = json.loads(classification_result)
+          classification["category"] = classification_result.get("category")
+          classification["region_country"] = classification_result.get("region_country")
+          classification["region_country_display"] = classification_result.get("region_country_display")
+          classification["region_state"] = classification_result.get("region_state")
+          classification["region_state_display"] = classification_result.get("region_state_display")
+          classification["confidence"] = classification_result.get("confidence")
+          classification["is_empty_form"] = classification_result.get("is_empty_form")
+      else:
+          # TIER 1/2 or fast-path — no LLM fields, confidence=1.0 (exact match)
+          classification["category"] = None
+          classification["region_country"] = None
+          classification["region_country_display"] = None
+          classification["region_state"] = None
+          classification["region_state_display"] = None
+          classification["confidence"] = 1.0
+          classification["is_empty_form"] = None
+
+      classification_json = json.dumps(classification)
+
       if extract_result.get("success"):
           payload = json.dumps(extract_result.get("data", {}))
-          return {"payload_json": payload, "status": "success"}
+          return {"payload_json": payload, "classification_json": classification_json, "status": "success"}
       else:
           payload = json.dumps({"error": extract_result.get("error", "Extraction failed"), "status": "failed"})
-          return {"payload_json": payload, "status": "error", "error": extract_result.get("error", "Extraction failed")}
+          return {"payload_json": payload, "classification_json": classification_json, "status": "error", "error": extract_result.get("error", "Extraction failed")}
 
   # Step 6: Save extraction result back to the node via GraphQL
   - name: save_payload
@@ -256,6 +531,8 @@ nodes:
       node_type: "ApplicationFormFile"
       updates:
         payload: "{{ state.payload_json }}"
+        classificationPayload: "{{ state.classification_json }}"
+        detectedYear: "{{ state.detected_year }}"
       graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
     output: update_result
 

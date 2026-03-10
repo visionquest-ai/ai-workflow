@@ -5,7 +5,11 @@ inputDocuments:
   - "/home/fabricio/src/ai-workflow/agents/file_extraction.yaml"
   - "/home/fabricio/src/ai-workflow/_bmad-output/planning-artifacts/epics/epic-14.md"
   - "/home/fabricio/src/ai-workflow/_bmad-output/implementation-artifacts/sprint-status.yaml"
-scope: "ButtonAction trigger for file_extraction agent (Phase 6 of trigger system architecture)"
+  - "/home/fabricio/src/ai-workflow/_bmad-output/project-context.md"
+  - "ref:spa-base/firebase/functions-agents/triggers/file_extraction.py"
+  - "ref:spa-base/firebase/functions-agents/agents/file_classification_agent.yaml"
+  - "ref:spa-base/firebase/projects/rankellix/functions-python/main.py"
+scope: "Three-tier directory & year detection for file_extraction agent (ported from spa-base)"
 ---
 
 # ai-workflow - Epic Breakdown
@@ -65,6 +69,7 @@ This document provides the complete epic and story breakdown for ai-workflow, im
 |------|-------|---------|----------|
 | 1 | Law Firm Website Scraper Agent | 3 | P0 (done) |
 | 15 | File Extraction Button Trigger with PathNode Input Mapping | 3 | P0 |
+| 16 | Automatic File Classification for Directory & Year Detection | 3 | P0 |
 
 ---
 
@@ -319,3 +324,239 @@ So that users can extract structured data from uploaded files with a single clic
 **When** the dispatch callback fires
 **Then** the WorkflowDispatch status is updated to `"completed"` or `"failed"`
 **And** the result or error is stored on the dispatch node
+
+---
+
+# Epic 16 Scope: Three-Tier Directory & Year Detection for File Extraction Agent
+
+## Requirements Inventory (Ported from spa-base RX.20 + RX.23.4)
+
+### Functional Requirements
+
+- FR-DD1: When directoryName is missing/empty on the ApplicationFormFile node, the agent SHALL attempt automatic directory detection via a three-tier fallback cascade (filename → content → LLM)
+- FR-DD2: TIER 1 — Detect directory from the file's fileName by matching against keyword patterns (chambers: ['chambers','c&p','candp'], iflr1000: ['iflr','iflr1000'], legal500: ['legal500','legal 500','l500'], itr: ['itr','international tax review'], leadersleague: ['leaders','league','leadersleague','leaders league'])
+- FR-DD3: TIER 2 — Extract text from the downloaded file (first 3500 chars) and match against 52+ content keyword patterns mapped to each directory (URLs, domain terms, form structure indicators)
+- FR-DD4: TIER 3 — When TIER 1 and TIER 2 both fail, invoke a file_classification LLM agent to classify the document and detect the directory
+- FR-DD5: Track which tier detected the directory via a directory_source field: "input" (pre-set), "filename" (TIER 1), "content" (TIER 2), "llm" (TIER 3)
+- FR-DD6: When directoryName IS already populated on the node, use it directly with directory_source="input" — preserving current behavior as a fast path
+- FR-DD7: The detected directory slug must resolve to the correct LlamaExtract agent name via the existing base_name_map (chambers→chambers-partners, iflr1000→iflr-1000, etc.)
+- FR-DD8: Text extraction for TIER 2 must support DOCX (python-docx) and PDF (pdfplumber) file formats
+- FR-DD9: The LLM classification agent (TIER 3) must return: directory, category, region_country, region_state, confidence, is_empty_form — with ISO code resolution for country/state
+- FR-DD10: Detect the form year using the same three-tier cascade — TIER 1: extract year from fileName (e.g., "chambers_2025.docx" → 2025), TIER 2: extract year from content keywords/patterns in the first 3500 chars, TIER 3: LLM classification returns the year
+- FR-DD11: Track year detection source via year_source field ("filename", "content", "llm", "input") independently from directory_source
+- FR-DD12: When a year is already provided on the node, use it directly with year_source="input"
+
+### Non-Functional Requirements
+
+- NFR-DD1: TIER 2 content scanning must be limited to the first 3500 characters for performance
+- NFR-DD2: TIER 3 LLM classification should be cached by content hash to avoid redundant API calls
+- NFR-DD3: TIER 1 and TIER 2 detection must complete sub-second (no network calls, pure pattern matching)
+- NFR-DD4: If all 3 tiers fail to detect a directory, the agent must error gracefully with a descriptive message listing supported directories
+- NFR-DD5: All new nodes must follow TEA YAML patterns consistent with existing file_extraction.yaml structure
+
+### Additional Requirements
+
+- Text extraction for TIER 2 requires python-docx and pdfplumber dependencies (file already downloaded in extract_and_download node)
+- A new file_classification agent YAML (agents/file_classification.yaml) must be created for TIER 3
+- The LLM classification prompt must cover all 5 directory types with specific indicators from spa-base
+- State schema needs new fields: directory_source, document_text, classification_result, detected_year, year_source
+- The classification metadata (category, region, confidence) should be persisted alongside the extraction payload
+- The existing extract_and_download node already downloads and converts files — text extraction for TIER 2 should reuse the downloaded file
+- Reference implementation: spa-base/firebase/functions-agents/triggers/file_extraction.py (TIER 1+2) and spa-base/firebase/functions-agents/agents/file_classification_agent.yaml (TIER 3)
+
+### FR Coverage Map (Epic 16)
+
+| Requirement | Story | Description |
+|-------------|-------|-------------|
+| FR-DD1 | 16.1 | Three-tier cascade when directoryName missing |
+| FR-DD2 | 16.1 | TIER 1 filename keyword patterns |
+| FR-DD3 | 16.1 | TIER 2 content keyword patterns (52+) |
+| FR-DD4 | 16.2 | TIER 3 LLM classification fallback |
+| FR-DD5 | 16.1 + 16.3 | directory_source tracking |
+| FR-DD6 | 16.1 | Fast path when directoryName pre-set |
+| FR-DD7 | 16.1 | Directory slug → LlamaExtract agent name |
+| FR-DD8 | 16.1 | DOCX/PDF text extraction for TIER 2 |
+| FR-DD9 | 16.2 | LLM returns directory + category + region + confidence |
+| FR-DD10 | 16.1 + 16.2 | Year detection via same three tiers |
+| FR-DD11 | 16.1 + 16.3 | year_source tracking |
+| FR-DD12 | 16.1 | Fast path when year pre-set |
+| NFR-DD1 | 16.1 | First 3500 chars limit |
+| NFR-DD2 | 16.2 | LLM cache by content hash |
+| NFR-DD3 | 16.1 | Sub-second TIER 1+2 |
+| NFR-DD4 | 16.1 | Graceful error on all-tiers-fail |
+| NFR-DD5 | All | TEA YAML patterns |
+
+## Epic 16: Automatic File Classification for Directory & Year Detection
+
+The file_extraction agent automatically identifies which legal directory a document belongs to and its submission year, using a three-tier fallback cascade (filename patterns → content keyword scanning → LLM classification), eliminating the need for pre-set metadata on ApplicationFormFile nodes.
+
+**FRs covered:** FR-DD1 through FR-DD12, NFR-DD1 through NFR-DD5
+**Depends on:** Epic 14 (file_extraction agent already working — done)
+
+### Story 16.1: TIER 1+2 — Filename & Content Pattern Detection for Directory and Year
+
+As a system operator,
+I want the file_extraction agent to automatically detect the directory and year from the filename and file content when they are not pre-set on the node,
+So that most files (~80%) are classified and routed to the correct LlamaExtract agent without LLM calls.
+
+**Acceptance Criteria:**
+
+**Given** an ApplicationFormFile node with `directoryName` already populated (e.g., `"chambers"`)
+**When** the agent executes the `detect_directory` step
+**Then** `directory_name` is set to the pre-existing value
+**And** `directory_source` is set to `"input"`
+**And** the agent skips TIER 1, 2, and 3 detection
+
+**Given** an ApplicationFormFile with `directoryName` empty/missing and `fileName` = `"chambers_2025.docx"`
+**When** the agent executes TIER 1 filename detection
+**Then** `directory_name` is set to `"chambers"` (matched keyword `"chambers"`)
+**And** `directory_source` is set to `"filename"`
+**And** `detected_year` is set to `2025` (extracted from filename)
+**And** `year_source` is set to `"filename"`
+
+**Given** an ApplicationFormFile with `directoryName` empty and `fileName` = `"submission_form.docx"` (no directory keyword in name)
+**When** the agent executes TIER 1
+**Then** TIER 1 returns no match
+**And** the agent proceeds to TIER 2 content scanning
+
+**Given** the downloaded file contains `"myaccount.chambers.com"` or `"Band 1"` within the first 3500 characters
+**When** the agent executes TIER 2 content keyword scanning
+**Then** `directory_name` is set to `"chambers"`
+**And** `directory_source` is set to `"content"`
+
+**Given** the downloaded file contains `"iflr1000.com"` or `"Market Leader"` within the first 3500 characters
+**When** the agent executes TIER 2
+**Then** `directory_name` is set to `"iflr1000"`
+**And** `directory_source` is set to `"content"`
+
+**Given** the file content contains a 4-digit year pattern (e.g., `"2025 submission"`) within the first 3500 chars and no year was detected from filename
+**When** the agent executes TIER 2 year detection
+**Then** `detected_year` is extracted from content
+**And** `year_source` is set to `"content"`
+
+**Given** TIER 1 and TIER 2 both fail to detect a directory
+**When** the agent reaches the end of TIER 2
+**Then** `directory_name` remains empty
+**And** the agent proceeds to TIER 3 (LLM classification in Story 16.2) if available, or errors gracefully with: `"Could not detect directory. Supported: chambers, iflr1000, legal500, itr, leadersleague"`
+
+**Given** a `.docx` file is downloaded
+**When** the agent extracts text for TIER 2 content scanning
+**Then** it uses `python-docx` to extract paragraph and table text
+**And** only the first 3500 characters are scanned
+
+**Given** a `.pdf` file is downloaded (including Word docs already converted to PDF)
+**When** the agent extracts text for TIER 2 content scanning
+**Then** it uses `pdfplumber` to extract page text
+**And** only the first 3500 characters are scanned
+
+**Given** an ApplicationFormFile with `year` already populated on the node
+**When** the agent executes year detection
+**Then** `detected_year` is set to the pre-existing value
+**And** `year_source` is set to `"input"`
+**And** year detection tiers are skipped
+
+**Implementation Notes:**
+- Modify `extract_and_download` node to also extract text (first 3500 chars) from the downloaded file after conversion
+- Add new `detect_directory` node between `extract_and_download` and `resolve_agent`
+- Add state fields: `directory_source`, `document_text`, `detected_year`, `year_source`
+- TIER 1 patterns: chambers=['chambers','c&p','candp'], iflr1000=['iflr','iflr1000'], legal500=['legal500','legal 500','l500'], itr=['itr','international tax review'], leadersleague=['leaders','league','leadersleague','leaders league']
+- TIER 2 content patterns: 52+ keywords from spa-base `DIRECTORY_CONTENT_PATTERNS` mapping
+- Remove the hard error on missing `directoryName` in `extract_and_download` — detection replaces it
+- Reference: `spa-base/firebase/functions-agents/triggers/file_extraction.py` lines 27-88, 256-282, 460-495
+
+### Story 16.2: TIER 3 — LLM Classification Agent
+
+As a system operator,
+I want a fallback LLM classification agent that identifies the directory and year when filename and content patterns fail,
+So that 100% of files can be classified regardless of naming or content patterns.
+
+**Acceptance Criteria:**
+
+**Given** TIER 1 and TIER 2 both failed to detect `directory_name`
+**When** the file_extraction agent reaches the TIER 3 step
+**Then** it invokes `agents/file_classification.yaml` with `document_text` (first 3500 chars)
+**And** passes `detected_directory: null` to indicate no pre-detection
+
+**Given** the LLM classification agent receives document text from a Chambers submission
+**When** the LLM analyzes the text
+**Then** it returns JSON with `directory: "chambers"`, `category` (e.g., "Corporate/M&A"), `region_country` (ISO 3166-1 alpha-3), `region_state` (ISO 3166-2), `confidence` (0.0-1.0), `year`, `is_empty_form` (boolean)
+**And** `directory_source` is set to `"llm"`
+
+**Given** the LLM classification agent receives document text from any of the 5 supported directories
+**When** the LLM analyzes the text
+**Then** the prompt includes specific indicators for all 5 directories: Chambers (Band rankings, PAB006/PAM006 refs), IFLR1000 (Market Leader, accreditation.euromoney.com), Legal500 (Tier rankings, Hall of Fame), ITR (World Tax, itrworldtax.com), Leaders League (Décideurs, peer feedback)
+
+**Given** the LLM cannot identify the directory with confidence
+**When** it returns a low confidence score (< 0.5) or `directory: null`
+**Then** the file_extraction agent errors gracefully with `"LLM classification inconclusive. Supported: chambers, iflr1000, legal500, itr, leadersleague"`
+**And** `status` is set to `"error"` and `completed` is `true`
+
+**Given** the LLM returns ISO country/state codes (e.g., `"BRA"`, `"BR-SP"`)
+**When** the classification result is parsed
+**Then** `region_country_display` resolves to the country name (e.g., `"Brazil"`)
+**And** `region_state_display` resolves to the state name (e.g., `"São Paulo"`)
+
+**Given** TIER 1 or TIER 2 successfully detected the directory but year was not detected
+**When** the agent reaches TIER 3
+**Then** it invokes the LLM classification agent with `detected_directory` pre-set
+**And** the LLM uses the "known directory" prompt branch (focused on category/region/year extraction)
+
+**Given** the LLM classification result is cached by content hash
+**When** the same document text is processed again
+**Then** the cached result is returned without a new LLM call
+**And** cache TTL is 30 days
+
+**Implementation Notes:**
+- Create `agents/file_classification.yaml` — TEA YAML agent with LLM node
+- Two prompt branches: unknown directory (full classification) vs known directory (category/region/year only)
+- Cache key: `classify:file:{{ document_text | sha256 }}`, TTL: 30 days
+- LLM model: configurable (default: gpt-4o or similar)
+- Temperature: 0.1 (deterministic classification)
+- Max tokens: 200
+- Add conditional node in file_extraction.yaml: if TIER 1+2 failed OR year missing → invoke file_classification agent
+- Output stored in `classification_result` state field
+- Reference: `spa-base/firebase/functions-agents/agents/file_classification_agent.yaml`
+
+### Story 16.3: Persist Classification Metadata
+
+As a system operator,
+I want the classification metadata (directory_source, year_source, category, region, confidence) persisted alongside the extraction payload,
+So that downstream consumers can audit how files were classified and leverage the enriched metadata.
+
+**Acceptance Criteria:**
+
+**Given** a successful file extraction with classification metadata available
+**When** the `save_payload` step runs
+**Then** the GraphQL mutation includes `classificationPayload` alongside `payload` on the ApplicationFormFile node
+**And** `classificationPayload` contains JSON with: `directory`, `directory_source`, `detected_year`, `year_source`, `category`, `region_country`, `region_country_display`, `region_state`, `region_state_display`, `confidence`, `is_empty_form`
+
+**Given** a file classified via TIER 1 (filename) with no LLM call
+**When** the classification metadata is persisted
+**Then** `classificationPayload` contains `directory_source: "filename"` and `category`, `region_country`, `region_state` are `null` (not available without LLM)
+**And** `confidence` is `1.0` (exact pattern match)
+
+**Given** a file classified via TIER 3 (LLM) with full classification
+**When** the classification metadata is persisted
+**Then** `classificationPayload` contains all fields populated: `directory_source: "llm"`, `category`, `region_country`, `region_country_display`, `region_state`, `region_state_display`, `confidence`, `is_empty_form`
+
+**Given** a file where directory was detected but extraction failed
+**When** the `save_payload` step runs with error status
+**Then** `classificationPayload` is still persisted with whatever metadata was available
+**And** `payload` contains the error JSON as before
+
+**Given** the `classificationPayload` property does not exist on ApplicationFormFile
+**When** the story is implemented
+**Then** the property is created via GraphQL mutations: create OntologyProperty node (`name: "classificationPayload"`, `type: "String"`), then connect it to the ApplicationFormFile OntologyClass via `HAS_PROPERTY` relationship
+**And** graphology is restarted to regenerate the GraphQL schema
+
+**Given** the `detectedYear` property does not exist on ApplicationFormFile
+**When** the story is implemented
+**Then** the property is created via GraphQL mutations: create OntologyProperty node (`name: "detectedYear"`, `type: "String"`), then connect it to the ApplicationFormFile OntologyClass via `HAS_PROPERTY` relationship
+**And** graphology is restarted to regenerate the GraphQL schema
+
+**Implementation Notes:**
+- Add `classificationPayload` and `detectedYear` to ApplicationFormFile ontology via GraphQL mutations (create OntologyProperty + connect via HAS_PROPERTY)
+- Modify `prepare_payload` node to also build `classification_json` from classification state fields
+- Modify `save_payload` node to include `classificationPayload` and `detectedYear` in the `graphology.update_node` updates
+- State schema adds: `classification_json` (serialized classification metadata)
+- Reference: spa-base persists classification alongside extraction in the same RTDB write
