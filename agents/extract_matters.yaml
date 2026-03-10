@@ -1,0 +1,267 @@
+# TEA YAML Agent - Extract Matters Agent
+# Story: RX.40 - ProtoMatter Extraction Pipeline
+#
+# Purpose: Parses the extracted file payload from an ApplicationFormFile
+# and creates individual ProtoMatter nodes (one per matter/deal),
+# each linked back to the source file via FILE_HAS_PROTO_MATTER.
+#
+# Trigger: PROPERTY_CHANGED on ApplicationFormFile.payload (after file_extraction)
+#
+# Usage:
+#   POST /run-agent {
+#     "agent": "extract_matters",
+#     "context_node_id": "<ApplicationFormFile-node-id>"
+#   }
+
+name: extract_matters
+description: |
+  Reads the payload and directory from an ApplicationFormFile node,
+  parses the payload JSON per directory format to locate matters/deals,
+  and creates one ProtoMatter node per matter with the individual
+  matter JSON in its payload field. Each ProtoMatter is linked to
+  the source ApplicationFormFile via FILE_HAS_PROTO_MATTER.
+
+variables:
+  # JSON paths where matters/deals arrays live, per directory
+  # Each directory maps to an array of paths to check (some dirs have multiple arrays)
+  matter_paths:
+    chambers:
+      - ["workHighlights", "publishableInformation", "matters"]
+      - ["workHighlights", "confidentialInformation", "matters"]
+    iflr1000:
+      - ["section_3_deal_highlights", "deal_highlights"]
+    legal500:
+      - ["section_work_highlights", "publishable_matters"]
+      - ["section_work_highlights", "non_publishable_matters"]
+    itr:
+      - ["section_2_deal_case_highlights", "matter_highlights"]
+    leadersleague:
+      - ["section_e_work_highlights", "work_highlights"]
+
+state_schema:
+  # Input (required)
+  context_node_id: str
+
+  # Intermediate
+  context_result: dict       # Result from graphology.get_node
+  file_payload: str          # Raw payload JSON from ApplicationFormFile
+  directory: str             # Directory identifier
+  matters_extracted: list    # List of individual matter JSON objects
+  proto_matter_ids: list     # IDs of created ProtoMatter nodes
+
+  # Output
+  status: str                # success, error
+  error: str                 # Error message if failed
+  completed: bool            # Completion signal
+  count: int                 # Number of ProtoMatter nodes created
+
+nodes:
+  # Step 1: Fetch the ApplicationFormFile node
+  - name: fetch_file_node
+    uses: graphology.get_node
+    with:
+      node_id: "{{ state.context_node_id }}"
+      graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
+    output: context_result
+
+  # Step 2: Parse payload and extract matters per directory format
+  - name: extract_matters
+    goto:
+      - if: "not state.matters_extracted"
+        to: __end__
+      - to: create_proto_matters
+    run: |
+      import json
+
+      context_result = state.get("context_result", {})
+
+      # Check graphology call success
+      if not context_result.get("success", True):
+          error_msg = context_result.get("error", "Failed to fetch node from graphology")
+          return {"error": error_msg, "status": "error", "completed": True, "matters_extracted": []}
+
+      data = context_result.get("data", {})
+      node_type = context_result.get("node_type", "")
+
+      if node_type != "ApplicationFormFile":
+          return {
+              "error": f"Expected ApplicationFormFile, got {node_type}",
+              "status": "error", "completed": True, "matters_extracted": []
+          }
+
+      payload_str = data.get("payload", "")
+      directory = (data.get("directoryName") or data.get("directory") or "").lower().strip()
+
+      if not payload_str:
+          return {"error": "ApplicationFormFile has no payload", "status": "error", "completed": True, "matters_extracted": []}
+
+      if not directory:
+          return {"error": "ApplicationFormFile has no directory", "status": "error", "completed": True, "matters_extracted": []}
+
+      # Parse payload JSON
+      try:
+          payload = json.loads(payload_str)
+      except json.JSONDecodeError as e:
+          return {"error": f"Malformed JSON payload: {e}", "status": "error", "completed": True, "matters_extracted": []}
+
+      # Directory-specific matter paths
+      matter_paths = {
+          "chambers": [
+              ["workHighlights", "publishableInformation", "matters"],
+              ["workHighlights", "confidentialInformation", "matters"],
+          ],
+          "iflr1000": [
+              ["section_3_deal_highlights", "deal_highlights"],
+          ],
+          "legal500": [
+              ["section_work_highlights", "publishable_matters"],
+              ["section_work_highlights", "non_publishable_matters"],
+          ],
+          "itr": [
+              ["section_2_deal_case_highlights", "matter_highlights"],
+          ],
+          "leadersleague": [
+              ["section_e_work_highlights", "work_highlights"],
+          ],
+      }
+
+      # Normalize directory aliases
+      dir_aliases = {
+          "chambers": "chambers",
+          "chambers-partners": "chambers",
+          "iflr1000": "iflr1000",
+          "iflr-1000": "iflr1000",
+          "legal500": "legal500",
+          "legal 500": "legal500",
+          "the-legal-500": "legal500",
+          "itr": "itr",
+          "itr-world-tax": "itr",
+          "leadersleague": "leadersleague",
+          "leaders league": "leadersleague",
+          "leaders-league": "leadersleague",
+      }
+
+      normalized_dir = dir_aliases.get(directory)
+      if not normalized_dir:
+          supported = list(dir_aliases.keys())
+          return {
+              "error": f"Unknown directory: '{directory}'. Supported: {supported}",
+              "status": "error", "completed": True, "matters_extracted": []
+          }
+
+      paths = matter_paths.get(normalized_dir, [])
+      all_matters = []
+
+      for path in paths:
+          # Navigate nested path
+          obj = payload
+          for key in path:
+              if isinstance(obj, dict):
+                  obj = obj.get(key)
+              else:
+                  obj = None
+                  break
+
+          if isinstance(obj, list):
+              all_matters.extend(obj)
+
+      if not all_matters:
+          # Not an error — file may have no matters
+          return {
+              "status": "success",
+              "completed": True,
+              "matters_extracted": [],
+              "count": 0,
+              "directory": normalized_dir,
+          }
+
+      return {
+          "matters_extracted": all_matters,
+          "directory": normalized_dir,
+          "file_payload": payload_str,
+      }
+
+  # Step 3: Create ProtoMatter nodes and connect to source file
+  - name: create_proto_matters
+    goto: __end__
+    run: |
+      import json
+      import os
+
+      matters = state.get("matters_extracted", [])
+      directory = state.get("directory", "")
+      context_node_id = state.get("context_node_id", "")
+      graphql_url = os.environ.get("GRAPHOLOGY_URL", variables.get("GRAPHOLOGY_URL", "http://localhost:4000/graphql"))
+
+      if not matters:
+          return {"status": "success", "completed": True, "count": 0, "proto_matter_ids": []}
+
+      created_ids = []
+      errors = []
+
+      for i, matter in enumerate(matters):
+          try:
+              matter_json = json.dumps(matter) if not isinstance(matter, str) else matter
+
+              # Create ProtoMatter and connect to source ApplicationFormFile in one mutation
+              mutation = """
+              mutation CreateProtoMatter($input: [ProtoMatterCreateInput!]!) {
+                createProtoMatters(input: $input) {
+                  protoMatters { id status }
+                }
+              }
+              """
+              variables_gql = {
+                  "input": [{
+                      "payload": matter_json,
+                      "directory": directory,
+                      "status": "pending",
+                      "fileHasProtoMatterFrom": {
+                          "connect": [{
+                              "where": {"node": {"id_EQ": context_node_id}}
+                          }]
+                      }
+                  }]
+              }
+
+              import requests
+              resp = requests.post(
+                  graphql_url,
+                  json={"query": mutation, "variables": variables_gql},
+                  headers={"Content-Type": "application/json"},
+                  timeout=30
+              )
+              resp.raise_for_status()
+              result = resp.json()
+
+              if result.get("errors"):
+                  errors.append(f"Matter {i}: {result['errors'][0].get('message', 'Unknown error')}")
+                  continue
+
+              proto_id = result.get("data", {}).get("createProtoMatters", {}).get("protoMatters", [{}])[0].get("id")
+              if proto_id:
+                  created_ids.append(proto_id)
+
+          except Exception as e:
+              errors.append(f"Matter {i}: {str(e)}")
+              continue
+
+      if errors and not created_ids:
+          return {
+              "status": "error",
+              "error": f"All {len(matters)} matters failed: {'; '.join(errors[:3])}",
+              "completed": True,
+              "count": 0,
+              "proto_matter_ids": [],
+          }
+
+      return {
+          "status": "success",
+          "completed": True,
+          "count": len(created_ids),
+          "proto_matter_ids": created_ids,
+          "error": f"{len(errors)} partial failures" if errors else "",
+      }
+
+config:
+  raise_exceptions: false
