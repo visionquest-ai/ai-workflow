@@ -68,8 +68,8 @@ query GetWorkflowQuestions($workflowId: ID!) {
 
 CREATE_PROMPT_EXECUTION_MUTATION = """
 mutation CreatePromptExecution($input: [PromptExecutionCreateInput!]!) {
-  createPromptExecutions(input: $input) {
-    promptExecutions {
+  createPromptExecution(input: $input) {
+    promptExecution {
       id
     }
   }
@@ -351,7 +351,7 @@ def save_workflow_responses(
             "hasExecutionFrom": {
                 "connect": [{
                     "where": {
-                        "node": {"id": version_id}
+                        "node": {"id_EQ": version_id}
                     }
                 }]
             },
@@ -389,7 +389,7 @@ def save_workflow_responses(
 
         batch_ids = [
             ex.get("id")
-            for ex in data.get("createPromptExecutions", {}).get("promptExecutions", [])
+            for ex in data.get("createPromptExecution", {}).get("promptExecution", [])
         ]
         execution_ids.extend(batch_ids)
 
