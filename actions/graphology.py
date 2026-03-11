@@ -862,7 +862,7 @@ def update_node(
     """
 
     variables = {
-        "where": {"id": node_id},
+        "where": {"id_EQ": node_id},
         "update": update_fields,
     }
 
@@ -926,20 +926,21 @@ def create_node(
     url = _get_graphql_url(kwargs, state)
     api_key = _get_graphql_api_key(kwargs, state)
 
-    # Build mutation — Neo4j GraphQL Library v6 uses singular type names
-    mutation_name = f"create{node_type}"
-    # Result field accessor: lowercase first char (e.g. ProtoMatter → protoMatter)
-    result_field = node_type[0].lower() + node_type[1:]
+    # Build mutation — Neo4j GraphQL Library v6 uses plural type names
+    # with list input: createProtoMatters(input: [ProtoMatterCreateInput!]!)
+    mutation_name = f"create{node_type}s"
+    # Result field accessor: lowercase first char + plural (e.g. ProtoMatter → protoMatters)
+    result_field = node_type[0].lower() + node_type[1:] + "s"
 
     mutation = f"""
-    mutation CreateNode($input: {node_type}CreateInput!) {{
+    mutation CreateNode($input: [{node_type}CreateInput!]!) {{
       {mutation_name}(input: $input) {{
         {result_field} {{ id }}
       }}
     }}
     """
 
-    variables = {"input": properties}
+    variables = {"input": [properties]}
 
     try:
         data = _execute_graphql(url, mutation, variables, api_key=api_key)
@@ -947,11 +948,11 @@ def create_node(
         logger.error(f"graphology.create_node failed: {e}")
         return {"success": False, "error": str(e)}
 
-    results = data.get(mutation_name, {}).get(result_field, {})
-    if not results:
+    results_list = data.get(mutation_name, {}).get(result_field, [])
+    if not results_list:
         return {"success": False, "error": f"No node returned after create {node_type}"}
 
-    node_id = results.get("id", "")
+    node_id = results_list[0].get("id", "") if results_list else ""
 
     logger.info(f"graphology.create_node: Created {node_type} node {node_id}")
 
@@ -1043,15 +1044,19 @@ def connect_nodes(
     """
 
     variables = {
-        "where": {"id": source_id},
+        "where": {"id_EQ": source_id},
         "update": {
-            rel_field: {
-                "connect": {
-                    "where": {
-                        "node": {"id": target_id}
-                    }
+            rel_field: [
+                {
+                    "connect": [
+                        {
+                            "where": {
+                                "node": {"id_EQ": target_id}
+                            }
+                        }
+                    ]
                 }
-            }
+            ]
         },
     }
 

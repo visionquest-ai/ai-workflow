@@ -62,8 +62,8 @@ class TestCreateNode:
     @patch("actions.graphology._execute_graphql")
     def test_success(self, mock_gql):
         mock_gql.return_value = {
-            "createProtoMatter": {
-                "protoMatter": {"id": "proto-123"}
+            "createProtoMatters": {
+                "protoMatters": [{"id": "proto-123"}]
             }
         }
         result = create_node(
@@ -75,15 +75,16 @@ class TestCreateNode:
         assert result["success"] is True
         assert result["node_id"] == "proto-123"
 
-        # Verify mutation structure
+        # Verify mutation structure — plural name, list input
         call_args = mock_gql.call_args
         assert call_args[0][0] == "http://localhost:4000"
         mutation = call_args[0][1]
-        assert "createProtoMatter" in mutation
-        assert "ProtoMatterCreateInput" in mutation
+        assert "createProtoMatters" in mutation
+        assert "[ProtoMatterCreateInput!]!" in mutation
         variables = call_args[0][2]
-        assert variables["input"]["payload"] == "{}"
-        assert variables["input"]["directory"] == "chambers"
+        assert isinstance(variables["input"], list)
+        assert variables["input"][0]["payload"] == "{}"
+        assert variables["input"][0]["directory"] == "chambers"
 
     @patch("actions.graphology._execute_graphql")
     def test_graphql_error(self, mock_gql):
@@ -111,7 +112,7 @@ class TestCreateNode:
 
     @patch("actions.graphology._execute_graphql")
     def test_empty_response(self, mock_gql):
-        mock_gql.return_value = {"createProtoMatter": {"protoMatter": {}}}
+        mock_gql.return_value = {"createProtoMatters": {"protoMatters": []}}
         result = create_node(
             {},
             node_type="ProtoMatter",
@@ -192,12 +193,16 @@ class TestConnectNodes:
         )
         assert result["success"] is True
 
-        # Verify mutation uses correct camelCase field name
+        # Verify mutation uses correct camelCase field name with list wrapping
         call_args = mock_gql.call_args
         variables = call_args[0][2]
+        assert variables["where"]["id_EQ"] == "file-1"
         assert "fileHasProtoMatter" in variables["update"]
-        connect_clause = variables["update"]["fileHasProtoMatter"]["connect"]
-        assert connect_clause["where"]["node"]["id"] == "proto-1"
+        rel_list = variables["update"]["fileHasProtoMatter"]
+        assert isinstance(rel_list, list)
+        connect_list = rel_list[0]["connect"]
+        assert isinstance(connect_list, list)
+        assert connect_list[0]["where"]["node"]["id_EQ"] == "proto-1"
 
     @patch("actions.graphology._execute_graphql")
     def test_graphql_error(self, mock_gql):
