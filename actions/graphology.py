@@ -694,7 +694,7 @@ def _find_node_type(
             remaining_items.append((query_field, type_name))
 
     for query_field, type_name in priority_items + remaining_items:
-        query = f'query FindNode($id: ID!) {{ {query_field}(where: {{id: $id}}) {{ id }} }}'
+        query = f'query FindNode($id: ID!) {{ {query_field}(where: {{id_EQ: $id}}) {{ id }} }}'
         try:
             data = _execute_graphql(url, query, {"id": node_id}, api_key=api_key)
         except (ConnectionError, RuntimeError):
@@ -764,7 +764,7 @@ def get_node(
 
         # Step 4: Query the full node
         fields_str = " ".join(scalar_fields)
-        full_query = f'query GetNode($id: ID!) {{ {query_field}(where: {{id: $id}}) {{ {fields_str} }} }}'
+        full_query = f'query GetNode($id: ID!) {{ {query_field}(where: {{id_EQ: $id}}) {{ {fields_str} }} }}'
         data = _execute_graphql(url, full_query, {"id": node_id}, api_key=api_key)
 
         results = data.get(query_field, [])
