@@ -170,7 +170,7 @@ nodes:
       if node_type != "ProtoMatter":
           return {"source_node_type": node_type}
 
-      graphql_url = os.environ.get("GRAPHOLOGY_URL", variables.get("GRAPHOLOGY_URL", "http://localhost:4000/graphql"))
+      graphql_url = os.environ.get("GRAPHOLOGY_URL", "http://localhost:4000/graphql")
       proto_matter_id = context_node_id
 
       # Determine status based on save result
@@ -190,10 +190,14 @@ nodes:
             ) { protoMatters { id status } }
           }
           """
+          api_key = os.environ.get("GRAPHOLOGY_API_KEY", "")
+          headers = {"Content-Type": "application/json"}
+          if api_key:
+              headers["x-api-key"] = api_key
           resp = requests.post(
               graphql_url,
               json={"query": update_mutation, "variables": {"id": proto_matter_id, "status": new_status}},
-              headers={"Content-Type": "application/json"},
+              headers=headers,
               timeout=30
           )
           resp.raise_for_status()
@@ -221,7 +225,7 @@ nodes:
               resp = requests.post(
                   graphql_url,
                   json={"query": link_mutation, "variables": {"protoMatterId": proto_matter_id, "matterId": matter_id}},
-                  headers={"Content-Type": "application/json"},
+                  headers=headers,
                   timeout=30
               )
               resp.raise_for_status()
