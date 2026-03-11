@@ -254,6 +254,8 @@ def save_workflow_responses(
     workflow_id: str,
     matter_id: str,
     responses: List[Dict[str, Any]],
+    context_node_id: str = "",
+    context_node_type: str = "",
     **kwargs,
 ) -> Dict[str, Any]:
     """
@@ -266,11 +268,18 @@ def save_workflow_responses(
         - llmRequest: The request sent to the LLM
         - llmResponse: The LLM's response
 
+    When context_node_id and context_node_type are provided, links each
+    PromptExecution to the existing node via HAS_CONTEXT (connect) instead
+    of creating a new ContextNode. Uses union type syntax for the GraphQL
+    mutation (hasContext is a union: ContextNode | ProtoMatter | Matter).
+
     Args:
         state: Current agent state
         workflow_id: Workflow ID (for tracking)
         matter_id: Client/matter ID (stored as clientId)
         responses: List of response dicts
+        context_node_id: (optional) ID of existing node to link as context
+        context_node_type: (optional) GraphQL type name (e.g. "ProtoMatter", "Matter")
         graphql_url: (optional kwarg) GraphQL endpoint URL
 
     Returns:
@@ -325,22 +334,11 @@ def save_workflow_responses(
             context_content = ""
             llm_req_str = llm_request if isinstance(llm_request, str) else json.dumps(llm_request)
 
-        # ContextNode stores the document context; llmRequest stores the question
-        context_node_content = context_content if context_content else llm_req_str
-
         exec_input = {
             "clientId": matter_id,
             "status": execution_status,
             "llmRequest": llm_req_str,
             "llmResponse": llm_resp_str,
-            "hasContext": {
-                "create": [{
-                    "node": {
-                        "content": context_node_content,
-                        "contextType": "DOCUMENT",
-                    }
-                }]
-            },
             "hasResponse": {
                 "create": [{
                     "node": {
@@ -356,6 +354,32 @@ def save_workflow_responses(
                 }]
             },
         }
+
+        # HAS_CONTEXT: connect to existing node or create new ContextNode
+        # Uses union type syntax: hasContext.{TypeName}.{connect|create}
+        if context_node_id and context_node_type:
+            exec_input["contextNodeId"] = context_node_id
+            exec_input["hasContext"] = {
+                context_node_type: {
+                    "connect": [{
+                        "where": {
+                            "node": {"id_EQ": context_node_id}
+                        }
+                    }]
+                }
+            }
+        else:
+            context_node_content = context_content if context_content else llm_req_str
+            exec_input["hasContext"] = {
+                "ContextNode": {
+                    "create": [{
+                        "node": {
+                            "content": context_node_content,
+                            "contextType": "DOCUMENT",
+                        }
+                    }]
+                }
+            }
         if metadata:
             exec_input["metadata"] = metadata
         execution_inputs.append(exec_input)
