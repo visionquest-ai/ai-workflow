@@ -42,7 +42,7 @@ def _get_graphql_api_key(kwargs: dict, state: dict = None) -> str | None:
 
 GET_WORKFLOW_QUESTIONS_QUERY = """
 query GetWorkflowQuestions($workflowId: ID!) {
-  workflows(where: { id: $workflowId }) {
+  workflow(where: { id_EQ: $workflowId }) {
     id
     name
     hasStep {
@@ -54,7 +54,7 @@ query GetWorkflowQuestions($workflowId: ID!) {
         id
         name
         description
-        hasVersion(where: { status: "active" }) {
+        hasVersion(where: { status_EQ: "active" }) {
           id
           versionNumber
           status
@@ -164,7 +164,7 @@ def _flatten_questions(workflow_data: dict) -> List[dict]:
     stepName, stepOrder.
     """
     questions = []
-    workflows = workflow_data.get("workflows", [])
+    workflows = workflow_data.get("workflow", [])
 
     if not workflows:
         return questions
