@@ -560,3 +560,37 @@ So that downstream consumers can audit how files were classified and leverage th
 - Modify `save_payload` node to include `classificationPayload` and `detectedYear` in the `graphology.update_node` updates
 - State schema adds: `classification_json` (serialized classification metadata)
 - Reference: spa-base persists classification alongside extraction in the same RTDB write
+
+### Story 16.4: Expand ProtoMatters from LlamaExtract Payload
+
+As a system operator,
+I want the file_extraction agent to parse the LlamaExtract payload after saving and create individual ProtoMatter nodes for each extracted matter/deal, linked to both the ApplicationFormFile and the Department the file belongs to,
+So that extracted data is graph-native and each matter can be independently reviewed, imported, or rejected downstream.
+
+**Acceptance Criteria:**
+
+**Given** a successful LlamaExtract extraction with `payload_json` containing an array of matters/deals
+**When** the `expand_proto_matters` node runs after `save_payload`
+**Then** one ProtoMatter node is created for each item via `graphology.create_node` with `payload`, `directory`, `status: "pending"`
+**And** each ProtoMatter is linked to the ApplicationFormFile via `FILE_HAS_PROTO_MATTER`
+**And** each ProtoMatter is linked to the Department (if found) via `DEPARTMENT_HAS_PROTO_MATTER`
+
+**Given** the extraction failed (`status == "error"`)
+**When** the flow reaches `expand_proto_matters`
+**Then** the node is skipped entirely (no ProtoMatter nodes created)
+
+**Given** the payload contains zero matters (empty array or missing key)
+**When** `expand_proto_matters` runs
+**Then** no ProtoMatter nodes are created and no error is raised
+
+**Given** `graphology.create_node` and `graphology.connect_nodes` actions do not exist
+**When** this story is implemented
+**Then** both are added to `actions/graphology.py` following the same patterns as `update_node`
+
+**Implementation Notes:**
+- Add `graphology.create_node` and `graphology.connect_nodes` actions to `actions/graphology.py`
+- Add `expand_proto_matters` node between `save_payload` and `finalize` in `file_extraction.yaml`
+- ProtoMatter class and `FILE_HAS_PROTO_MATTER` are already defined in graphology's `bootstrap.ts` (but may not be deployed)
+- Add `DEPARTMENT_HAS_PROTO_MATTER` relationship to `bootstrap.ts` DOMAIN_RELATIONS
+- Department discovery: query graph to find Department linked to the ApplicationFormFile
+- LlamaExtract payload structure varies by directory — matters key mapping: chambers=`workHighlights.*.matters` (2 arrays), iflr1000=`dealHighlights.deals`, legal500=`workHighlightsDetailed` + `_nonPublishable` (2 arrays), itr=`section_2_deal_and_case_highlights`, leadersleague=`work_highlights`. Source: `spa-base/docs/formsPayloadsTemplate/`

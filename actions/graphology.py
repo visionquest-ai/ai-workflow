@@ -891,6 +891,189 @@ def update_node(
 
 
 # =============================================================================
+# create_node ACTION (Story 16.4)
+# =============================================================================
+
+def create_node(
+    state: Dict[str, Any],
+    node_type: str,
+    properties: Dict[str, Any],
+    **kwargs,
+) -> Dict[str, Any]:
+    """
+    Create a new graph node via GraphQL mutation.
+
+    TEA Custom Action: graphology.create_node
+
+    Uses Neo4j GraphQL Library v6 convention: create<SingularType>(input: {...}).
+
+    Args:
+        state: Current agent state
+        node_type: GraphQL type name (e.g. "ProtoMatter")
+        properties: Dict of property names to values
+        graphql_url: (optional kwarg) GraphQL endpoint URL
+
+    Returns:
+        Dict with success, node_id
+    """
+    logger.info(f"graphology.create_node: type={node_type}, properties={list(properties.keys())}")
+
+    if not node_type:
+        return {"success": False, "error": "node_type is required"}
+    if not properties:
+        return {"success": False, "error": "properties dict is required and must not be empty"}
+
+    url = _get_graphql_url(kwargs, state)
+    api_key = _get_graphql_api_key(kwargs, state)
+
+    # Build mutation — Neo4j GraphQL Library v6 uses singular type names
+    mutation_name = f"create{node_type}"
+    # Result field accessor: lowercase first char (e.g. ProtoMatter → protoMatter)
+    result_field = node_type[0].lower() + node_type[1:]
+
+    mutation = f"""
+    mutation CreateNode($input: {node_type}CreateInput!) {{
+      {mutation_name}(input: $input) {{
+        {result_field} {{ id }}
+      }}
+    }}
+    """
+
+    variables = {"input": properties}
+
+    try:
+        data = _execute_graphql(url, mutation, variables, api_key=api_key)
+    except (ConnectionError, RuntimeError) as e:
+        logger.error(f"graphology.create_node failed: {e}")
+        return {"success": False, "error": str(e)}
+
+    results = data.get(mutation_name, {}).get(result_field, {})
+    if not results:
+        return {"success": False, "error": f"No node returned after create {node_type}"}
+
+    node_id = results.get("id", "")
+
+    logger.info(f"graphology.create_node: Created {node_type} node {node_id}")
+
+    return {
+        "success": True,
+        "node_id": node_id,
+    }
+
+
+# =============================================================================
+# connect_nodes ACTION (Story 16.4)
+# =============================================================================
+
+def _relationship_to_field_name(relationship_name: str) -> str:
+    """Convert UPPER_SNAKE_CASE relationship name to camelCase field name.
+
+    Neo4j GraphQL Library v6 generates field names by converting
+    UPPER_SNAKE_CASE to camelCase. E.g.:
+        FILE_HAS_PROTO_MATTER → fileHasProtoMatter
+        DEPARTMENT_HAS_PROTO_MATTER → departmentHasProtoMatter
+    """
+    parts = relationship_name.lower().split("_")
+    return parts[0] + "".join(p.capitalize() for p in parts[1:])
+
+
+def connect_nodes(
+    state: Dict[str, Any],
+    source_id: str,
+    source_type: str,
+    relationship_name: str,
+    target_id: str,
+    target_type: str,
+    **kwargs,
+) -> Dict[str, Any]:
+    """
+    Connect two nodes via a relationship using GraphQL update + connect.
+
+    TEA Custom Action: graphology.connect_nodes
+
+    Uses Neo4j GraphQL Library v6 convention:
+        update<SourceType>(where: {id: ...}, update: {
+            <relationshipField>: { connect: { where: { node: { id: ... }}}}
+        })
+
+    Args:
+        state: Current agent state
+        source_id: ID of the source node
+        source_type: GraphQL type name of source (e.g. "ApplicationFormFile")
+        relationship_name: UPPER_SNAKE_CASE relationship name (e.g. "FILE_HAS_PROTO_MATTER")
+        target_id: ID of the target node
+        target_type: GraphQL type name of target (e.g. "ProtoMatter")
+        graphql_url: (optional kwarg) GraphQL endpoint URL
+
+    Returns:
+        Dict with success
+    """
+    logger.info(
+        f"graphology.connect_nodes: {source_type}({source_id}) "
+        f"-[{relationship_name}]-> {target_type}({target_id})"
+    )
+
+    if not source_id:
+        return {"success": False, "error": "source_id is required"}
+    if not source_type:
+        return {"success": False, "error": "source_type is required"}
+    if not relationship_name:
+        return {"success": False, "error": "relationship_name is required"}
+    if not target_id:
+        return {"success": False, "error": "target_id is required"}
+    if not target_type:
+        return {"success": False, "error": "target_type is required"}
+
+    url = _get_graphql_url(kwargs, state)
+    api_key = _get_graphql_api_key(kwargs, state)
+
+    # Derive camelCase field name from UPPER_SNAKE_CASE relationship
+    rel_field = _relationship_to_field_name(relationship_name)
+
+    # Build mutation — singular type name (v6)
+    mutation_name = f"update{source_type}"
+    result_field = source_type[0].lower() + source_type[1:]
+
+    mutation = f"""
+    mutation ConnectNodes($where: {source_type}Where!, $update: {source_type}UpdateInput!) {{
+      {mutation_name}(where: $where, update: $update) {{
+        {result_field} {{ id }}
+      }}
+    }}
+    """
+
+    variables = {
+        "where": {"id": source_id},
+        "update": {
+            rel_field: {
+                "connect": {
+                    "where": {
+                        "node": {"id": target_id}
+                    }
+                }
+            }
+        },
+    }
+
+    try:
+        data = _execute_graphql(url, mutation, variables, api_key=api_key)
+    except (ConnectionError, RuntimeError) as e:
+        logger.error(f"graphology.connect_nodes failed: {e}")
+        return {"success": False, "error": str(e)}
+
+    results = data.get(mutation_name, {}).get(result_field, [])
+    if not results:
+        return {"success": False, "error": f"No node returned after connect: {source_id}"}
+
+    logger.info(
+        f"graphology.connect_nodes: Connected {source_type}({source_id}) "
+        f"-[{relationship_name}]-> {target_type}({target_id})"
+    )
+
+    return {"success": True}
+
+
+# =============================================================================
 # ACTION REGISTRATION
 # =============================================================================
 
@@ -907,10 +1090,13 @@ def register_actions(registry: Dict[str, Callable], engine: Any) -> None:
     registry["graphology.collect_answers"] = collect_parallel_answers
     registry["graphology.get_node"] = get_node
     registry["graphology.update_node"] = update_node
+    registry["graphology.create_node"] = create_node
+    registry["graphology.connect_nodes"] = connect_nodes
 
     logger.info(
         "Graphology actions registered: "
         "graphology.get_questions, graphology.save_responses, "
         "graphology.collect_answers, graphology.get_node, "
-        "graphology.update_node"
+        "graphology.update_node, graphology.create_node, "
+        "graphology.connect_nodes"
     )
