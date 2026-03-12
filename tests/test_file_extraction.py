@@ -1654,3 +1654,505 @@ class TestProtoMatterStateSchema:
     def test_department_id_field_exists(self, agent_def):
         """AC3: department_id field in state_schema."""
         assert "department_id" in agent_def["state_schema"]
+
+
+# =============================================================================
+# ApplicationFormFile Status Tracking tests (Story 14.4)
+# =============================================================================
+
+class TestStatusTrackingReadingNode:
+    """Tests for update_status_reading node (Story 14.4, AC1)."""
+
+    def test_update_status_reading_node_exists(self, agent_def):
+        """AC1: update_status_reading node exists in agent definition."""
+        node_names = [n["name"] for n in agent_def["nodes"]]
+        assert "update_status_reading" in node_names
+
+    def test_update_status_reading_uses_graphology_update(self, agent_def):
+        """AC1: update_status_reading uses graphology.update_node."""
+        node = next(n for n in agent_def["nodes"] if n["name"] == "update_status_reading")
+        assert node["uses"] == "graphology.update_node"
+
+    def test_update_status_reading_sets_status_reading(self, agent_def):
+        """AC1: update_status_reading sets status to 'reading'."""
+        node = next(n for n in agent_def["nodes"] if n["name"] == "update_status_reading")
+        assert node["with"]["updates"]["status"] == "reading"
+
+    def test_update_status_reading_targets_application_form_file(self, agent_def):
+        """AC1: update_status_reading targets ApplicationFormFile node type."""
+        node = next(n for n in agent_def["nodes"] if n["name"] == "update_status_reading")
+        assert node["with"]["node_type"] == "ApplicationFormFile"
+
+    def test_extract_and_download_routes_to_update_status_reading(self, agent_def):
+        """AC1: extract_and_download success routes to update_status_reading."""
+        node = next(n for n in agent_def["nodes"] if n["name"] == "extract_and_download")
+        goto_targets = [g.get("to") for g in node["goto"]]
+        assert "update_status_reading" in goto_targets
+
+    def test_update_status_reading_before_detect_directory(self, agent_def):
+        """AC1: update_status_reading appears before detect_directory in node order."""
+        node_names = [n["name"] for n in agent_def["nodes"]]
+        reading_idx = node_names.index("update_status_reading")
+        detect_idx = node_names.index("detect_directory")
+        assert reading_idx < detect_idx
+
+
+class TestStatusTrackingFailedOnDownloadError:
+    """Tests for status 'failed' on download errors (Story 14.4, AC3)."""
+
+    def test_gcs_download_failure_sets_failed(self, agent_def):
+        """AC3: GCS download failure calls graphology.update_node with status 'failed'."""
+        update_calls = []
+
+        def mock_update_node(**kwargs):
+            update_calls.append(kwargs)
+            return {"success": True}
+
+        mock_actions = {"graphology.update_node": mock_update_node}
+
+        import unittest.mock as mock
+        mock_fsspec = mock.MagicMock()
+        mock_fsspec.filesystem.return_value.open.side_effect = Exception("GCS error")
+
+        state = {
+            "context_node_id": "file-123",
+            "context_result": {
+                "success": True,
+                "node_type": "ApplicationFormFile",
+                "data": {"storageUrl": "gs://bucket/file.pdf", "fileName": "file.pdf"},
+            },
+        }
+
+        result = _exec_node_with_actions(
+            agent_def, "extract_and_download", state,
+            mock_actions=mock_actions, mock_modules={"fsspec": mock_fsspec},
+        )
+
+        assert result["status"] == "error"
+        assert len(update_calls) == 1
+        assert update_calls[0]["updates"] == {"status": "failed"}
+        assert update_calls[0]["node_id"] == "file-123"
+
+    def test_http_download_failure_sets_failed(self, agent_def):
+        """AC3: HTTP download failure calls graphology.update_node with status 'failed'."""
+        update_calls = []
+
+        def mock_update_node(**kwargs):
+            update_calls.append(kwargs)
+            return {"success": True}
+
+        mock_actions = {"graphology.update_node": mock_update_node}
+
+        import unittest.mock as mock
+        mock_requests = mock.MagicMock()
+        mock_requests.get.side_effect = Exception("HTTP error")
+
+        state = {
+            "context_node_id": "file-456",
+            "context_result": {
+                "success": True,
+                "node_type": "ApplicationFormFile",
+                "data": {"storageUrl": "https://example.com/file.pdf", "fileName": "file.pdf"},
+            },
+        }
+
+        result = _exec_node_with_actions(
+            agent_def, "extract_and_download", state,
+            mock_actions=mock_actions, mock_modules={"requests": mock_requests},
+        )
+
+        assert result["status"] == "error"
+        assert len(update_calls) == 1
+        assert update_calls[0]["updates"] == {"status": "failed"}
+
+    def test_unsupported_scheme_sets_failed(self, agent_def):
+        """AC3: Unsupported URL scheme sets status 'failed'."""
+        update_calls = []
+
+        def mock_update_node(**kwargs):
+            update_calls.append(kwargs)
+            return {"success": True}
+
+        mock_actions = {"graphology.update_node": mock_update_node}
+
+        state = {
+            "context_node_id": "file-789",
+            "context_result": {
+                "success": True,
+                "node_type": "ApplicationFormFile",
+                "data": {"storageUrl": "ftp://invalid/file.pdf", "fileName": "file.pdf"},
+            },
+        }
+
+        result = _exec_node_with_actions(
+            agent_def, "extract_and_download", state,
+            mock_actions=mock_actions,
+        )
+
+        assert result["status"] == "error"
+        assert len(update_calls) == 1
+        assert update_calls[0]["updates"] == {"status": "failed"}
+
+    def test_no_storage_url_sets_failed(self, agent_def):
+        """AC3: Missing storageUrl sets status 'failed'."""
+        update_calls = []
+
+        def mock_update_node(**kwargs):
+            update_calls.append(kwargs)
+            return {"success": True}
+
+        mock_actions = {"graphology.update_node": mock_update_node}
+
+        state = {
+            "context_node_id": "file-no-url",
+            "context_result": {
+                "success": True,
+                "node_type": "ApplicationFormFile",
+                "data": {"storageUrl": ""},
+            },
+        }
+
+        result = _exec_node_with_actions(
+            agent_def, "extract_and_download", state,
+            mock_actions=mock_actions,
+        )
+
+        assert result["status"] == "error"
+        assert len(update_calls) == 1
+        assert update_calls[0]["updates"] == {"status": "failed"}
+
+    def test_wrong_node_type_sets_failed(self, agent_def):
+        """AC3: Wrong node type sets status 'failed'."""
+        update_calls = []
+
+        def mock_update_node(**kwargs):
+            update_calls.append(kwargs)
+            return {"success": True}
+
+        mock_actions = {"graphology.update_node": mock_update_node}
+
+        state = {
+            "context_node_id": "file-wrong-type",
+            "context_result": {
+                "success": True,
+                "node_type": "LegalFirm",
+                "data": {"storageUrl": "gs://bucket/file.pdf"},
+            },
+        }
+
+        result = _exec_node_with_actions(
+            agent_def, "extract_and_download", state,
+            mock_actions=mock_actions,
+        )
+
+        assert result["status"] == "error"
+        assert len(update_calls) == 1
+        assert update_calls[0]["updates"] == {"status": "failed"}
+
+    def test_graphology_fetch_failure_sets_failed(self, agent_def):
+        """AC3: Graphology fetch failure (context_result.success=False) sets status 'failed'."""
+        update_calls = []
+
+        def mock_update_node(**kwargs):
+            update_calls.append(kwargs)
+            return {"success": True}
+
+        mock_actions = {"graphology.update_node": mock_update_node}
+
+        state = {
+            "context_node_id": "file-gql-fail",
+            "context_result": {
+                "success": False,
+                "error": "Service unavailable (503)",
+            },
+        }
+
+        result = _exec_node_with_actions(
+            agent_def, "extract_and_download", state,
+            mock_actions=mock_actions,
+        )
+
+        assert result["status"] == "error"
+        assert "503" in result["error"]
+        assert len(update_calls) == 1
+        assert update_calls[0]["updates"] == {"status": "failed"}
+        assert update_calls[0]["node_id"] == "file-gql-fail"
+
+    def test_pdf_conversion_failure_sets_failed(self, agent_def):
+        """AC3: PDF conversion failure sets status 'failed'."""
+        update_calls = []
+
+        def mock_update_node(**kwargs):
+            update_calls.append(kwargs)
+            return {"success": True}
+
+        mock_actions = {"graphology.update_node": mock_update_node}
+
+        import unittest.mock as mock
+
+        # Create a real temp file that looks like a .docx download
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".docx")
+        tmp.write(b"fake docx content")
+        tmp.close()
+
+        mock_fsspec = mock.MagicMock()
+        mock_fs = mock.MagicMock()
+        mock_fsspec.filesystem.return_value = mock_fs
+
+        # Make fs.open return the fake content successfully
+        mock_file_ctx = mock.MagicMock()
+        mock_file_ctx.__enter__ = mock.MagicMock(return_value=mock.MagicMock(read=mock.MagicMock(return_value=b"fake")))
+        mock_file_ctx.__exit__ = mock.MagicMock(return_value=False)
+        mock_fs.open.return_value = mock_file_ctx
+
+        # Mock subprocess to simulate LibreOffice failure
+        mock_subprocess = mock.MagicMock()
+        mock_subprocess.run.return_value = mock.MagicMock(returncode=1, stderr="LibreOffice crashed", stdout="")
+
+        state = {
+            "context_node_id": "file-pdf-fail",
+            "context_result": {
+                "success": True,
+                "node_type": "ApplicationFormFile",
+                "data": {"storageUrl": "gs://bucket/file.docx", "fileName": "file.docx"},
+            },
+        }
+
+        result = _exec_node_with_actions(
+            agent_def, "extract_and_download", state,
+            mock_actions=mock_actions,
+            mock_modules={"fsspec": mock_fsspec, "subprocess": mock_subprocess},
+        )
+
+        assert result["status"] == "error"
+        assert "PDF conversion" in result["error"] or "LibreOffice" in result["error"]
+        assert len(update_calls) == 1
+        assert update_calls[0]["updates"] == {"status": "failed"}
+
+        # Clean up temp file if still exists
+        if os.path.exists(tmp.name):
+            os.unlink(tmp.name)
+
+
+class TestStatusTrackingFailedOnClassification:
+    """Tests for status 'failed' on classification errors (Story 14.4, AC4, AC5)."""
+
+    def test_classification_subagent_failure_sets_failed(self, agent_def):
+        """AC5: Classification sub-agent failure sets status 'failed'."""
+        update_calls = []
+
+        def mock_update_node(**kwargs):
+            update_calls.append(kwargs)
+            return {"success": True}
+
+        mock_actions = {"graphology.update_node": mock_update_node}
+
+        state = {
+            "context_node_id": "file-class-fail",
+            "classification_invoke_result": {"success": False, "error": "Sub-agent crashed"},
+        }
+
+        result = _exec_node_with_actions(
+            agent_def, "process_classification", state,
+            mock_actions=mock_actions,
+        )
+
+        assert result["status"] == "error"
+        assert len(update_calls) == 1
+        assert update_calls[0]["updates"] == {"status": "failed"}
+
+    def test_low_confidence_classification_sets_failed(self, agent_def):
+        """AC5: Low confidence classification sets status 'failed'."""
+        update_calls = []
+
+        def mock_update_node(**kwargs):
+            update_calls.append(kwargs)
+            return {"success": True}
+
+        mock_actions = {"graphology.update_node": mock_update_node}
+
+        state = {
+            "context_node_id": "file-low-conf",
+            "classification_invoke_result": {
+                "success": True,
+                "result": {"status": "success", "directory": "chambers", "confidence": 0.3},
+            },
+        }
+
+        result = _exec_node_with_actions(
+            agent_def, "process_classification", state,
+            mock_actions=mock_actions,
+        )
+
+        assert result["status"] == "error"
+        assert len(update_calls) == 1
+        assert update_calls[0]["updates"] == {"status": "failed"}
+
+    def test_unknown_directory_in_resolve_agent_sets_failed(self, agent_def):
+        """AC5: Unknown directory in resolve_agent sets status 'failed'."""
+        update_calls = []
+
+        def mock_update_node(**kwargs):
+            update_calls.append(kwargs)
+            return {"success": True}
+
+        mock_actions = {"graphology.update_node": mock_update_node}
+
+        state = {
+            "context_node_id": "file-unknown-dir",
+            "directory_name": "unknown_directory",
+            "_extraction_mode": "balanced",
+        }
+
+        result = _exec_node_with_actions(
+            agent_def, "resolve_agent", state,
+            mock_actions=mock_actions,
+        )
+
+        assert result["status"] == "error"
+        assert len(update_calls) == 1
+        assert update_calls[0]["updates"] == {"status": "failed"}
+
+
+class TestStatusTrackingSucceeded:
+    """Tests for status 'succeeded' on successful completion (Story 14.4, AC2)."""
+
+    def test_successful_finalize_sets_succeeded(self, agent_def):
+        """AC2: Successful finalize sets status to 'succeeded'."""
+        update_calls = []
+
+        def mock_update_node(**kwargs):
+            update_calls.append(kwargs)
+            return {"success": True}
+
+        mock_actions = {"graphology.update_node": mock_update_node}
+
+        state = {
+            "context_node_id": "file-success",
+            "update_result": {"success": True},
+        }
+
+        result = _exec_node_with_actions(
+            agent_def, "finalize", state,
+            mock_actions=mock_actions,
+        )
+
+        assert result["status"] == "success"
+        assert result["completed"] is True
+        assert len(update_calls) == 1
+        assert update_calls[0]["updates"] == {"status": "succeeded"}
+
+    def test_failed_save_in_finalize_sets_failed(self, agent_def):
+        """AC4: Failed save_payload in finalize sets status to 'failed'."""
+        update_calls = []
+
+        def mock_update_node(**kwargs):
+            update_calls.append(kwargs)
+            return {"success": True}
+
+        mock_actions = {"graphology.update_node": mock_update_node}
+
+        state = {
+            "context_node_id": "file-save-fail",
+            "update_result": {"success": False, "error": "GraphQL timeout"},
+        }
+
+        result = _exec_node_with_actions(
+            agent_def, "finalize", state,
+            mock_actions=mock_actions,
+        )
+
+        assert result["status"] == "error"
+        assert len(update_calls) == 1
+        assert update_calls[0]["updates"] == {"status": "failed"}
+
+
+class TestStatusTrackingResilience:
+    """Tests for status update resilience (Story 14.4, AC6)."""
+
+    def test_status_update_failure_does_not_crash_download_error(self, agent_def):
+        """AC6: Status update failure does not crash the pipeline on download error."""
+        def mock_update_node(**kwargs):
+            raise ConnectionError("Graphology unreachable")
+
+        mock_actions = {"graphology.update_node": mock_update_node}
+
+        state = {
+            "context_node_id": "file-resilient",
+            "context_result": {
+                "success": True,
+                "node_type": "ApplicationFormFile",
+                "data": {"storageUrl": "ftp://invalid/file.pdf", "fileName": "file.pdf"},
+            },
+        }
+
+        result = _exec_node_with_actions(
+            agent_def, "extract_and_download", state,
+            mock_actions=mock_actions,
+        )
+
+        # Pipeline should still return the primary error, not crash
+        assert result["status"] == "error"
+        assert "Unsupported" in result["error"]
+
+    def test_status_update_failure_does_not_crash_classification(self, agent_def):
+        """AC6: Status update failure does not crash classification error path."""
+        def mock_update_node(**kwargs):
+            raise RuntimeError("GraphQL server error")
+
+        mock_actions = {"graphology.update_node": mock_update_node}
+
+        state = {
+            "context_node_id": "file-resilient-class",
+            "classification_invoke_result": {"success": False, "error": "Timeout"},
+        }
+
+        result = _exec_node_with_actions(
+            agent_def, "process_classification", state,
+            mock_actions=mock_actions,
+        )
+
+        assert result["status"] == "error"
+        assert "Timeout" in result["error"]
+
+    def test_status_update_failure_does_not_crash_finalize(self, agent_def):
+        """AC6: Status update failure does not crash finalize."""
+        def mock_update_node(**kwargs):
+            raise Exception("Network down")
+
+        mock_actions = {"graphology.update_node": mock_update_node}
+
+        state = {
+            "context_node_id": "file-resilient-fin",
+            "update_result": {"success": True},
+        }
+
+        result = _exec_node_with_actions(
+            agent_def, "finalize", state,
+            mock_actions=mock_actions,
+        )
+
+        # Pipeline still succeeds even though status update failed
+        assert result["status"] == "success"
+        assert result["completed"] is True
+
+    def test_status_update_failure_does_not_crash_resolve_agent(self, agent_def):
+        """AC6: Status update failure does not crash resolve_agent error path."""
+        def mock_update_node(**kwargs):
+            raise Exception("Connection refused")
+
+        mock_actions = {"graphology.update_node": mock_update_node}
+
+        state = {
+            "context_node_id": "file-resilient-resolve",
+            "directory_name": "nonexistent_dir",
+            "_extraction_mode": "balanced",
+        }
+
+        result = _exec_node_with_actions(
+            agent_def, "resolve_agent", state,
+            mock_actions=mock_actions,
+        )
+
+        assert result["status"] == "error"
+        assert "Unknown directory" in result["error"]
