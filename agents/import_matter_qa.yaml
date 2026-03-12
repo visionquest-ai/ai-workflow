@@ -141,12 +141,16 @@ nodes:
     output: answers
 
   # Node 4: Persist all responses to the graph
+  # When context_node_id is provided, links PromptExecution -> HAS_CONTEXT -> existing node
+  # instead of creating new ContextNode copies. Uses union type syntax with context_node_type.
   - name: save_responses
     uses: graphology.save_responses
     with:
       workflow_id: "{{ state.workflow_id }}"
       matter_id: "{{ state.matter_id or state.context_node_id }}"
       responses: "{{ state.answers.answers }}"
+      context_node_id: "{{ state.context_node_id }}"
+      context_node_type: "{{ state.context_result.node_type if state.context_result else '' }}"
       graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
     output: save_result
 
@@ -184,16 +188,20 @@ nodes:
       try:
           update_mutation = """
           mutation UpdateProtoMatter($id: ID!, $status: String!) {
-            updateProtoMatters(
+            updateProtoMatter(
               where: { id_EQ: $id }
               update: { status: $status }
-            ) { protoMatters { id status } }
+            ) { protoMatter { id status } }
           }
           """
+          api_key = os.environ.get("GRAPHOLOGY_API_KEY", "")
+          headers = {"Content-Type": "application/json"}
+          if api_key:
+              headers["x-api-key"] = api_key
           resp = requests.post(
               graphql_url,
               json={"query": update_mutation, "variables": {"id": proto_matter_id, "status": new_status}},
-              headers={"Content-Type": "application/json"},
+              headers=headers,
               timeout=30
           )
           resp.raise_for_status()
@@ -208,20 +216,20 @@ nodes:
           try:
               link_mutation = """
               mutation LinkProtoMatterToMatter($protoMatterId: ID!, $matterId: ID!) {
-                updateProtoMatters(
+                updateProtoMatter(
                   where: { id_EQ: $protoMatterId }
                   update: {
                     protoMatterImportedAs: {
                       connect: { where: { node: { id_EQ: $matterId } } }
                     }
                   }
-                ) { protoMatters { id } }
+                ) { protoMatter { id } }
               }
               """
               resp = requests.post(
                   graphql_url,
                   json={"query": link_mutation, "variables": {"protoMatterId": proto_matter_id, "matterId": matter_id}},
-                  headers={"Content-Type": "application/json"},
+                  headers=headers,
                   timeout=30
               )
               resp.raise_for_status()

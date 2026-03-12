@@ -182,6 +182,7 @@ def _load_and_run_agent(
             "workflow_id": workflow_id,
             "context_node_id": context_node_id,
             "matter_context": matter_context,
+            "context_result": node_result,
         }
 
         final_state = None
