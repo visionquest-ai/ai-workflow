@@ -1,21 +1,26 @@
 # TEA YAML Agent - File Extraction Agent
 #
 # Purpose: Extracts structured data from ApplicationFormFile nodes using LlamaExtract.
-# Fetches the file via storageUrl, sends to LlamaExtract (BALANCED mode),
+# Fetches the file via storageUrl, converts Word docs (.doc/.docx) to PDF,
+# sends to a pre-created LlamaExtract agent (selected by directoryName),
 # and persists the extraction result back to the node's payload field via GraphQL.
+#
+# Reference: Based on spa-base/firebase/functions-agents/agents/file_extraction_agent.yaml
+# Agent naming: rankellix-{base_name}-{mode} (same agents as spa-base)
+# Upload script: spa-base/scripts/rankellix/upload_to_llamaextract.py
 #
 # Usage:
 #   POST /run-agent {
 #     "agent": "file_extraction",
-#     "workflow_id": "<workflow-id>",
 #     "context_node_id": "<ApplicationFormFile-node-id>"
 #   }
 
 name: file_extraction
 description: |
   Extracts structured data from an ApplicationFormFile using LlamaExtract.
-  Reads storageUrl, sends to LlamaExtract with BALANCED mode,
-  and saves the result to the payload field on the same node.
+  Reads storageUrl, downloads from GCS, converts Word docs to PDF,
+  resolves the LlamaExtract agent from directoryName, extracts,
+  and saves the result to payload.
 
 settings:
   llamaextract:
@@ -23,22 +28,52 @@ settings:
     timeout: 300
     max_retries: 3
 
+variables:
+  # Mapping from directoryName to LlamaExtract agent base name
+  # Agent name format: rankellix-{base_name}-{mode}
+  # Agents created via: spa-base/scripts/rankellix/upload_to_llamaextract.py
+  agent_base_names:
+    chambers: chambers-partners
+    iflr1000: iflr-1000
+    legal500: the-legal-500
+    "legal 500": the-legal-500
+    itr: itr-world-tax
+    leadersleague: leaders-league
+    "leaders league": leaders-league
+
 state_schema:
   # Input (required)
-  workflow_id: str
   context_node_id: str
 
   # Intermediate
   context_result: dict       # Result from graphology.get_node
-  storage_url: str           # Extracted from node data (gs:// or http://)
+  storage_url: str           # Local file path after download
   directory_name: str        # Extracted from node data
-  file_base64: str           # Base64-encoded file content for LlamaExtract
+  file_name: str             # Original filename from node data
+  year: str                  # Year from node data (fast path for year detection)
   file_mime_type: str        # MIME type of the file
+  agent_name_used: str       # Resolved LlamaExtract agent name
   extract_result: dict       # Result from llamaextract.extract
   payload_json: str          # Serialized extraction result
 
+  # Detection
+  directory_source: str      # How directory was detected: "input", "filename", "content", "llm"
+  document_text: str         # First 3500 chars extracted from file for content scanning
+  detected_year: str         # Year detected from any tier
+  year_source: str           # How year was detected: "input", "filename", "content", "llm"
+  classification_result: str # Full JSON from LLM classification agent (TIER 3)
+  classification_invoke_result: dict  # Raw result from agents.invoke_agent
+  classification_json: str            # Serialized JSON string of classification metadata for GraphQL persistence
+
+  # ProtoMatter expansion
+  proto_matter_ids: list     # List of created ProtoMatter node IDs
+  department_id: str         # Department ID found via graph traversal
+
   # Output
   update_result: dict        # Result from graphology.update_node
+  status: str                # success, error
+  error: str                 # Error message if failed
+  completed: bool            # Completion signal
 
 nodes:
   # Step 1: Fetch the ApplicationFormFile node to get storageUrl and directoryName
@@ -49,108 +84,465 @@ nodes:
       graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
     output: context_result
 
-  # Step 2: Extract storageUrl and directoryName, download file from GCS
+  # Step 2: Download file from GCS, extract text for TIER 2, convert Word docs to PDF
   - name: extract_and_download
+    goto:
+      - if: "not state.storage_url"
+        to: __end__
+      - to: detect_directory
     run: |
-      import base64
       import os
+      import tempfile
 
-      data = state.get("context_result", {}).get("data", {})
+      context_result = state.get("context_result", {})
+
+      # Check if graphology call itself failed (server down, 503, etc.)
+      if not context_result.get("success", True):
+          error_msg = context_result.get("error", "Failed to fetch node from graphology")
+          return {"error": error_msg, "storage_url": "", "status": "error", "completed": True}
+
+      data = context_result.get("data", {})
       storage_url = data.get("storageUrl", "")
       directory_name = data.get("directoryName", "")
+      file_name = data.get("fileName", "")
       mime_type = data.get("mimeType", "application/octet-stream")
-      node_type = state.get("context_result", {}).get("node_type", "")
+      node_type = context_result.get("node_type", "")
+      year = data.get("year", "")
 
       if not storage_url:
-          return {"error": "ApplicationFormFile has no storageUrl", "storage_url": "", "directory_name": ""}
+          return {"error": "ApplicationFormFile has no storageUrl", "storage_url": "", "status": "error", "completed": True}
 
       if node_type != "ApplicationFormFile":
-          return {"error": f"Expected ApplicationFormFile, got {node_type}", "storage_url": "", "directory_name": ""}
+          return {"error": f"Expected ApplicationFormFile, got {node_type}", "storage_url": "", "status": "error", "completed": True}
 
-      # If storage_url is gs://, download via GCS and encode as base64
+      # Determine file extension from fileName or storageUrl
+      ext = ""
+      for source in [file_name, storage_url]:
+          if "." in source:
+              ext = "." + source.rsplit(".", 1)[-1].lower()
+              break
+
+      # Download from GCS
+      local_path = None
       if storage_url.startswith("gs://"):
           try:
               import fsspec
               fs = fsspec.filesystem("gs")
+              tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
               with fs.open(storage_url, "rb") as f:
-                  file_bytes = f.read()
-              file_b64 = base64.b64encode(file_bytes).decode("utf-8")
-              data_uri = f"data:{mime_type};base64,{file_b64}"
-              return {
-                  "storage_url": data_uri,
-                  "directory_name": directory_name or "",
-                  "file_mime_type": mime_type,
-              }
+                  tmp.write(f.read())
+              tmp.close()
+              local_path = tmp.name
           except Exception as e:
-              return {"error": f"Failed to download from GCS: {e}", "storage_url": "", "directory_name": ""}
+              return {"error": f"Failed to download from GCS: {e}", "storage_url": "", "status": "error", "completed": True}
 
-      # HTTP/HTTPS URLs can be passed directly to LlamaExtract
-      return {"storage_url": storage_url, "directory_name": directory_name or "", "file_mime_type": mime_type}
+      elif storage_url.startswith(("http://", "https://")):
+          try:
+              import requests
+              resp = requests.get(storage_url, timeout=60)
+              resp.raise_for_status()
+              tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+              tmp.write(resp.content)
+              tmp.close()
+              local_path = tmp.name
+          except Exception as e:
+              return {"error": f"Failed to download from URL: {e}", "storage_url": "", "status": "error", "completed": True}
+      else:
+          return {"error": f"Unsupported storage URL scheme: {storage_url}", "storage_url": "", "status": "error", "completed": True}
 
-  # Step 3: Send file to LlamaExtract for processing
+      # Extract text from the downloaded file BEFORE PDF conversion (for TIER 2 content scanning)
+      document_text = ""
+      if ext in (".docx",):
+          try:
+              from docx import Document
+              doc = Document(local_path)
+              parts = []
+              for para in doc.paragraphs:
+                  parts.append(para.text)
+              for table in doc.tables:
+                  for row in table.rows:
+                      for cell in row.cells:
+                          parts.append(cell.text)
+              document_text = "\n".join(parts)[:3500]
+          except Exception:
+              document_text = ""
+      elif ext == ".pdf":
+          try:
+              import pdfplumber
+              with pdfplumber.open(local_path) as pdf:
+                  parts = []
+                  for page in pdf.pages:
+                      text = page.extract_text() or ""
+                      parts.append(text)
+                      if len("\n".join(parts)) >= 3500:
+                          break
+                  document_text = "\n".join(parts)[:3500]
+          except Exception:
+              document_text = ""
+
+      # Convert Word docs to PDF — LlamaExtract has a bug parsing docx (parse_job_id=None, 0 pages extracted)
+      if ext in (".doc", ".docx"):
+          try:
+              import subprocess
+              pdf_dir = os.path.dirname(local_path)
+              result = subprocess.run(
+                  ["libreoffice", "--headless", "--convert-to", "pdf", "--outdir", pdf_dir, local_path],
+                  capture_output=True, text=True, timeout=120
+              )
+              if result.returncode != 0:
+                  raise RuntimeError(f"LibreOffice exited {result.returncode}: {result.stderr}")
+              pdf_path = local_path.rsplit(".", 1)[0] + ".pdf"
+              if not os.path.exists(pdf_path):
+                  raise RuntimeError(f"PDF not created. stdout: {result.stdout}")
+              os.unlink(local_path)
+              local_path = pdf_path
+              mime_type = "application/pdf"
+          except Exception as e:
+              if local_path and os.path.exists(local_path):
+                  os.unlink(local_path)
+              return {"error": f"PDF conversion error: {e}", "storage_url": "", "status": "error", "completed": True}
+
+      # Extract text from converted PDF if not already extracted (e.g., .doc files)
+      if not document_text and local_path and local_path.endswith(".pdf"):
+          try:
+              import pdfplumber
+              with pdfplumber.open(local_path) as pdf:
+                  parts = []
+                  for page in pdf.pages:
+                      text = page.extract_text() or ""
+                      parts.append(text)
+                      if len("\n".join(parts)) >= 3500:
+                          break
+                  document_text = "\n".join(parts)[:3500]
+          except Exception:
+              document_text = ""
+
+      return {
+          "storage_url": local_path,
+          "directory_name": directory_name,
+          "file_mime_type": mime_type,
+          "document_text": document_text,
+          "file_name": file_name,
+          "year": year,
+          "_extraction_mode": "balanced",
+      }
+
+  # Step 3: Detect directory and year from filename/content (TIER 1+2)
+  # Routes to invoke_classification (TIER 3) when:
+  #   - TIER 1+2 fail to detect directory_name
+  #   - Directory detected but year is missing
+  - name: detect_directory
+    goto:
+      - if: "state.error"
+        to: __end__
+      - if: "not state.directory_name"
+        to: invoke_classification
+      - if: "state.directory_name and not state.detected_year"
+        to: invoke_classification
+      - to: resolve_agent
+    run: |
+      import re
+
+      directory_name = (state.get("directory_name") or "").strip()
+      directory_source = ""
+      document_text = state.get("document_text") or ""
+      file_name = state.get("file_name") or ""
+      detected_year = ""
+      year_source = ""
+
+      # Fast path: directory already set from node data
+      if directory_name:
+          directory_source = "input"
+      else:
+          # TIER 1: Filename keyword detection
+          fn_lower = file_name.lower()
+
+          filename_patterns = {
+              "chambers": ["chambers", "c&p", "candp"],
+              "iflr1000": ["iflr", "iflr1000"],
+              "legal500": ["legal500", "legal 500", "l500"],
+              "itr": ["itr", "international tax review"],
+              "leadersleague": ["leaders", "league", "leadersleague", "leaders league"],
+          }
+
+          for dir_name, keywords in filename_patterns.items():
+              for keyword in keywords:
+                  if keyword in fn_lower:
+                      directory_name = dir_name
+                      directory_source = "filename"
+                      break
+              if directory_name:
+                  break
+
+          # TIER 2: Content keyword scanning (if TIER 1 missed)
+          if not directory_name and document_text:
+              text_lower = document_text.lower()
+
+              # Note: Generic overlapping keywords like "leading individual", "rising star",
+              # "leading", "excellent" are intentionally omitted to avoid false positives.
+              # Ambiguous cases fall through to TIER 3 LLM classification (Story 16.2).
+              content_patterns = {
+                  "chambers": [
+                      "chambers.com", "myaccount.chambers.com", "chambers and partners",
+                      "chambers & partners", "band 1", "band 2", "band 3", "band 4",
+                      "ranked individual", "leading individual", "recognised practitioner",
+                      "associate to watch", "up and coming", "star individual",
+                      "pab006", "pam006",
+                      "chambers global", "chambers latin america", "chambers asia",
+                      "chambers europe", "chambers usa",
+                  ],
+                  "iflr1000": [
+                      "iflr1000.com", "iflr.com", "accreditation.euromoney.com",
+                      "iflr1000", "market leader", "highly regarded",
+                      "notable practitioner", "rising star",
+                  ],
+                  "legal500": [
+                      "legal500.com", "thelegal500.com", "the legal 500",
+                      "legal 500", "hall of fame",
+                      "next generation partner",
+                      "recommended lawyer", "tier 1", "tier 2", "tier 3",
+                  ],
+                  "itr": [
+                      "itrworldtax.com", "itr world tax", "international tax review",
+                      "world tax", "world transfer pricing",
+                      "tax controversy leaders", "indirect tax leaders",
+                      "women in tax leaders",
+                  ],
+                  "leadersleague": [
+                      "leadersleague.com", "leaders league", "décideurs",
+                      "decideurs", "classement", "peer feedback",
+                      "highly recommended",
+                      "strong reputation",
+                  ],
+              }
+
+              for dir_name, keywords in content_patterns.items():
+                  for keyword in keywords:
+                      if keyword in text_lower:
+                          directory_name = dir_name
+                          directory_source = "content"
+                          break
+                  if directory_name:
+                      break
+
+      # Year detection
+      year_from_node = state.get("year") or ""
+      if year_from_node:
+          detected_year = str(year_from_node)
+          year_source = "input"
+      else:
+          # TIER 1: Year from filename
+          year_matches = re.findall(r'(?<!\d)(20[0-9]{2})(?!\d)', file_name)
+          if year_matches:
+              detected_year = max(year_matches)
+              year_source = "filename"
+          elif document_text:
+              # TIER 2: Year from content
+              year_matches = re.findall(r'(?<!\d)(20[0-9]{2})(?!\d)', document_text)
+              if year_matches:
+                  detected_year = max(year_matches)
+                  year_source = "content"
+
+      return {
+          "directory_name": directory_name.lower() if directory_name else "",
+          "directory_source": directory_source,
+          "detected_year": detected_year,
+          "year_source": year_source,
+      }
+
+  # Step 3b: Invoke TIER 3 LLM classification as sub-agent
+  - name: invoke_classification
+    uses: agents.invoke_agent
+    with:
+      agent_name: "file_classification"
+      input_state:
+        document_text: "{{ state.document_text }}"
+        detected_directory: "{{ state.directory_name or '' }}"
+    output: classification_invoke_result
+
+  # Step 3c: Process classification result
+  - name: process_classification
+    goto:
+      - if: "state.error"
+        to: __end__
+      - to: resolve_agent
+    run: |
+      import json
+
+      invoke_result = state.get("classification_invoke_result", {})
+
+      if not invoke_result.get("success"):
+          return {
+              "error": invoke_result.get("error", "Classification sub-agent failed"),
+              "status": "error",
+              "completed": True,
+          }
+
+      result = invoke_result.get("result", {})
+      cl_status = result.get("status", "")
+      cl_error = result.get("error", "")
+
+      if cl_status == "error":
+          return {
+              "error": cl_error or "LLM classification inconclusive. Supported: chambers, iflr1000, legal500, itr, leadersleague",
+              "status": "error",
+              "completed": True,
+          }
+
+      directory = result.get("directory", "")
+      confidence = result.get("confidence", 0.0)
+
+      if not directory or confidence < 0.5:
+          return {
+              "error": "LLM classification inconclusive. Supported: chambers, iflr1000, legal500, itr, leadersleague",
+              "status": "error",
+              "completed": True,
+          }
+
+      # Store full classification result as JSON
+      classification_result = json.dumps({
+          "directory": directory,
+          "category": result.get("category", ""),
+          "region_country": result.get("region_country", ""),
+          "region_state": result.get("region_state", ""),
+          "region_country_display": result.get("region_country_display", ""),
+          "region_state_display": result.get("region_state_display", ""),
+          "confidence": confidence,
+          "year": result.get("year", ""),
+          "is_empty_form": result.get("is_empty_form", False),
+      })
+
+      # Use LLM-detected directory if not already set
+      new_directory = state.get("directory_name") or directory
+      new_directory_source = state.get("directory_source") or "llm"
+
+      # Use LLM-detected year if not already set
+      detected_year = state.get("detected_year") or result.get("year", "")
+      year_source = state.get("year_source") or ("llm" if result.get("year") else "")
+
+      return {
+          "directory_name": new_directory.lower(),
+          "directory_source": new_directory_source,
+          "detected_year": detected_year,
+          "year_source": year_source,
+          "classification_result": classification_result,
+      }
+
+  # Step 4: Resolve LlamaExtract agent name from directoryName
+  - name: resolve_agent
+    goto:
+      - if: "not state.agent_name_used"
+        to: __end__
+      - to: run_extraction
+    run: |
+      import os
+      import re
+
+      directory_name = (state.get("directory_name") or "").lower().strip()
+      extraction_mode = (state.get("_extraction_mode") or "balanced")
+
+      # Map directoryName to agent base name (same as spa-base)
+      base_name_map = {
+          "chambers": "chambers-partners",
+          "iflr1000": "iflr-1000",
+          "legal500": "the-legal-500",
+          "legal 500": "the-legal-500",
+          "itr": "itr-world-tax",
+          "leadersleague": "leaders-league",
+          "leaders league": "leaders-league",
+      }
+
+      base_name = base_name_map.get(directory_name)
+      if not base_name:
+          supported = list(base_name_map.keys())
+          return {
+              "status": "error",
+              "error": f"Unknown directory: '{directory_name}'. Supported: {supported}",
+              "agent_name_used": "",
+              "completed": True
+          }
+
+      # Build agent name: [prefix-]rankellix-{base_name}-{mode}
+      prefix = os.environ.get("AGENT_NAME_PREFIX", "").strip()
+      if prefix and not re.match(r'^[a-z0-9-]+$', prefix):
+          return {
+              "status": "error",
+              "error": f"Invalid AGENT_NAME_PREFIX '{prefix}': must match ^[a-z0-9-]+$",
+              "agent_name_used": "",
+              "completed": True
+          }
+
+      if prefix:
+          agent_name = f"{prefix}-rankellix-{base_name}-{extraction_mode}"
+      else:
+          agent_name = f"rankellix-{base_name}-{extraction_mode}"
+
+      return {"agent_name_used": agent_name, "status": "agent_selected"}
+
+  # Step 4: Extract using LlamaExtract SDK with agent_name
   - name: run_extraction
     uses: llamaextract.extract
     with:
       file: "{{ state.storage_url }}"
+      agent_name: "{{ state.agent_name_used }}"
       mode: "{{ settings.llamaextract.mode }}"
       timeout: "{{ settings.llamaextract.timeout }}"
       max_retries: "{{ settings.llamaextract.max_retries }}"
-      use_rest: true
-      schema:
-        type: object
-        properties:
-          title:
-            type: string
-            description: "Document title or heading"
-          sections:
-            type: array
-            items:
-              type: object
-              properties:
-                heading:
-                  type: string
-                content:
-                  type: string
-          tables:
-            type: array
-            items:
-              type: object
-              properties:
-                caption:
-                  type: string
-                headers:
-                  type: array
-                  items:
-                    type: string
-                rows:
-                  type: array
-                  items:
-                    type: array
-                    items:
-                      type: string
-          metadata:
-            type: object
-            properties:
-              author:
-                type: string
-              date:
-                type: string
-              category:
-                type: string
     output: extract_result
 
-  # Step 4: Serialize extraction result to JSON string
+  # Step 5: Serialize extraction result and clean up temp files
   - name: prepare_payload
     run: |
       import json
+      import os
+
       extract_result = state.get("extract_result", {})
+
+      # Clean up temp file
+      storage_url = state.get("storage_url", "")
+      if storage_url and storage_url.startswith("/tmp/") and os.path.exists(storage_url):
+          os.unlink(storage_url)
+
+      # Build classification metadata (independent of extraction success/failure)
+      classification = {
+          "directory": state.get("directory_name", ""),
+          "directory_source": state.get("directory_source", ""),
+          "detected_year": state.get("detected_year"),
+          "year_source": state.get("year_source", ""),
+      }
+
+      # Merge LLM classification fields if available (TIER 3)
+      classification_result = state.get("classification_result")
+      if classification_result:
+          if isinstance(classification_result, str):
+              classification_result = json.loads(classification_result)
+          classification["category"] = classification_result.get("category")
+          classification["region_country"] = classification_result.get("region_country")
+          classification["region_country_display"] = classification_result.get("region_country_display")
+          classification["region_state"] = classification_result.get("region_state")
+          classification["region_state_display"] = classification_result.get("region_state_display")
+          classification["confidence"] = classification_result.get("confidence")
+          classification["is_empty_form"] = classification_result.get("is_empty_form")
+      else:
+          # TIER 1/2 or fast-path — no LLM fields, confidence=1.0 (exact match)
+          classification["category"] = None
+          classification["region_country"] = None
+          classification["region_country_display"] = None
+          classification["region_state"] = None
+          classification["region_state_display"] = None
+          classification["confidence"] = 1.0
+          classification["is_empty_form"] = None
+
+      classification_json = json.dumps(classification)
+
       if extract_result.get("success"):
           payload = json.dumps(extract_result.get("data", {}))
+          return {"payload_json": payload, "classification_json": classification_json, "status": "success"}
       else:
           payload = json.dumps({"error": extract_result.get("error", "Extraction failed"), "status": "failed"})
-      return {"payload_json": payload}
+          return {"payload_json": payload, "classification_json": classification_json, "status": "error", "error": extract_result.get("error", "Extraction failed")}
 
-  # Step 5: Save extraction result back to the node via GraphQL
+  # Step 6: Save extraction result back to the node via GraphQL
   - name: save_payload
     uses: graphology.update_node
     with:
@@ -158,26 +550,181 @@ nodes:
       node_type: "ApplicationFormFile"
       updates:
         payload: "{{ state.payload_json }}"
+        classificationPayload: "{{ state.classification_json }}"
+        detectedYear: "{{ state.detected_year }}"
       graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
     output: update_result
 
-edges:
-  - from: __start__
-    to: fetch_file_node
-  - from: fetch_file_node
-    to: extract_and_download
-  - from: extract_and_download
-    to: run_extraction
-    condition: "{{ state.storage_url }}"
-  - from: extract_and_download
-    to: __end__
-    condition: "{{ not state.storage_url }}"
-  - from: run_extraction
-    to: prepare_payload
-  - from: prepare_payload
-    to: save_payload
-  - from: save_payload
-    to: __end__
+  # Step 7: Expand ProtoMatter nodes from extraction payload (Story 16.4)
+  - name: expand_proto_matters
+    goto:
+      - to: finalize
+    run: |
+      import json
+      import logging
+
+      logger = logging.getLogger(__name__)
+
+      # AC7: Skip if extraction failed
+      if state.get("status") == "error":
+          logger.debug("expand_proto_matters: skipping — extraction status is error")
+          return {"proto_matter_ids": [], "department_id": ""}
+
+      payload_json = state.get("payload_json", "")
+      if not payload_json:
+          logger.debug("expand_proto_matters: no payload_json, skipping")
+          return {"proto_matter_ids": [], "department_id": ""}
+
+      try:
+          payload_dict = json.loads(payload_json)
+      except (json.JSONDecodeError, TypeError):
+          logger.debug("expand_proto_matters: invalid payload_json, skipping")
+          return {"proto_matter_ids": [], "department_id": ""}
+
+      directory_name = (state.get("directory_name") or "").lower().strip()
+
+      # --- Matter extraction helper (Task 4, AC1, AC8) ---
+      MATTERS_KEY_MAP = {
+          "chambers": [
+              ("workHighlights", "publishableInformation", "matters"),
+              ("workHighlights", "confidentialInformation", "matters"),
+          ],
+          "iflr1000": [
+              ("dealHighlights", "deals"),
+          ],
+          "legal500": [
+              ("workHighlightsDetailed",),
+              ("workHighlightsDetailed_nonPublishable",),
+          ],
+          "itr": [
+              ("section_2_deal_and_case_highlights",),
+          ],
+          "leadersleague": [
+              ("work_highlights",),
+          ],
+      }
+
+      def _extract_matters(pd, dn):
+          key_paths = MATTERS_KEY_MAP.get(dn, [])
+          matters = []
+          for path in key_paths:
+              obj = pd
+              for key in path:
+                  obj = obj.get(key, {}) if isinstance(obj, dict) else {}
+              if isinstance(obj, list):
+                  matters.extend(obj)
+          return matters
+
+      matters = _extract_matters(payload_dict, directory_name)
+
+      # AC8: Empty matters array — no error
+      if not matters:
+          logger.debug("No matters found in payload")
+          return {"proto_matter_ids": [], "department_id": ""}
+
+      # --- Department discovery (AC3) ---
+      department_id = ""
+      file_id = state.get("context_node_id", "")
+
+      try:
+          dept_query = '''
+          query FindDepartment($fileId: ID!) {
+            departments(where: { departmentHasFiles_SOME: { id: $fileId } }) {
+              id
+            }
+          }
+          '''
+          import os
+          gql_url = (
+              state.get("variables", {}).get("GRAPHOLOGY_URL")
+              or os.environ.get("GRAPHOLOGY_URL")
+              or "http://localhost:4000"
+          )
+          gql_api_key = (
+              state.get("variables", {}).get("GRAPHOLOGY_API_KEY")
+              or os.environ.get("GRAPHOLOGY_API_KEY")
+          )
+          import requests as req
+          headers = {"Content-Type": "application/json"}
+          if gql_api_key:
+              headers["x-api-key"] = gql_api_key
+          resp = req.post(gql_url, json={"query": dept_query, "variables": {"fileId": file_id}}, timeout=30, headers=headers)
+          resp.raise_for_status()
+          dept_data = resp.json().get("data", {})
+          depts = dept_data.get("departments", [])
+          if depts:
+              department_id = depts[0].get("id", "")
+      except Exception as e:
+          logger.warning(f"expand_proto_matters: Department discovery failed: {e}")
+
+      if not department_id:
+          logger.warning("expand_proto_matters: No Department found for file %s — ProtoMatters will be created without Department link", file_id)
+
+      # --- Create ProtoMatter nodes and connect (AC1, AC2, AC4) ---
+      proto_matter_ids = []
+
+      for matter in matters:
+          matter_payload = json.dumps(matter) if not isinstance(matter, str) else matter
+
+          # Create ProtoMatter node via graphology.create_node action
+          create_result = actions["graphology.create_node"](
+              state=state,
+              node_type="ProtoMatter",
+              properties={
+                  "payload": matter_payload,
+                  "directory": directory_name,
+                  "status": "pending",
+              },
+              graphql_url=gql_url,
+          )
+
+          if not create_result.get("success"):
+              logger.error("expand_proto_matters: Failed to create ProtoMatter: %s", create_result.get("error"))
+              continue
+
+          proto_id = create_result["node_id"]
+          proto_matter_ids.append(proto_id)
+
+          # AC2: Connect ApplicationFormFile → ProtoMatter via FILE_HAS_PROTO_MATTER
+          connect_result = actions["graphology.connect_nodes"](
+              state=state,
+              source_id=file_id,
+              source_type="ApplicationFormFile",
+              relationship_name="FILE_HAS_PROTO_MATTER",
+              target_id=proto_id,
+              target_type="ProtoMatter",
+              graphql_url=gql_url,
+          )
+          if not connect_result.get("success"):
+              logger.error("expand_proto_matters: Failed to connect FILE_HAS_PROTO_MATTER: %s", connect_result.get("error"))
+
+          # AC4: Connect Department → ProtoMatter via DEPARTMENT_HAS_PROTO_MATTER (if department found)
+          if department_id:
+              dept_connect = actions["graphology.connect_nodes"](
+                  state=state,
+                  source_id=department_id,
+                  source_type="Department",
+                  relationship_name="DEPARTMENT_HAS_PROTO_MATTER",
+                  target_id=proto_id,
+                  target_type="ProtoMatter",
+                  graphql_url=gql_url,
+              )
+              if not dept_connect.get("success"):
+                  logger.error("expand_proto_matters: Failed to connect DEPARTMENT_HAS_PROTO_MATTER: %s", dept_connect.get("error"))
+
+      logger.info("expand_proto_matters: Created %d ProtoMatter nodes (department_id=%s)", len(proto_matter_ids), department_id or "none")
+
+      return {"proto_matter_ids": proto_matter_ids, "department_id": department_id}
+
+  # Step 8: Finalize
+  - name: finalize
+    goto: __end__
+    run: |
+      update_result = state.get("update_result", {})
+      if update_result.get("success"):
+          return {"completed": True, "status": "success"}
+      else:
+          return {"completed": True, "status": "error", "error": update_result.get("error", "Failed to save payload")}
 
 config:
   raise_exceptions: false

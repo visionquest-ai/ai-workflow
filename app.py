@@ -12,12 +12,18 @@ import json
 import logging
 import os
 import sys
+import hmac
+import threading
+import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, model_validator
 
 # Add the actions directory to path so graphology module is importable
 ACTIONS_DIR = os.environ.get("ACTIONS_DIR", str(Path(__file__).parent / "actions"))
@@ -26,6 +32,7 @@ if ACTIONS_DIR not in sys.path:
 
 # Import get_node from graphology actions
 from graphology import get_node, register_actions
+from agents import register_actions as register_agent_actions
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -51,8 +58,49 @@ AGENTS_DIR = os.environ.get("AGENTS_DIR", str(Path(__file__).parent / "agents"))
 
 class RunAgentRequest(BaseModel):
     agent: str
-    workflow_id: str
-    context_node_id: str
+    workflow_id: Optional[str] = None
+    context_node_id: Optional[str] = None
+    application_form_id: Optional[str] = None
+    async_mode: bool = False
+
+    @model_validator(mode="after")
+    def resolve_node_id(self):
+        """Accept application_form_id as alias for context_node_id."""
+        if self.application_form_id and not self.context_node_id:
+            self.context_node_id = self.application_form_id
+        if not self.context_node_id:
+            raise ValueError("Either context_node_id or application_form_id is required")
+        return self
+
+
+class JobStatus(str, Enum):
+    ACCEPTED = "accepted"
+    RUNNING = "running"
+    SUCCESS = "success"
+    ERROR = "error"
+
+
+_job_store: dict[str, dict] = {}
+_job_lock = threading.Lock()
+_MAX_COMPLETED_JOBS = 1000
+
+
+def _generate_job_id() -> str:
+    return str(uuid.uuid4())
+
+
+def _evict_oldest_completed_jobs():
+    """Remove oldest completed jobs when store exceeds limit. Caller must hold _job_lock."""
+    completed = [
+        (jid, j["created_at"])
+        for jid, j in _job_store.items()
+        if j["status"] in (JobStatus.SUCCESS, JobStatus.ERROR)
+    ]
+    if len(completed) <= _MAX_COMPLETED_JOBS:
+        return
+    completed.sort(key=lambda x: x[1])
+    for jid, _ in completed[: len(completed) - _MAX_COMPLETED_JOBS]:
+        del _job_store[jid]
 
 
 # =============================================================================
@@ -80,10 +128,10 @@ def _validate_workflow(workflow_id: str) -> dict:
 
 def _load_and_run_agent(
     agent: str,
-    workflow_id: str,
+    workflow_id: Optional[str],
     context_node_id: str,
-    agents_dir: str = None,
-    actions_dir: str = None,
+    agents_dir: Optional[str] = None,
+    actions_dir: Optional[str] = None,
 ) -> dict:
     """
     Load a YAML agent and run it with context node data.
@@ -107,10 +155,11 @@ def _load_and_run_agent(
     if not node_result.get("success"):
         return {"success": False, "error": node_result.get("error", "Unknown error")}
 
-    # AC3b: Validate workflow
-    wf_result = _validate_workflow(workflow_id)
-    if not wf_result.get("success"):
-        return {"success": False, "error": wf_result.get("error", "Unknown error")}
+    # AC3b: Validate workflow (skip if not provided — some agents don't need it)
+    if workflow_id:
+        wf_result = _validate_workflow(workflow_id)
+        if not wf_result.get("success"):
+            return {"success": False, "error": wf_result.get("error", "Unknown error")}
 
     context_node_type = node_result["node_type"]
     node_data = node_result["data"]
@@ -122,6 +171,7 @@ def _load_and_run_agent(
 
         engine = YAMLEngine()
         register_actions(engine.actions_registry, engine)
+        register_agent_actions(engine.actions_registry, engine)
 
         engine.variables["GRAPHOLOGY_URL"] = os.environ.get("GRAPHOLOGY_URL", "http://localhost:4000")
         engine.variables["GRAPHOLOGY_API_KEY"] = os.environ.get("GRAPHOLOGY_API_KEY", "")
@@ -132,6 +182,7 @@ def _load_and_run_agent(
             "workflow_id": workflow_id,
             "context_node_id": context_node_id,
             "matter_context": matter_context,
+            "context_result": node_result,
         }
 
         final_state = None
@@ -139,29 +190,79 @@ def _load_and_run_agent(
             logger.info(f"TEA event type: {type(event).__name__}")
             final_state = event
 
-        execution_ids = []
+        agent_state = {}
         if final_state and isinstance(final_state, dict):
             # TEA returns {"type": ..., "state": {...}, "output": ...}
             # The actual agent state is nested under "state" key
             agent_state = final_state.get("state", final_state)
-            save_result = agent_state.get("save_result", {})
-            if isinstance(save_result, dict):
-                execution_ids = save_result.get("executionIds", [])
-            logger.info(f"Final state keys: {list(final_state.keys())}")
             logger.info(f"Agent state keys: {list(agent_state.keys()) if isinstance(agent_state, dict) else 'N/A'}")
-            logger.info(f"save_result: {save_result}")
         else:
             logger.warning(f"Unexpected final_state type: {type(final_state)}, value: {str(final_state)[:500]}")
 
-        return {
-            "success": True,
-            "execution_ids": execution_ids,
+        agent_status = agent_state.get("status", "unknown")
+        agent_error = agent_state.get("error")
+
+        # Infer success from agent output when no explicit status field exists.
+        # YAML agents like import_matter_qa populate save_result on completion
+        # but do not set a top-level "status" key in state.
+        if agent_status == "unknown" and not agent_error:
+            # Check for evidence of successful completion in agent state
+            save_result = agent_state.get("save_result")
+            if save_result and isinstance(save_result, dict) and save_result.get("success"):
+                agent_status = "success"
+            elif agent_state.get("answers") or agent_state.get("save_result"):
+                agent_status = "success"
+
+        result = {
+            "success": agent_status == "success",
+            "status": agent_status,
             "context_node_type": context_node_type,
         }
+        if agent_error:
+            result["error"] = agent_error
+
+        payload_json = agent_state.get("payload_json")
+        if payload_json:
+            result["payload"] = json.loads(payload_json)
+
+        return result
 
     except Exception as e:
         logger.error(f"Agent execution failed: {e}")
         return {"success": False, "error": str(e)}
+
+
+# =============================================================================
+# ASYNC JOB HELPERS
+# =============================================================================
+
+def _run_agent_job(job_id: str, agent: str, workflow_id: Optional[str], context_node_id: str):
+    """Run agent in background thread, updating job store with result."""
+    with _job_lock:
+        _job_store[job_id]["status"] = JobStatus.RUNNING
+    try:
+        result = _load_and_run_agent(
+            agent=agent,
+            workflow_id=workflow_id,
+            context_node_id=context_node_id,
+        )
+        new_status = JobStatus.SUCCESS if result.get("success") else JobStatus.ERROR
+    except Exception as e:
+        # Defensive: _load_and_run_agent already catches exceptions internally,
+        # but guard against unexpected failures in dict/json processing.
+        result = {"success": False, "error": str(e)}
+        new_status = JobStatus.ERROR
+    with _job_lock:
+        _job_store[job_id]["result"] = result
+        _job_store[job_id]["status"] = new_status  # status LAST to avoid race
+        _evict_oldest_completed_jobs()
+
+
+def _check_api_key(x_api_key: Optional[str]):
+    """Validate API key, raise 401 if invalid."""
+    expected_key = os.environ.get("RUN_AGENT_API_KEY", "")
+    if not x_api_key or not hmac.compare_digest(x_api_key, expected_key):
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 # =============================================================================
@@ -180,20 +281,62 @@ def run_agent(
     x_api_key: Optional[str] = Header(None),
 ):
     """
-    Run a TEA agent with a context node from graphology (AC2).
+    Run a TEA agent with a context node from graphology.
 
     Requires x-api-key header (AC4).
-    Synchronous endpoint — TEA engine and GraphQL calls are blocking.
+    Supports sync (default) and async modes (AC2, AC7).
     """
-    # AC4: API key auth
-    expected_key = os.environ.get("RUN_AGENT_API_KEY", "")
-    if not x_api_key or x_api_key != expected_key:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    _check_api_key(x_api_key)
+    assert request.context_node_id  # guaranteed by model_validator
+
+    if request.async_mode:
+        job_id = _generate_job_id()
+        with _job_lock:
+            _job_store[job_id] = {
+                "status": JobStatus.ACCEPTED,
+                "result": None,
+                "created_at": datetime.now(timezone.utc),
+            }
+        thread = threading.Thread(
+            target=_run_agent_job,
+            args=(job_id, request.agent, request.workflow_id, request.context_node_id),
+            daemon=True,
+        )
+        thread.start()
+        return JSONResponse(
+            status_code=202,
+            content={"job_id": job_id, "status": "accepted"},
+        )
 
     result = _load_and_run_agent(
         agent=request.agent,
         workflow_id=request.workflow_id,
         context_node_id=request.context_node_id,
     )
-
     return result
+
+
+@app.get("/run-agent/jobs/{job_id}")
+def get_job_status(
+    job_id: str,
+    x_api_key: Optional[str] = Header(None),
+):
+    """
+    Poll async job status (AC3, AC4, AC6).
+
+    Returns current job state with result when complete.
+    """
+    _check_api_key(x_api_key)
+
+    with _job_lock:
+        if job_id not in _job_store:
+            raise HTTPException(status_code=404, detail="Job not found")
+
+        job = _job_store[job_id]
+        status = job["status"]
+        response = {"job_id": job_id, "status": status.value}
+
+        if status in (JobStatus.SUCCESS, JobStatus.ERROR):
+            response["result"] = job["result"]
+
+    return response

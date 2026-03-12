@@ -1,5 +1,11 @@
 fastapi>=0.100.0
 uvicorn>=0.20.0
 requests>=2.28.0
-the-edge-agent>=0.9.90
 openai>=1.0.0
+fsspec>=2023.6.0
+gcsfs>=2023.6.0
+llama-cloud-services>=0.6.0
+scrapegraph-py>=1.0.0
+python-docx>=1.0.0
+pdfplumber>=0.10.0
+pycountry>=24.6.1

@@ -1,13 +1,18 @@
 # TEA YAML Agent - Import Matter Q&A Agent
 # Story: 15.2 - ImportMatter YAML Workflow Agent
 # Updated: Story 16.1 - Added context_node_id support
+# Updated: Story RX.40 - ProtoMatter traceability (PROTO_MATTER_IMPORTED_AS + status update)
 #
 # Purpose: Orchestrates the full Q&A pipeline for a matter using only TEA
 # built-in patterns and the graphology custom action.
 # Fetches questions from graphology, runs parallel LLM calls,
 # and persists responses back to the graph.
 #
-# Key constraint: ZERO inline Python — all logic via `uses:` actions
+# When triggered from a ProtoMatter NODE_CREATED event (Story RX.40),
+# after Q&A completion: updates ProtoMatter.status to "imported" and
+# creates PROTO_MATTER_IMPORTED_AS relation to the Matter.
+#
+# Key constraint: Uses `uses:` actions for core Q&A; `run:` block for ProtoMatter post-processing
 #
 # Rate Limiting (NFR-QA1):
 #   - max_concurrency: controls how many LLM calls run simultaneously
@@ -33,12 +38,12 @@ description: |
 settings:
   llm:
     model: gpt-5.2-chat
-    temperature: 0
+    temperature: 1
   parallel:
-    max_concurrency: 20
+    max_concurrency: 5
   rate_limiters:
     llm_qa:
-      rpm: 1000
+      rpm: 60
   opik:
     project_name: "import-matter-qa"
 
@@ -58,6 +63,10 @@ state_schema:
   parallel_results: list       # Raw results from dynamic_parallel fan-out
   answers: list                # Mapped responses from collect_answers
   answer_count: int            # Count of collected answers
+
+  # ProtoMatter traceability (Story RX.40)
+  source_node_type: str        # Node type of context_node_id (Matter or ProtoMatter)
+  proto_matter_id: str         # ProtoMatter node ID (set when source is ProtoMatter)
 
   # Output
   save_result: dict            # Result from graphology.save_responses
@@ -132,14 +141,109 @@ nodes:
     output: answers
 
   # Node 4: Persist all responses to the graph
+  # When context_node_id is provided, links PromptExecution -> HAS_CONTEXT -> existing node
+  # instead of creating new ContextNode copies. Uses union type syntax with context_node_type.
   - name: save_responses
     uses: graphology.save_responses
     with:
       workflow_id: "{{ state.workflow_id }}"
       matter_id: "{{ state.matter_id or state.context_node_id }}"
       responses: "{{ state.answers.answers }}"
+      context_node_id: "{{ state.context_node_id }}"
+      context_node_type: "{{ state.context_result.node_type if state.context_result else '' }}"
       graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
     output: save_result
+
+  # Node 5 (Story RX.40): Post-processing for ProtoMatter traceability
+  # When the source context_node is a ProtoMatter:
+  #   - Updates ProtoMatter.status to "imported" (or "error" on failure)
+  #   - Creates PROTO_MATTER_IMPORTED_AS relation from ProtoMatter to Matter
+  - name: finalize_proto_matter
+    goto: __end__
+    run: |
+      import json
+      import os
+
+      context_result = state.get("context_result", {})
+      node_type = context_result.get("node_type", "")
+      save_result = state.get("save_result", {})
+      context_node_id = state.get("context_node_id", "")
+      matter_id = state.get("matter_id") or context_node_id
+
+      # Only run for ProtoMatter sources
+      if node_type != "ProtoMatter":
+          return {"source_node_type": node_type}
+
+      graphql_url = os.environ.get("GRAPHOLOGY_URL", "http://localhost:4000/graphql")
+      proto_matter_id = context_node_id
+
+      # Determine status based on save result
+      save_success = save_result.get("success", False) if save_result else False
+      new_status = "imported" if save_success else "error"
+
+      import requests
+      errors = []
+
+      # Update ProtoMatter.status
+      try:
+          update_mutation = """
+          mutation UpdateProtoMatter($id: ID!, $status: String!) {
+            updateProtoMatter(
+              where: { id_EQ: $id }
+              update: { status: $status }
+            ) { protoMatter { id status } }
+          }
+          """
+          api_key = os.environ.get("GRAPHOLOGY_API_KEY", "")
+          headers = {"Content-Type": "application/json"}
+          if api_key:
+              headers["x-api-key"] = api_key
+          resp = requests.post(
+              graphql_url,
+              json={"query": update_mutation, "variables": {"id": proto_matter_id, "status": new_status}},
+              headers=headers,
+              timeout=30
+          )
+          resp.raise_for_status()
+          result = resp.json()
+          if result.get("errors"):
+              errors.append(f"Status update: {result['errors'][0].get('message', '')}")
+      except Exception as e:
+          errors.append(f"Status update: {str(e)}")
+
+      # Create PROTO_MATTER_IMPORTED_AS relation (only on success)
+      if save_success and matter_id and matter_id != proto_matter_id:
+          try:
+              link_mutation = """
+              mutation LinkProtoMatterToMatter($protoMatterId: ID!, $matterId: ID!) {
+                updateProtoMatter(
+                  where: { id_EQ: $protoMatterId }
+                  update: {
+                    protoMatterImportedAs: {
+                      connect: { where: { node: { id_EQ: $matterId } } }
+                    }
+                  }
+                ) { protoMatter { id } }
+              }
+              """
+              resp = requests.post(
+                  graphql_url,
+                  json={"query": link_mutation, "variables": {"protoMatterId": proto_matter_id, "matterId": matter_id}},
+                  headers=headers,
+                  timeout=30
+              )
+              resp.raise_for_status()
+              result = resp.json()
+              if result.get("errors"):
+                  errors.append(f"Link creation: {result['errors'][0].get('message', '')}")
+          except Exception as e:
+              errors.append(f"Link creation: {str(e)}")
+
+      return {
+          "source_node_type": "ProtoMatter",
+          "proto_matter_id": proto_matter_id,
+          "error": "; ".join(errors) if errors else "",
+      }
 
 edges:
   - from: __start__
@@ -157,6 +261,12 @@ edges:
   - from: collect_answers
     to: save_responses
   - from: save_responses
+    to: finalize_proto_matter
+    condition: "{{ state.context_result and state.context_result.node_type == 'ProtoMatter' }}"
+  - from: save_responses
+    to: __end__
+    condition: "{{ not state.context_result or state.context_result.node_type != 'ProtoMatter' }}"
+  - from: finalize_proto_matter
     to: __end__
 
 config:
