@@ -1163,3 +1163,494 @@ class TestClassificationMetadataPersistence:
         assert "payload" in updates
         assert "classificationPayload" in updates
         assert "detectedYear" in updates
+
+
+# =============================================================================
+# expand_proto_matters node tests — Story 16.4
+# =============================================================================
+
+def _exec_node_with_actions(agent_def, node_name, state, mock_actions=None, mock_modules=None):
+    """Execute a node's run block with actions dict injected (for expand_proto_matters).
+
+    Extends _exec_node to inject an `actions` dict into the namespace,
+    matching the TEA YAMLEngine's run block execution context.
+    """
+    code = _get_node_code(agent_def, node_name)
+    if not code:
+        raise ValueError(f"Node '{node_name}' has no run block")
+
+    mock_modules = mock_modules or {}
+    mock_actions = mock_actions or {}
+
+    namespace = {"state": state, "settings": agent_def.get("settings", {}), "actions": mock_actions}
+
+    indented = textwrap.indent(code, "    ")
+    wrapped = f"def _node_fn():\n{indented}\n_result = _node_fn()"
+
+    for mod_name, mod_obj in mock_modules.items():
+        namespace[mod_name] = mod_obj
+
+    if mock_modules:
+        original_import = __builtins__.__import__ if hasattr(__builtins__, '__import__') else __import__
+
+        def patched_import(name, *args, **kwargs):
+            if name in mock_modules:
+                return mock_modules[name]
+            return original_import(name, *args, **kwargs)
+
+        namespace["__builtins__"] = {**__builtins__.__dict__, "__import__": patched_import} if hasattr(__builtins__, '__dict__') else {**__builtins__, "__import__": patched_import}
+
+    exec(compile(wrapped, f"<agent:{node_name}>", "exec"), namespace)
+    return namespace.get("_result")
+
+
+class TestProtoMatterExpansion:
+    """Tests for expand_proto_matters node (Story 16.4)."""
+
+    def _make_chambers_payload(self, matters_pub, matters_conf=None):
+        """Build a chambers-style payload with publishable + confidential matters."""
+        payload = {
+            "workHighlights": {
+                "publishableInformation": {"matters": matters_pub},
+                "confidentialInformation": {"matters": matters_conf or []},
+            }
+        }
+        return json.dumps(payload)
+
+    def test_skip_on_error_status(self, agent_def):
+        """AC7: Extraction error → skip expansion, no ProtoMatters."""
+        state = {"status": "error", "payload_json": "{}"}
+        result = _exec_node(agent_def, "expand_proto_matters", state)
+        assert result["proto_matter_ids"] == []
+        assert result["department_id"] == ""
+
+    def test_empty_payload_json(self, agent_def):
+        """AC8 edge: Empty payload_json → skip."""
+        state = {"status": "success", "payload_json": ""}
+        result = _exec_node(agent_def, "expand_proto_matters", state)
+        assert result["proto_matter_ids"] == []
+
+    def test_empty_matters_array(self, agent_def):
+        """AC8: Payload with empty matters array → no ProtoMatters, no error."""
+        payload = json.dumps({"workHighlights": {"publishableInformation": {"matters": []}, "confidentialInformation": {"matters": []}}})
+        state = {"status": "success", "payload_json": payload, "directory_name": "chambers", "context_node_id": "file-1"}
+
+        # Mock requests for department discovery
+        from unittest.mock import MagicMock
+        mock_requests = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"data": {"departments": []}}
+        mock_requests.post.return_value = mock_resp
+
+        result = _exec_node_with_actions(
+            agent_def, "expand_proto_matters", state,
+            mock_modules={"requests": mock_requests},
+        )
+        assert result["proto_matter_ids"] == []
+
+    def test_three_matters_creates_three_protos(self, agent_def):
+        """AC1: 3 matters in payload → 3 ProtoMatter nodes created."""
+        from unittest.mock import MagicMock, call
+
+        matters = [
+            {"clientName": "Acme Corp", "summary": "M&A deal"},
+            {"clientName": "BigCo", "summary": "Restructuring"},
+            {"clientName": "SmallCo", "summary": "IPO"},
+        ]
+        payload = self._make_chambers_payload(matters)
+
+        # Mock requests for department discovery (no department found)
+        mock_requests = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"data": {"departments": []}}
+        mock_requests.post.return_value = mock_resp
+
+        # Mock actions
+        create_call_count = [0]
+        def mock_create_node(state, node_type, properties, **kw):
+            create_call_count[0] += 1
+            return {"success": True, "node_id": f"proto-{create_call_count[0]}"}
+
+        def mock_connect_nodes(state, source_id, source_type, relationship_name, target_id, target_type, **kw):
+            return {"success": True}
+
+        mock_actions = {
+            "graphology.create_node": mock_create_node,
+            "graphology.connect_nodes": mock_connect_nodes,
+        }
+
+        state = {
+            "status": "success",
+            "payload_json": payload,
+            "directory_name": "chambers",
+            "context_node_id": "file-1",
+        }
+
+        result = _exec_node_with_actions(
+            agent_def, "expand_proto_matters", state,
+            mock_actions=mock_actions,
+            mock_modules={"requests": mock_requests},
+        )
+        assert len(result["proto_matter_ids"]) == 3
+        assert result["proto_matter_ids"] == ["proto-1", "proto-2", "proto-3"]
+
+    def test_file_has_proto_matter_connection(self, agent_def):
+        """AC2: Each ProtoMatter connected to ApplicationFormFile via FILE_HAS_PROTO_MATTER."""
+        from unittest.mock import MagicMock
+
+        matters = [{"clientName": "Acme"}]
+        payload = self._make_chambers_payload(matters)
+
+        mock_requests = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"data": {"departments": []}}
+        mock_requests.post.return_value = mock_resp
+
+        connect_calls = []
+        def mock_connect(state, source_id, source_type, relationship_name, target_id, target_type, **kw):
+            connect_calls.append({
+                "source_id": source_id, "source_type": source_type,
+                "relationship_name": relationship_name,
+                "target_id": target_id, "target_type": target_type,
+            })
+            return {"success": True}
+
+        mock_actions = {
+            "graphology.create_node": lambda state, node_type, properties, **kw: {"success": True, "node_id": "proto-1"},
+            "graphology.connect_nodes": mock_connect,
+        }
+
+        state = {
+            "status": "success",
+            "payload_json": payload,
+            "directory_name": "chambers",
+            "context_node_id": "file-1",
+        }
+
+        _exec_node_with_actions(
+            agent_def, "expand_proto_matters", state,
+            mock_actions=mock_actions,
+            mock_modules={"requests": mock_requests},
+        )
+
+        # Should have exactly 1 connect call (FILE_HAS_PROTO_MATTER, no department)
+        assert len(connect_calls) == 1
+        assert connect_calls[0]["source_id"] == "file-1"
+        assert connect_calls[0]["source_type"] == "ApplicationFormFile"
+        assert connect_calls[0]["relationship_name"] == "FILE_HAS_PROTO_MATTER"
+        assert connect_calls[0]["target_id"] == "proto-1"
+        assert connect_calls[0]["target_type"] == "ProtoMatter"
+
+    def test_department_discovery_and_linkage(self, agent_def):
+        """AC3+AC4: Department found → DEPARTMENT_HAS_PROTO_MATTER connection created."""
+        from unittest.mock import MagicMock
+
+        matters = [{"clientName": "Acme"}]
+        payload = self._make_chambers_payload(matters)
+
+        # Mock requests to return a department
+        mock_requests = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"data": {"departments": [{"id": "dept-42"}]}}
+        mock_requests.post.return_value = mock_resp
+
+        connect_calls = []
+        def mock_connect(state, source_id, source_type, relationship_name, target_id, target_type, **kw):
+            connect_calls.append({
+                "source_id": source_id, "source_type": source_type,
+                "relationship_name": relationship_name,
+                "target_id": target_id, "target_type": target_type,
+            })
+            return {"success": True}
+
+        mock_actions = {
+            "graphology.create_node": lambda state, node_type, properties, **kw: {"success": True, "node_id": "proto-1"},
+            "graphology.connect_nodes": mock_connect,
+        }
+
+        state = {
+            "status": "success",
+            "payload_json": payload,
+            "directory_name": "chambers",
+            "context_node_id": "file-1",
+        }
+
+        result = _exec_node_with_actions(
+            agent_def, "expand_proto_matters", state,
+            mock_actions=mock_actions,
+            mock_modules={"requests": mock_requests},
+        )
+
+        assert result["department_id"] == "dept-42"
+        # Should have 2 connect calls: FILE_HAS_PROTO_MATTER + DEPARTMENT_HAS_PROTO_MATTER
+        assert len(connect_calls) == 2
+        assert connect_calls[1]["source_id"] == "dept-42"
+        assert connect_calls[1]["source_type"] == "Department"
+        assert connect_calls[1]["relationship_name"] == "DEPARTMENT_HAS_PROTO_MATTER"
+
+    def test_no_department_still_creates_protos(self, agent_def):
+        """AC4: No Department found → ProtoMatters created without Department link, warning logged."""
+        from unittest.mock import MagicMock
+
+        matters = [{"clientName": "Acme"}]
+        payload = self._make_chambers_payload(matters)
+
+        mock_requests = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"data": {"departments": []}}
+        mock_requests.post.return_value = mock_resp
+
+        connect_calls = []
+        def mock_connect(state, source_id, source_type, relationship_name, target_id, target_type, **kw):
+            connect_calls.append(relationship_name)
+            return {"success": True}
+
+        mock_actions = {
+            "graphology.create_node": lambda state, node_type, properties, **kw: {"success": True, "node_id": "proto-1"},
+            "graphology.connect_nodes": mock_connect,
+        }
+
+        state = {
+            "status": "success",
+            "payload_json": payload,
+            "directory_name": "chambers",
+            "context_node_id": "file-1",
+        }
+
+        result = _exec_node_with_actions(
+            agent_def, "expand_proto_matters", state,
+            mock_actions=mock_actions,
+            mock_modules={"requests": mock_requests},
+        )
+
+        assert len(result["proto_matter_ids"]) == 1
+        assert result["department_id"] == ""
+        # Only FILE_HAS_PROTO_MATTER, no DEPARTMENT_HAS_PROTO_MATTER
+        assert connect_calls == ["FILE_HAS_PROTO_MATTER"]
+
+    def test_create_node_failure_skips_matter(self, agent_def):
+        """AC1 edge: create_node failure → skip that matter, continue with rest."""
+        from unittest.mock import MagicMock
+
+        matters = [{"clientName": "Acme"}, {"clientName": "BigCo"}]
+        payload = self._make_chambers_payload(matters)
+
+        mock_requests = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"data": {"departments": []}}
+        mock_requests.post.return_value = mock_resp
+
+        call_count = [0]
+        def mock_create(state, node_type, properties, **kw):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return {"success": False, "error": "Server error"}
+            return {"success": True, "node_id": "proto-2"}
+
+        mock_actions = {
+            "graphology.create_node": mock_create,
+            "graphology.connect_nodes": lambda **kw: {"success": True},
+        }
+
+        state = {
+            "status": "success",
+            "payload_json": payload,
+            "directory_name": "chambers",
+            "context_node_id": "file-1",
+        }
+
+        result = _exec_node_with_actions(
+            agent_def, "expand_proto_matters", state,
+            mock_actions=mock_actions,
+            mock_modules={"requests": mock_requests},
+        )
+
+        # First matter failed, second succeeded
+        assert result["proto_matter_ids"] == ["proto-2"]
+
+
+class TestMattersExtraction:
+    """Tests for _extract_matters logic per directory (Task 4)."""
+
+    def test_chambers_merges_publishable_and_confidential(self, agent_def):
+        """AC1: Chambers merges publishable + confidential matters."""
+        from unittest.mock import MagicMock
+
+        payload = json.dumps({
+            "workHighlights": {
+                "publishableInformation": {"matters": [{"client": "A"}, {"client": "B"}]},
+                "confidentialInformation": {"matters": [{"client": "C"}]},
+            }
+        })
+
+        mock_requests = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"data": {"departments": []}}
+        mock_requests.post.return_value = mock_resp
+
+        created_props = []
+        def mock_create(state, node_type, properties, **kw):
+            created_props.append(json.loads(properties["payload"]))
+            return {"success": True, "node_id": f"proto-{len(created_props)}"}
+
+        mock_actions = {
+            "graphology.create_node": mock_create,
+            "graphology.connect_nodes": lambda **kw: {"success": True},
+        }
+
+        state = {
+            "status": "success", "payload_json": payload,
+            "directory_name": "chambers", "context_node_id": "file-1",
+        }
+        result = _exec_node_with_actions(agent_def, "expand_proto_matters", state, mock_actions=mock_actions, mock_modules={"requests": mock_requests})
+        assert len(result["proto_matter_ids"]) == 3
+        clients = [p["client"] for p in created_props]
+        assert clients == ["A", "B", "C"]
+
+    def test_iflr1000_deals(self, agent_def):
+        """AC1: IFLR1000 extracts from dealHighlights.deals."""
+        from unittest.mock import MagicMock
+
+        payload = json.dumps({
+            "dealHighlights": {
+                "deals": [{"dealName": "Deal A"}, {"dealName": "Deal B"}]
+            }
+        })
+
+        mock_requests = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"data": {"departments": []}}
+        mock_requests.post.return_value = mock_resp
+
+        create_count = [0]
+        def mock_create(state, node_type, properties, **kw):
+            create_count[0] += 1
+            return {"success": True, "node_id": f"proto-{create_count[0]}"}
+
+        mock_actions = {
+            "graphology.create_node": mock_create,
+            "graphology.connect_nodes": lambda **kw: {"success": True},
+        }
+
+        state = {
+            "status": "success", "payload_json": payload,
+            "directory_name": "iflr1000", "context_node_id": "file-1",
+        }
+        result = _exec_node_with_actions(agent_def, "expand_proto_matters", state, mock_actions=mock_actions, mock_modules={"requests": mock_requests})
+        assert len(result["proto_matter_ids"]) == 2
+
+    def test_legal500_merges_two_arrays(self, agent_def):
+        """AC1: Legal500 merges workHighlightsDetailed + workHighlightsDetailed_nonPublishable."""
+        from unittest.mock import MagicMock
+
+        payload = json.dumps({
+            "workHighlightsDetailed": [{"nameOfClient": "X"}],
+            "workHighlightsDetailed_nonPublishable": [{"nameOfClient": "Y"}, {"nameOfClient": "Z"}],
+        })
+
+        mock_requests = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"data": {"departments": []}}
+        mock_requests.post.return_value = mock_resp
+
+        create_count = [0]
+        def mock_create(state, node_type, properties, **kw):
+            create_count[0] += 1
+            return {"success": True, "node_id": f"proto-{create_count[0]}"}
+
+        mock_actions = {
+            "graphology.create_node": mock_create,
+            "graphology.connect_nodes": lambda **kw: {"success": True},
+        }
+
+        state = {
+            "status": "success", "payload_json": payload,
+            "directory_name": "legal500", "context_node_id": "file-1",
+        }
+        result = _exec_node_with_actions(agent_def, "expand_proto_matters", state, mock_actions=mock_actions, mock_modules={"requests": mock_requests})
+        assert len(result["proto_matter_ids"]) == 3
+
+    def test_itr_section_2(self, agent_def):
+        """AC1: ITR extracts from section_2_deal_and_case_highlights."""
+        from unittest.mock import MagicMock
+
+        payload = json.dumps({
+            "section_2_deal_and_case_highlights": [{"matterName": "Tax Case 1"}]
+        })
+
+        mock_requests = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"data": {"departments": []}}
+        mock_requests.post.return_value = mock_resp
+
+        mock_actions = {
+            "graphology.create_node": lambda state, node_type, properties, **kw: {"success": True, "node_id": "proto-1"},
+            "graphology.connect_nodes": lambda **kw: {"success": True},
+        }
+
+        state = {
+            "status": "success", "payload_json": payload,
+            "directory_name": "itr", "context_node_id": "file-1",
+        }
+        result = _exec_node_with_actions(agent_def, "expand_proto_matters", state, mock_actions=mock_actions, mock_modules={"requests": mock_requests})
+        assert len(result["proto_matter_ids"]) == 1
+
+    def test_leadersleague_work_highlights(self, agent_def):
+        """AC1: LeadersLeague extracts from work_highlights."""
+        from unittest.mock import MagicMock
+
+        payload = json.dumps({
+            "work_highlights": [{"matterName": "Deal X"}, {"matterName": "Deal Y"}]
+        })
+
+        mock_requests = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"data": {"departments": []}}
+        mock_requests.post.return_value = mock_resp
+
+        create_count = [0]
+        def mock_create(state, node_type, properties, **kw):
+            create_count[0] += 1
+            return {"success": True, "node_id": f"proto-{create_count[0]}"}
+
+        mock_actions = {
+            "graphology.create_node": mock_create,
+            "graphology.connect_nodes": lambda **kw: {"success": True},
+        }
+
+        state = {
+            "status": "success", "payload_json": payload,
+            "directory_name": "leadersleague", "context_node_id": "file-1",
+        }
+        result = _exec_node_with_actions(agent_def, "expand_proto_matters", state, mock_actions=mock_actions, mock_modules={"requests": mock_requests})
+        assert len(result["proto_matter_ids"]) == 2
+
+    def test_unknown_directory_no_matters(self, agent_def):
+        """AC8: Unknown directory → no key mapping, no matters extracted."""
+        from unittest.mock import MagicMock
+
+        payload = json.dumps({"some_key": [{"item": 1}]})
+
+        mock_requests = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"data": {"departments": []}}
+        mock_requests.post.return_value = mock_resp
+
+        state = {
+            "status": "success", "payload_json": payload,
+            "directory_name": "unknown_dir", "context_node_id": "file-1",
+        }
+        result = _exec_node_with_actions(agent_def, "expand_proto_matters", state, mock_modules={"requests": mock_requests})
+        assert result["proto_matter_ids"] == []
+
+
+class TestProtoMatterStateSchema:
+    """Tests for state_schema additions (Story 16.4)."""
+
+    def test_proto_matter_ids_field_exists(self, agent_def):
+        """AC1: proto_matter_ids field in state_schema."""
+        assert "proto_matter_ids" in agent_def["state_schema"]
+
+    def test_department_id_field_exists(self, agent_def):
+        """AC3: department_id field in state_schema."""
+        assert "department_id" in agent_def["state_schema"]
