@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-CLI tool to import a file end-to-end through the AI Workflow pipeline.
+CLI tool to import a file through the AI Workflow pipeline.
 
-Full flow:
+Flow:
   1. Upload file to GCS → storageUrl
   2. Create ApplicationFormFile node in the graph
   3. Run file_extraction agent → extracts payload, creates ProtoMatters
-  4. Run import_matter_qa agent on each ProtoMatter → generates PromptResponses
+
+The import_matter_qa step is handled automatically by database triggers
+when ProtoMatters are created with status "pending".
 
 Usage:
   python cli_import.py /path/to/file.docx
@@ -80,7 +82,6 @@ def load_config():
 # =============================================================================
 
 FILE_EXTRACTION_WORKFLOW_ID = "07646202-ddd7-4086-8acf-4c51561328fc"
-IMPORT_MATTER_WORKFLOW_ID = "2cf23dd5-6dda-4be3-93cb-37185f702057"
 
 
 # =============================================================================
@@ -241,36 +242,6 @@ def get_proto_matters(file_id: str, config: dict) -> list[dict]:
 
 
 # =============================================================================
-# STEP 5: Verify results
-# =============================================================================
-
-def get_execution_count(context_node_id: str, config: dict) -> int:
-    """Count PromptExecutions linked to a context node."""
-    query = """
-    query CountExecutions($nodeId: String!) {
-      promptExecutionAggregate(where: { contextNodeId_EQ: $nodeId }) {
-        count
-      }
-    }
-    """
-    headers = {
-        "Content-Type": "application/json",
-        "x-api-key": config["graphql_api_key"],
-    }
-    resp = requests.post(
-        config["graphql_url"],
-        json={"query": query, "variables": {"nodeId": context_node_id}},
-        headers=headers,
-        timeout=30,
-    )
-    resp.raise_for_status()
-    result = resp.json()
-    if "errors" in result:
-        return 0
-    return result["data"]["promptExecutionAggregate"]["count"]
-
-
-# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -283,14 +254,12 @@ Examples:
   python cli_import.py submission_form.docx
   python cli_import.py form.pdf --directory chambers --year 2025
   python cli_import.py form.docx --dry-run
-  python cli_import.py form.docx --skip-qa
         """,
     )
     parser.add_argument("file", type=Path, help="Path to the file to import (.doc, .docx, .pdf)")
     parser.add_argument("--directory", type=str, help="Directory name (chambers, iflr1000, legal500, itr, leadersleague)")
     parser.add_argument("--year", type=str, help="Year for the submission")
     parser.add_argument("--storage-url", type=str, help="Skip upload, use this existing GCS URL")
-    parser.add_argument("--skip-qa", action="store_true", help="Only run file_extraction, skip import_matter_qa")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be done without executing")
     parser.add_argument("--env", type=Path, help="Path to .env file")
 
@@ -311,13 +280,12 @@ Examples:
     mime_type = mime_type or "application/octet-stream"
 
     print(f"\n{'='*60}")
-    print(f"AI Workflow Pipeline — Full Import")
+    print(f"AI Workflow Pipeline — File Import")
     print(f"{'='*60}")
     print(f"  File:      {file_name}")
     print(f"  MIME:      {mime_type}")
     print(f"  Directory: {args.directory or '(auto-detect)'}")
     print(f"  Year:      {args.year or '(auto-detect)'}")
-    print(f"  Skip Q&A:  {args.skip_qa}")
     print()
 
     if args.dry_run:
@@ -325,13 +293,12 @@ Examples:
         print(f"  1. Upload {file_name} to GCS")
         print(f"  2. Create ApplicationFormFile node")
         print(f"  3. Run file_extraction agent")
-        if not args.skip_qa:
-            print(f"  4. Run import_matter_qa on each ProtoMatter")
+        print(f"  Q&A is handled automatically by database triggers.")
         print("\nNo changes made.")
         return
 
     # --- Step 1: Upload to GCS ---
-    print("[1/4] Uploading file to GCS...")
+    print("[1/3] Uploading file to GCS...")
     if args.storage_url:
         storage_url = args.storage_url
         print(f"  Using existing URL: {storage_url}")
@@ -339,7 +306,7 @@ Examples:
         storage_url = upload_to_gcs(args.file, config)
 
     # --- Step 2: Create ApplicationFormFile ---
-    print("\n[2/4] Creating ApplicationFormFile node...")
+    print("\n[2/3] Creating ApplicationFormFile node...")
     file_id = create_application_form_file(
         storage_url=storage_url,
         file_name=file_name,
@@ -350,7 +317,7 @@ Examples:
     )
 
     # --- Step 3: Run file_extraction ---
-    print("\n[3/4] Running file_extraction agent...")
+    print("\n[3/3] Running file_extraction agent...")
     t0 = time.time()
     result = run_agent("file_extraction", FILE_EXTRACTION_WORKFLOW_ID, file_id, config)
     elapsed = time.time() - t0
@@ -370,46 +337,11 @@ Examples:
         matter_name = payload.get("matter_name", "(unnamed)")
         print(f"    {i}. {pm['id'][:12]}... — {matter_name} [{pm['status']}]")
 
-    if args.skip_qa or not proto_matters:
-        print(f"\n{'='*60}")
-        print(f"Done. ApplicationFormFile: {file_id}")
-        print(f"ProtoMatters created: {len(proto_matters)}")
-        print(f"{'='*60}")
-        return
-
-    # --- Step 4: Run import_matter_qa on each ProtoMatter ---
-    print(f"\n[4/4] Running import_matter_qa on {len(proto_matters)} ProtoMatter(s)...")
-    success_count = 0
-    fail_count = 0
-
-    for i, pm in enumerate(proto_matters, 1):
-        pm_id = pm["id"]
-        payload = json.loads(pm.get("payload", "{}")) if pm.get("payload") else {}
-        matter_name = payload.get("matter_name", "(unnamed)")
-        print(f"\n  [{i}/{len(proto_matters)}] {matter_name} ({pm_id[:12]}...)")
-
-        t0 = time.time()
-        qa_result = run_agent("import_matter_qa", IMPORT_MATTER_WORKFLOW_ID, pm_id, config)
-        elapsed = time.time() - t0
-
-        if qa_result.get("success"):
-            exec_count = get_execution_count(pm_id, config)
-            print(f"    ✓ imported ({elapsed:.1f}s) — {exec_count} PromptExecutions")
-            success_count += 1
-        else:
-            print(f"    ✗ failed ({elapsed:.1f}s) — {qa_result.get('error', 'Unknown')}")
-            fail_count += 1
-
     # --- Summary ---
     print(f"\n{'='*60}")
-    print(f"Pipeline Complete")
-    print(f"{'='*60}")
-    print(f"  ApplicationFormFile: {file_id}")
-    print(f"  Storage URL:        {storage_url}")
-    print(f"  ProtoMatters:       {len(proto_matters)}")
-    print(f"  Q&A Success:        {success_count}/{len(proto_matters)}")
-    if fail_count:
-        print(f"  Q&A Failed:         {fail_count}/{len(proto_matters)}")
+    print(f"Done. ApplicationFormFile: {file_id}")
+    print(f"ProtoMatters created: {len(proto_matters)}")
+    print(f"Q&A will be triggered automatically by the database.")
     print(f"{'='*60}")
 
 
