@@ -188,10 +188,10 @@ nodes:
       try:
           update_mutation = """
           mutation UpdateProtoMatter($id: ID!, $status: String!) {
-            updateProtoMatters(
+            updateProtoMatter(
               where: { id_EQ: $id }
               update: { status: $status }
-            ) { protoMatters { id status } }
+            ) { protoMatter { id status } }
           }
           """
           api_key = os.environ.get("GRAPHOLOGY_API_KEY", "")
@@ -216,14 +216,14 @@ nodes:
           try:
               link_mutation = """
               mutation LinkProtoMatterToMatter($protoMatterId: ID!, $matterId: ID!) {
-                updateProtoMatters(
+                updateProtoMatter(
                   where: { id_EQ: $protoMatterId }
                   update: {
                     protoMatterImportedAs: {
                       connect: { where: { node: { id_EQ: $matterId } } }
                     }
                   }
-                ) { protoMatters { id } }
+                ) { protoMatter { id } }
               }
               """
               resp = requests.post(
