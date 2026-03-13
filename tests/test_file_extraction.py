@@ -2156,3 +2156,481 @@ class TestStatusTrackingResilience:
 
         assert result["status"] == "error"
         assert "Unknown directory" in result["error"]
+
+
+# =============================================================================
+# Save directoryName early tests (Story 1.2)
+# =============================================================================
+
+class TestSaveDirectoryNameNode:
+    """Tests for save_directory_name node (Story 1.2)."""
+
+    def test_save_directory_name_node_exists(self, agent_def):
+        """AC1: save_directory_name node exists in agent definition."""
+        node_names = [n["name"] for n in agent_def["nodes"]]
+        assert "save_directory_name" in node_names
+
+    def test_save_directory_name_uses_graphology_update(self, agent_def):
+        """AC1: save_directory_name uses graphology.update_node."""
+        node = next(n for n in agent_def["nodes"] if n["name"] == "save_directory_name")
+        assert node["uses"] == "graphology.update_node"
+
+    def test_save_directory_name_sets_directory_name(self, agent_def):
+        """AC1: save_directory_name sets directoryName from state."""
+        node = next(n for n in agent_def["nodes"] if n["name"] == "save_directory_name")
+        assert node["with"]["updates"]["directoryName"] == "{{ state.directory_name }}"
+
+    def test_save_directory_name_targets_application_form_file(self, agent_def):
+        """AC1: save_directory_name targets ApplicationFormFile node type."""
+        node = next(n for n in agent_def["nodes"] if n["name"] == "save_directory_name")
+        assert node["with"]["node_type"] == "ApplicationFormFile"
+
+    def test_save_directory_name_output_is_underscore_prefixed(self, agent_def):
+        """AC3: Output stored in _directory_save_result (best-effort, not checked)."""
+        node = next(n for n in agent_def["nodes"] if n["name"] == "save_directory_name")
+        assert node["output"] == "_directory_save_result"
+
+    def test_save_directory_name_before_resolve_agent(self, agent_def):
+        """AC2: save_directory_name appears before resolve_agent in node order."""
+        node_names = [n["name"] for n in agent_def["nodes"]]
+        save_idx = node_names.index("save_directory_name")
+        resolve_idx = node_names.index("resolve_agent")
+        assert save_idx < resolve_idx
+
+    def test_save_directory_name_after_process_classification(self, agent_def):
+        """AC2: save_directory_name appears after process_classification."""
+        node_names = [n["name"] for n in agent_def["nodes"]]
+        classify_idx = node_names.index("process_classification")
+        save_idx = node_names.index("save_directory_name")
+        assert classify_idx < save_idx
+
+    def test_detect_directory_routes_to_save_directory_name(self, agent_def):
+        """AC1,AC2: detect_directory fallthrough routes to save_directory_name."""
+        node = next(n for n in agent_def["nodes"] if n["name"] == "detect_directory")
+        goto_targets = [g.get("to") for g in node["goto"]]
+        assert "save_directory_name" in goto_targets
+
+    def test_process_classification_routes_to_save_directory_name(self, agent_def):
+        """AC1,AC2: process_classification success routes to save_directory_name."""
+        node = next(n for n in agent_def["nodes"] if n["name"] == "process_classification")
+        goto_targets = [g.get("to") for g in node["goto"]]
+        assert "save_directory_name" in goto_targets
+
+    def test_detect_directory_does_not_route_to_resolve_agent(self, agent_def):
+        """AC2: detect_directory no longer routes directly to resolve_agent."""
+        node = next(n for n in agent_def["nodes"] if n["name"] == "detect_directory")
+        goto_targets = [g.get("to") for g in node["goto"]]
+        assert "resolve_agent" not in goto_targets
+
+    def test_process_classification_does_not_route_to_resolve_agent(self, agent_def):
+        """AC2: process_classification no longer routes directly to resolve_agent."""
+        node = next(n for n in agent_def["nodes"] if n["name"] == "process_classification")
+        goto_targets = [g.get("to") for g in node["goto"]]
+        assert "resolve_agent" not in goto_targets
+
+    def test_detect_directory_error_and_classification_routes_unchanged(self, agent_def):
+        """AC2: detect_directory error→__end__ and classification routes unchanged."""
+        node = next(n for n in agent_def["nodes"] if n["name"] == "detect_directory")
+        goto_list = node["goto"]
+        # Error route still goes to __end__
+        assert goto_list[0]["to"] == "__end__"
+        assert goto_list[0]["if"] == "state.error"
+        # No directory → invoke_classification
+        assert goto_list[1]["to"] == "invoke_classification"
+        # Directory but no year → invoke_classification
+        assert goto_list[2]["to"] == "invoke_classification"
+
+    def test_save_directory_name_uses_context_node_id(self, agent_def):
+        """AC4: save_directory_name uses context_node_id for idempotent updates."""
+        node = next(n for n in agent_def["nodes"] if n["name"] == "save_directory_name")
+        assert node["with"]["node_id"] == "{{ state.context_node_id }}"
+
+    def test_save_directory_name_has_explicit_goto_to_lookup(self, agent_def):
+        """save_directory_name has explicit goto to lookup_directory_id (not implicit sequential)."""
+        node = next(n for n in agent_def["nodes"] if n["name"] == "save_directory_name")
+        goto = node.get("goto")
+        assert goto is not None, "save_directory_name must have an explicit goto block"
+        targets = [g.get("to") for g in goto]
+        assert "lookup_directory_id" in targets
+
+
+# =============================================================================
+# Story 1.3: lookup_directory_id node tests
+# =============================================================================
+
+class TestLookupDirectoryIdStructure:
+    """Structural tests for the lookup_directory_id node (Story 1.3)."""
+
+    def test_lookup_directory_id_node_exists(self, agent_def):
+        """Story 1.3 Task 1: lookup_directory_id node must exist."""
+        node_names = [n["name"] for n in agent_def["nodes"]]
+        assert "lookup_directory_id" in node_names
+
+    def test_lookup_directory_id_after_save_directory_name(self, agent_def):
+        """Story 1.3 Task 1.1: lookup_directory_id appears after save_directory_name."""
+        node_names = [n["name"] for n in agent_def["nodes"]]
+        save_idx = node_names.index("save_directory_name")
+        lookup_idx = node_names.index("lookup_directory_id")
+        assert lookup_idx == save_idx + 1
+
+    def test_lookup_directory_id_before_resolve_agent(self, agent_def):
+        """Story 1.3 Task 1.1: lookup_directory_id appears before resolve_agent."""
+        node_names = [n["name"] for n in agent_def["nodes"]]
+        lookup_idx = node_names.index("lookup_directory_id")
+        resolve_idx = node_names.index("resolve_agent")
+        assert lookup_idx < resolve_idx
+
+    def test_lookup_directory_id_has_run_block(self, agent_def):
+        """Story 1.3 Task 1: lookup_directory_id has a run: block."""
+        node = next(n for n in agent_def["nodes"] if n["name"] == "lookup_directory_id")
+        assert "run" in node
+        assert len(node["run"]) > 0
+
+    def test_lookup_directory_id_routes_to_resolve_agent(self, agent_def):
+        """Story 1.3 Task 2.2: lookup_directory_id unconditionally routes to resolve_agent."""
+        node = next(n for n in agent_def["nodes"] if n["name"] == "lookup_directory_id")
+        goto = node.get("goto")
+        # Check unconditional route to resolve_agent
+        if isinstance(goto, list):
+            targets = [g.get("to") for g in goto]
+            assert "resolve_agent" in targets
+        elif isinstance(goto, str):
+            assert goto == "resolve_agent"
+        else:
+            raise AssertionError("lookup_directory_id must have goto to resolve_agent")
+
+    def test_directory_id_in_state_schema(self, agent_def):
+        """Story 1.3: directory_id field exists in state_schema."""
+        assert "directory_id" in agent_def["state_schema"]
+
+
+class TestLookupDirectoryIdBehavior:
+    """Behavioral tests for the lookup_directory_id run block (Story 1.3)."""
+
+    def test_no_directory_name_skips_lookup(self, agent_def):
+        """AC#3 variant: If no directory_name in state, skip lookup."""
+        state = {
+            "context_node_id": "file-1",
+            "directory_name": "",
+        }
+        result = _exec_node_with_actions(agent_def, "lookup_directory_id", state)
+        assert result == {}
+
+    def test_successful_directory_lookup_exact_match(self, agent_def):
+        """AC#1,#2: Exact name match returns directory_id and calls update_node."""
+        from unittest.mock import MagicMock
+
+        mock_requests = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "data": {"directories": [{"id": "dir-123", "name": "chambers"}]}
+        }
+        mock_requests.post.return_value = mock_resp
+
+        update_calls = []
+        def mock_update(state, node_id, node_type, updates, **kw):
+            update_calls.append({"node_id": node_id, "node_type": node_type, "updates": updates})
+            return {"success": True}
+
+        mock_actions = {"graphology.update_node": mock_update}
+
+        state = {
+            "context_node_id": "file-1",
+            "directory_name": "chambers",
+        }
+
+        result = _exec_node_with_actions(
+            agent_def, "lookup_directory_id", state,
+            mock_actions=mock_actions,
+            mock_modules={"requests": mock_requests},
+        )
+
+        assert result["directory_id"] == "dir-123"
+        assert len(update_calls) == 1
+        assert update_calls[0]["node_id"] == "file-1"
+        assert update_calls[0]["node_type"] == "ApplicationFormFile"
+        assert update_calls[0]["updates"] == {"directoryId": "dir-123"}
+
+    def test_case_insensitive_fallback(self, agent_def):
+        """AC#1 subtask 1.6: Case-insensitive matching when exact match fails."""
+        from unittest.mock import MagicMock, call
+
+        mock_requests = MagicMock()
+        # First call (exact match) returns empty
+        resp1 = MagicMock()
+        resp1.json.return_value = {"data": {"directories": []}}
+        # Second call (all directories) returns with different casing
+        resp2 = MagicMock()
+        resp2.json.return_value = {
+            "data": {"directories": [
+                {"id": "dir-456", "name": "Chambers"},
+                {"id": "dir-789", "name": "IFLR1000"},
+            ]}
+        }
+        mock_requests.post.side_effect = [resp1, resp2]
+
+        update_calls = []
+        def mock_update(state, node_id, node_type, updates, **kw):
+            update_calls.append(updates)
+            return {"success": True}
+
+        mock_actions = {"graphology.update_node": mock_update}
+
+        state = {
+            "context_node_id": "file-1",
+            "directory_name": "chambers",
+        }
+
+        result = _exec_node_with_actions(
+            agent_def, "lookup_directory_id", state,
+            mock_actions=mock_actions,
+            mock_modules={"requests": mock_requests},
+        )
+
+        assert result["directory_id"] == "dir-456"
+        assert update_calls[0] == {"directoryId": "dir-456"}
+
+    def test_no_match_returns_empty_and_no_update(self, agent_def):
+        """AC#3: No matching Directory node → directory_id empty, no update_node call."""
+        from unittest.mock import MagicMock
+
+        mock_requests = MagicMock()
+        # First call: no match
+        resp1 = MagicMock()
+        resp1.json.return_value = {"data": {"directories": []}}
+        # Second call (fallback): still no match
+        resp2 = MagicMock()
+        resp2.json.return_value = {"data": {"directories": [
+            {"id": "dir-1", "name": "Legal500"},
+        ]}}
+        mock_requests.post.side_effect = [resp1, resp2]
+
+        update_calls = []
+        def mock_update(state, node_id, node_type, updates, **kw):
+            update_calls.append(updates)
+            return {"success": True}
+
+        mock_actions = {"graphology.update_node": mock_update}
+
+        state = {
+            "context_node_id": "file-1",
+            "directory_name": "chambers",
+        }
+
+        result = _exec_node_with_actions(
+            agent_def, "lookup_directory_id", state,
+            mock_actions=mock_actions,
+            mock_modules={"requests": mock_requests},
+        )
+
+        assert result["directory_id"] == ""
+        assert len(update_calls) == 0
+
+    def test_graphql_failure_best_effort(self, agent_def):
+        """AC#4: GraphQL failure → error logged, pipeline continues, directory_id empty."""
+        from unittest.mock import MagicMock
+
+        mock_requests = MagicMock()
+        mock_requests.post.side_effect = Exception("Connection refused")
+
+        mock_actions = {"graphology.update_node": MagicMock()}
+
+        state = {
+            "context_node_id": "file-1",
+            "directory_name": "chambers",
+        }
+
+        result = _exec_node_with_actions(
+            agent_def, "lookup_directory_id", state,
+            mock_actions=mock_actions,
+            mock_modules={"requests": mock_requests},
+        )
+
+        # Best-effort: no crash, returns empty directory_id
+        assert result["directory_id"] == ""
+
+    def test_uses_graphology_url_from_state_variables(self, agent_def):
+        """AC#5 subtask 1.4: GQL URL resolved from state.variables.GRAPHOLOGY_URL."""
+        from unittest.mock import MagicMock
+
+        mock_requests = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "data": {"directories": [{"id": "dir-1", "name": "chambers"}]}
+        }
+        mock_requests.post.return_value = mock_resp
+
+        mock_actions = {"graphology.update_node": lambda **kw: {"success": True}}
+
+        state = {
+            "context_node_id": "file-1",
+            "directory_name": "chambers",
+            "variables": {"GRAPHOLOGY_URL": "http://custom:4000"},
+        }
+
+        _exec_node_with_actions(
+            agent_def, "lookup_directory_id", state,
+            mock_actions=mock_actions,
+            mock_modules={"requests": mock_requests},
+        )
+
+        # Verify the URL used in the request
+        call_args = mock_requests.post.call_args
+        assert call_args[0][0] == "http://custom:4000"
+
+    def test_api_key_header_set_when_present(self, agent_def):
+        """AC#5 subtask 1.5: x-api-key header set when GRAPHOLOGY_API_KEY available."""
+        from unittest.mock import MagicMock
+
+        mock_requests = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "data": {"directories": [{"id": "dir-1", "name": "chambers"}]}
+        }
+        mock_requests.post.return_value = mock_resp
+
+        mock_actions = {"graphology.update_node": lambda **kw: {"success": True}}
+
+        state = {
+            "context_node_id": "file-1",
+            "directory_name": "chambers",
+            "variables": {
+                "GRAPHOLOGY_URL": "http://localhost:4000",
+                "GRAPHOLOGY_API_KEY": "test-key-123",
+            },
+        }
+
+        _exec_node_with_actions(
+            agent_def, "lookup_directory_id", state,
+            mock_actions=mock_actions,
+            mock_modules={"requests": mock_requests},
+        )
+
+        call_kwargs = mock_requests.post.call_args
+        headers = call_kwargs[1].get("headers") or call_kwargs.kwargs.get("headers", {})
+        assert headers.get("x-api-key") == "test-key-123"
+
+    def test_graphql_query_uses_find_directory(self, agent_def):
+        """AC#1 subtask 1.2: GraphQL query uses directories(where: {name_EQ: $name})."""
+        node = next(n for n in agent_def["nodes"] if n["name"] == "lookup_directory_id")
+        code = node["run"]
+        assert "directories" in code
+        assert "name_EQ" in code
+
+    def test_update_node_uses_graphology_action(self, agent_def):
+        """AC#5: Uses actions['graphology.update_node'] not direct mutation."""
+        node = next(n for n in agent_def["nodes"] if n["name"] == "lookup_directory_id")
+        code = node["run"]
+        assert 'actions["graphology.update_node"]' in code
+
+
+# =============================================================================
+# Story 1.4: LlamaExtract year override tests
+# =============================================================================
+
+class TestLlamaExtractYearOverride:
+    """Tests for LlamaExtract year extraction in prepare_payload (Story 1.4)."""
+
+    def test_top_level_year_overrides_detected_year(self, agent_def):
+        """AC1: Top-level year in LlamaExtract data overrides detected_year in classification_json."""
+        import json
+        state = {
+            "extract_result": {"success": True, "data": {"year": "2025", "firmName": "Acme"}},
+            "directory_name": "chambers",
+            "directory_source": "filename",
+            "detected_year": "2024",
+            "year_source": "filename",
+        }
+        result = _exec_node(agent_def, "prepare_payload", state)
+        assert result["status"] == "success"
+        classification = json.loads(result["classification_json"])
+        assert classification["detected_year"] == "2025"
+        assert classification["year_source"] == "llamaextract"
+
+    def test_nested_year_found_via_fallback(self, agent_def):
+        """AC2: Year nested in sub-section found via fallback search."""
+        import json
+        state = {
+            "extract_result": {"success": True, "data": {
+                "firmName": "Acme",
+                "lawyersRanking": {"year": "2026", "lawyers": []},
+            }},
+            "directory_name": "chambers",
+            "directory_source": "filename",
+            "detected_year": "2024",
+            "year_source": "filename",
+        }
+        result = _exec_node(agent_def, "prepare_payload", state)
+        classification = json.loads(result["classification_json"])
+        assert classification["detected_year"] == "2026"
+        assert classification["year_source"] == "llamaextract"
+
+    def test_no_year_anywhere_keeps_previous_tier(self, agent_def):
+        """AC3: No year in LlamaExtract data → detected_year unchanged."""
+        state = {
+            "extract_result": {"success": True, "data": {"firmName": "Acme", "lawyers": []}},
+            "directory_name": "chambers",
+            "directory_source": "filename",
+            "detected_year": "2024",
+            "year_source": "filename",
+        }
+        result = _exec_node(agent_def, "prepare_payload", state)
+        assert result["status"] == "success"
+        # No detected_year/year_source keys in return = previous state preserved
+        assert "detected_year" not in result
+        assert "year_source" not in result
+
+    def test_data_not_dict_skips_year_extraction(self, agent_def):
+        """AC5: Non-dict data does not cause errors."""
+        state = {
+            "extract_result": {"success": True, "data": ["item1", "item2"]},
+            "directory_name": "chambers",
+            "directory_source": "filename",
+        }
+        result = _exec_node(agent_def, "prepare_payload", state)
+        assert result["status"] == "success"
+        assert "detected_year" not in result
+
+    def test_integer_year_converted_to_string(self, agent_def):
+        """AC1 edge case: Integer year (e.g., 2026) is converted to string."""
+        import json
+        state = {
+            "extract_result": {"success": True, "data": {"year": 2026}},
+            "directory_name": "chambers",
+            "directory_source": "filename",
+            "detected_year": "2024",
+            "year_source": "filename",
+        }
+        result = _exec_node(agent_def, "prepare_payload", state)
+        classification = json.loads(result["classification_json"])
+        assert classification["detected_year"] == "2026"
+        assert classification["year_source"] == "llamaextract"
+
+    def test_none_year_treated_as_empty(self, agent_def):
+        """AC3 edge case: year=None is treated as empty, no override."""
+        state = {
+            "extract_result": {"success": True, "data": {"year": None, "firmName": "Acme"}},
+            "directory_name": "chambers",
+            "directory_source": "filename",
+            "detected_year": "2024",
+            "year_source": "filename",
+        }
+        result = _exec_node(agent_def, "prepare_payload", state)
+        assert "detected_year" not in result
+
+    def test_classification_json_reserialized_with_year(self, agent_def):
+        """AC4: classification_json includes updated year when override fires."""
+        import json
+        state = {
+            "extract_result": {"success": True, "data": {"year": "2025"}},
+            "directory_name": "iflr1000",
+            "directory_source": "filename",
+            "detected_year": "2024",
+            "year_source": "content",
+        }
+        result = _exec_node(agent_def, "prepare_payload", state)
+        classification = json.loads(result["classification_json"])
+        assert classification["detected_year"] == "2025"
+        assert classification["year_source"] == "llamaextract"
+        # Original directory info preserved
+        assert classification["directory"] == "iflr1000"
