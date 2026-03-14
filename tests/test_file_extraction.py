@@ -3349,7 +3349,7 @@ class TestDeriveLegalField:
         from unittest.mock import MagicMock
 
         mock_requests = self._make_mock_requests({
-            "practiceAreas": [{
+            "practiceArea": [{
                 "practiceAreaHasLegalField": [{"id": "lf-123", "name": "Banking Law"}]
             }]
         })
@@ -3375,7 +3375,7 @@ class TestDeriveLegalField:
         from unittest.mock import MagicMock
 
         mock_requests = self._make_mock_requests({
-            "practiceAreas": [{
+            "practiceArea": [{
                 "practiceAreaHasLegalField": [{"id": "lf-100", "name": "Tax Law"}]
             }]
         })
@@ -3424,7 +3424,7 @@ class TestDeriveLegalField:
         import logging
 
         mock_requests = self._make_mock_requests({
-            "practiceAreas": [{"practiceAreaHasLegalField": []}]
+            "practiceArea": [{"practiceAreaHasLegalField": []}]
         })
         state = {
             "practice_area_match": {"matched_id": "pa-no-lf"},
@@ -3444,7 +3444,7 @@ class TestDeriveLegalField:
         import logging
 
         mock_requests = self._make_mock_requests({
-            "practiceAreas": [{"practiceAreaHasLegalField": None}]
+            "practiceArea": [{"practiceAreaHasLegalField": None}]
         })
         state = {
             "practice_area_match": {"matched_id": "pa-null-lf"},
@@ -3460,11 +3460,11 @@ class TestDeriveLegalField:
         assert any("No LegalField found" in r.message for r in caplog.records)
 
     def test_empty_practice_areas_list(self, agent_def, caplog):
-        """AC4: practiceAreas returns empty list -> warning, empty result."""
+        """AC4: practiceArea returns empty list -> warning, empty result."""
         import logging
 
         mock_requests = self._make_mock_requests({
-            "practiceAreas": []
+            "practiceArea": []
         })
         state = {
             "practice_area_match": {"matched_id": "pa-missing"},
@@ -3485,7 +3485,7 @@ class TestDeriveLegalField:
         from unittest.mock import MagicMock
 
         mock_requests = self._make_mock_requests({
-            "practiceAreas": [{
+            "practiceArea": [{
                 "practiceAreaHasLegalField": [{"id": "lf-1", "name": "IP"}]
             }]
         })
@@ -3569,7 +3569,7 @@ class TestDeriveLegalField:
         from unittest.mock import MagicMock
 
         mock_requests = self._make_mock_requests({
-            "practiceAreas": [{
+            "practiceArea": [{
                 "practiceAreaHasLegalField": {"id": "lf-single", "name": "Litigation"}
             }]
         })
@@ -3593,7 +3593,7 @@ class TestDeriveLegalField:
         from unittest.mock import MagicMock
 
         mock_requests = self._make_mock_requests({
-            "practiceAreas": [{
+            "practiceArea": [{
                 "practiceAreaHasLegalField": [{"id": "lf-1", "name": "Tax"}]
             }]
         })
@@ -3619,7 +3619,7 @@ class TestDeriveLegalField:
         from unittest.mock import MagicMock
 
         mock_requests = self._make_mock_requests({
-            "practiceAreas": [{
+            "practiceArea": [{
                 "practiceAreaHasLegalField": [{"id": "lf-1", "name": "IP"}]
             }]
         })
@@ -3650,7 +3650,7 @@ class TestDeriveLegalField:
         from unittest.mock import MagicMock
 
         mock_requests = self._make_mock_requests({
-            "practiceAreas": [{
+            "practiceArea": [{
                 "practiceAreaHasLegalField": [{"id": "lf-1", "name": "Tax"}]
             }]
         })
@@ -3678,7 +3678,7 @@ class TestDeriveLegalField:
         from unittest.mock import MagicMock
 
         mock_requests = self._make_mock_requests({
-            "practiceAreas": [{
+            "practiceArea": [{
                 "practiceAreaHasLegalField": [{"id": "lf-2", "name": "IP Law"}]
             }]
         })
@@ -3769,8 +3769,8 @@ class TestExtractRegion:
         assert result["extracted_region"] == "Brazil"
 
     # --- AC4: ITR ---
-    def test_itr_region_dict(self, agent_def):
-        """AC4: ITR jurisdictions as dict -> extract jurisdiction_l1."""
+    def test_itr_region_dict_prefers_l2(self, agent_def):
+        """AC4: ITR jurisdictions as dict -> prefer jurisdiction_l2 (more specific)."""
         state = {
             "payload_json": json.dumps({
                 "firmInfo": {"jurisdictions": {"jurisdiction_l1": "United Kingdom", "jurisdiction_l2": "London"}}
@@ -3778,18 +3778,29 @@ class TestExtractRegion:
             "directory_name": "itr",
         }
         result = _exec_node(agent_def, "extract_region", state)
-        assert result["extracted_region"] == "United Kingdom"
+        assert result["extracted_region"] == "London"
 
-    def test_itr_region_dict_empty_l1(self, agent_def):
-        """AC4: ITR jurisdictions dict with empty jurisdiction_l1 -> empty string."""
+    def test_itr_region_dict_falls_back_to_l1(self, agent_def):
+        """AC4: ITR jurisdictions dict with empty jurisdiction_l2 -> fall back to l1."""
         state = {
             "payload_json": json.dumps({
-                "firmInfo": {"jurisdictions": {"jurisdiction_l1": "", "jurisdiction_l2": "Minas Gerais"}}
+                "firmInfo": {"jurisdictions": {"jurisdiction_l1": "Brazil - Regional", "jurisdiction_l2": ""}}
             }),
             "directory_name": "itr",
         }
         result = _exec_node(agent_def, "extract_region", state)
-        assert result["extracted_region"] == ""
+        assert result["extracted_region"] == "Brazil - Regional"
+
+    def test_itr_region_dict_l2_only(self, agent_def):
+        """AC4: ITR jurisdictions dict with only jurisdiction_l2 -> returns l2."""
+        state = {
+            "payload_json": json.dumps({
+                "firmInfo": {"jurisdictions": {"jurisdiction_l2": "Minas Gerais"}}
+            }),
+            "directory_name": "itr",
+        }
+        result = _exec_node(agent_def, "extract_region", state)
+        assert result["extracted_region"] == "Minas Gerais"
 
     def test_itr_region_string(self, agent_def):
         """AC4: ITR jurisdictions as string (legacy) -> passthrough."""

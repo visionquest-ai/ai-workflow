@@ -852,7 +852,8 @@ nodes:
       def _extract_itr_region(p):
           jurisdictions = p.get("firmInfo", {}).get("jurisdictions", "")
           if isinstance(jurisdictions, dict):
-              return jurisdictions.get("jurisdiction_l1", "")
+              # Prefer jurisdiction_l2 (state/region) over l1 (country-level)
+              return jurisdictions.get("jurisdiction_l2", "") or jurisdictions.get("jurisdiction_l1", "")
           if isinstance(jurisdictions, list):
               return jurisdictions[0] if jurisdictions else ""
           return str(jurisdictions)
@@ -1043,7 +1044,7 @@ nodes:
 
       query = '''
       query GetLegalField($paId: ID!) {
-        practiceAreas(where: { id_EQ: $paId }) {
+        practiceArea(where: { id_EQ: $paId }) {
           practiceAreaHasLegalField {
             id
             name
@@ -1062,7 +1063,7 @@ nodes:
           )
           resp.raise_for_status()
           data = resp.json().get("data", {})
-          pas = data.get("practiceAreas", [])
+          pas = data.get("practiceArea", [])
 
           if pas and pas[0].get("practiceAreaHasLegalField"):
               lf_list = pas[0]["practiceAreaHasLegalField"]
