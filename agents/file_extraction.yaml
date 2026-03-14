@@ -73,6 +73,19 @@ state_schema:
   # Directory lookup (Story 1.3)
   directory_id: str           # ID of matched Directory node from graph
 
+  # Practice area extraction (Story 2.2)
+  extracted_practice_area: str  # Raw practice area string for downstream fuzzy matching
+
+  # Region extraction (Story 3.1)
+  extracted_region: str           # Raw region string for downstream fuzzy matching
+
+  # Practice area matching (Story 2.3)
+  practice_area_match: dict     # Fuzzy match result: matched_name, matched_id, score, tier, via_hint
+
+  # Legal field derivation (Story 2.4)
+  legal_field_name: str          # Derived LegalField name from PracticeArea graph traversal
+  legal_field_id: str            # Derived LegalField graph node ID
+
   # Output
   update_result: dict        # Result from graphology.update_node
   status: str                # success, error
@@ -674,6 +687,8 @@ nodes:
 
   # Step 5: Serialize extraction result and clean up temp files
   - name: prepare_payload
+    goto:
+      - to: extract_practice_area
     run: |
       import json
       import os
@@ -744,6 +759,343 @@ nodes:
       else:
           payload = json.dumps({"error": extract_result.get("error", "Extraction failed"), "status": "failed"})
           return {"payload_json": payload, "classification_json": classification_json, "status": "error", "error": extract_result.get("error", "Extraction failed")}
+
+  # Step 5b: Extract practiceArea from payload (Story 2.2)
+  - name: extract_practice_area
+    goto:
+      - to: extract_region
+    run: |
+      import json
+      import logging
+
+      logger = logging.getLogger(__name__)
+
+      # Skip extraction if upstream failed (error payload has no practiceArea)
+      if state.get("status") == "error":
+          return {"extracted_practice_area": ""}
+
+      payload_json = state.get("payload_json", "")
+      if not payload_json:
+          return {"extracted_practice_area": ""}
+
+      try:
+          payload = json.loads(payload_json)
+      except (json.JSONDecodeError, TypeError):
+          return {"extracted_practice_area": ""}
+
+      directory = (state.get("directory_name") or "").lower().strip()
+
+      def _extract_itr_practice_area(p):
+          pa = p.get("firmInfo", {}).get("primary_practice_area", {})
+          if isinstance(pa, str):
+              return pa
+          if isinstance(pa, dict):
+              both = pa.get("both", False)
+              if both:
+                  return "Tax and Transfer Pricing"
+              parts = []
+              if pa.get("tax", False):
+                  parts.append("Tax")
+              if pa.get("transferPricing", False):
+                  parts.append("Transfer Pricing")
+              return " and ".join(parts) if parts else ""
+          return ""
+
+      extractors = {
+          "chambers": lambda p: p.get("preliminaryInformation", {}).get("practiceArea", ""),
+          "iflr1000": lambda p: p.get("firmDetails", {}).get("practiceArea", ""),
+          "legal500": lambda p: p.get("practiceArea", ""),
+          "leadersleague": lambda p: p.get("practice_area", ""),
+          "leaders league": lambda p: p.get("practice_area", ""),
+          "itr": lambda p: _extract_itr_practice_area(p),
+      }
+
+      extractor = extractors.get(directory)
+      if not extractor:
+          logger.warning("No practiceArea extractor for directory: %s", directory)
+          return {"extracted_practice_area": ""}
+
+      practice_area = extractor(payload) or ""
+      if not practice_area:
+          logger.warning("No practiceArea found in payload for directory: %s", directory)
+
+      return {"extracted_practice_area": str(practice_area).strip()}
+
+  # Step 5b2: Extract region from payload (Story 3.1)
+  - name: extract_region
+    goto:
+      - to: resolve_practice_area
+    run: |
+      import json
+      import logging
+
+      logger = logging.getLogger(__name__)
+
+      # Skip extraction if upstream failed
+      if state.get("status") == "error":
+          return {"extracted_region": ""}
+
+      payload_json = state.get("payload_json", "")
+      if not payload_json:
+          return {"extracted_region": ""}
+
+      try:
+          payload = json.loads(payload_json)
+      except (json.JSONDecodeError, TypeError):
+          return {"extracted_region": ""}
+
+      directory = (state.get("directory_name") or "").lower().strip()
+
+      def _extract_itr_region(p):
+          jurisdictions = p.get("firmInfo", {}).get("jurisdictions", "")
+          if isinstance(jurisdictions, dict):
+              return jurisdictions.get("jurisdiction_l1", "")
+          if isinstance(jurisdictions, list):
+              return jurisdictions[0] if jurisdictions else ""
+          return str(jurisdictions)
+
+      def _extract_leaders_region(p):
+          return p.get("jurisdiction", "") or ""
+
+      extractors = {
+          "chambers": lambda p: p.get("preliminaryInformation", {}).get("jurisdiction", ""),
+          "iflr1000": lambda p: p.get("firmDetails", {}).get("jurisdiction", ""),
+          "legal500": lambda p: p.get("country", ""),
+          "itr": lambda p: _extract_itr_region(p),
+          "leadersleague": lambda p: _extract_leaders_region(p),
+          "leaders league": lambda p: _extract_leaders_region(p),
+      }
+
+      extractor = extractors.get(directory)
+      if not extractor:
+          logger.warning("No region extractor for directory: %s", directory)
+          return {"extracted_region": ""}
+
+      region = extractor(payload) or ""
+      if not region:
+          logger.warning("No region found in payload for directory: %s", directory)
+
+      return {"extracted_region": str(region).strip()}
+
+  # Step 5c: Fuzzy match practiceArea against graph PracticeArea nodes (Story 2.3)
+  - name: resolve_practice_area
+    goto:
+      - to: derive_legal_field
+    run: |
+      import json
+      import os
+      import logging
+
+      logger = logging.getLogger(__name__)
+
+      extracted_pa = state.get("extracted_practice_area", "")
+      if not extracted_pa:
+          logger.debug("resolve_practice_area: no extracted_practice_area, skipping")
+          return {"practice_area_match": {}}
+
+      directory_id = state.get("directory_id", "")
+
+      try:
+          # 1. Query PracticeArea nodes from graph
+          gql_url = (
+              state.get("variables", {}).get("GRAPHOLOGY_URL")
+              or os.environ.get("GRAPHOLOGY_URL")
+              or "http://localhost:4000"
+          )
+          gql_api_key = (
+              state.get("variables", {}).get("GRAPHOLOGY_API_KEY")
+              or os.environ.get("GRAPHOLOGY_API_KEY")
+          )
+          headers = {"Content-Type": "application/json"}
+          if gql_api_key:
+              headers["x-api-key"] = gql_api_key
+
+          # Filter by directory if directory_id is available
+          if directory_id:
+              query = '''
+              query GetPracticeAreasByDirectory($directoryId: ID!) {
+                practiceArea(where: { practiceAreaInDirectory_SOME: { id_EQ: $directoryId } }) {
+                  id
+                  name
+                  hints
+                }
+              }
+              '''
+              variables = {"directoryId": directory_id}
+          else:
+              query = '''
+              query GetAllPracticeAreas {
+                practiceArea {
+                  id
+                  name
+                  hints
+                }
+              }
+              '''
+              variables = {}
+
+          import requests
+          resp = requests.post(
+              gql_url,
+              json={"query": query, "variables": variables},
+              timeout=30,
+              headers=headers,
+          )
+          resp.raise_for_status()
+          data = resp.json().get("data", {})
+          practice_areas = data.get("practiceArea", [])
+
+          if not practice_areas:
+              logger.warning(
+                  "resolve_practice_area: No PracticeArea nodes returned from graph "
+                  "(directory_id=%s)", directory_id
+              )
+              return {"practice_area_match": {}}
+
+          # 2. Build master list for fuzzy matching
+          master_list = [
+              {
+                  "name": pa["name"],
+                  "id": pa["id"],
+                  "hints": pa.get("hints") or "",
+              }
+              for pa in practice_areas
+          ]
+
+          # 3. Import and run fuzzy matcher (from Story 2.1)
+          from actions.fuzzy_match import fuzzy_match
+          result = fuzzy_match(extracted_pa, master_list)
+
+          # 4. Save to ApplicationFormFile if match found
+          if result.get("matched_name"):
+              context_node_id = state.get("context_node_id", "")
+              if not context_node_id:
+                  logger.warning(
+                      "resolve_practice_area: match found but context_node_id missing, "
+                      "cannot persist to ApplicationFormFile"
+                  )
+              else:
+                  update_result = actions["graphology.update_node"](
+                      state=state,
+                      node_id=context_node_id,
+                      node_type="ApplicationFormFile",
+                      updates={
+                          "practiceAreaName": result["matched_name"],
+                          "practiceAreaId": result["matched_id"],
+                      },
+                      graphql_url=gql_url,
+                      graphql_api_key=gql_api_key,
+                  )
+                  if not update_result.get("success"):
+                      logger.warning(
+                          "resolve_practice_area: update_node failed: %s",
+                          update_result.get("error", "unknown"),
+                      )
+              logger.info(
+                  "resolve_practice_area: Matched '%s' -> '%s' (id=%s, score=%.4f, tier=%s)",
+                  extracted_pa, result["matched_name"], result["matched_id"],
+                  result.get("score", 0), result.get("tier", "unknown"),
+              )
+          else:
+              logger.warning(
+                  "resolve_practice_area: No match for '%s'. Tier: %s",
+                  extracted_pa, result.get("tier", "unknown"),
+              )
+
+          return {"practice_area_match": result}
+
+      except Exception as e:
+          logger.warning("resolve_practice_area: Failed (best-effort): %s", e)
+          return {"practice_area_match": {}}
+
+  # Step 5d: Derive LegalField from matched PracticeArea via graph traversal (Story 2.4)
+  - name: derive_legal_field
+    goto:
+      - to: save_payload
+    run: |
+      import os
+      import logging
+
+      logger = logging.getLogger(__name__)
+
+      pa_match = state.get("practice_area_match", {})
+      pa_id = pa_match.get("matched_id", "")
+
+      if not pa_id:
+          logger.debug("derive_legal_field: no practiceAreaId, skipping")
+          return {"legal_field_name": "", "legal_field_id": ""}
+
+      gql_url = (
+          state.get("variables", {}).get("GRAPHOLOGY_URL")
+          or os.environ.get("GRAPHOLOGY_URL")
+          or "http://localhost:4000"
+      )
+      gql_api_key = (
+          state.get("variables", {}).get("GRAPHOLOGY_API_KEY")
+          or os.environ.get("GRAPHOLOGY_API_KEY")
+      )
+      headers = {"Content-Type": "application/json"}
+      if gql_api_key:
+          headers["x-api-key"] = gql_api_key
+
+      query = '''
+      query GetLegalField($paId: ID!) {
+        practiceAreas(where: { id_EQ: $paId }) {
+          practiceAreaHasLegalField {
+            id
+            name
+          }
+        }
+      }
+      '''
+
+      import requests as req
+      try:
+          resp = req.post(
+              gql_url,
+              json={"query": query, "variables": {"paId": pa_id}},
+              timeout=30,
+              headers=headers,
+          )
+          resp.raise_for_status()
+          data = resp.json().get("data", {})
+          pas = data.get("practiceAreas", [])
+
+          if pas and pas[0].get("practiceAreaHasLegalField"):
+              lf_list = pas[0]["practiceAreaHasLegalField"]
+              if lf_list:
+                  lf = lf_list[0] if isinstance(lf_list, list) else lf_list
+                  lf_name = lf.get("name", "")
+                  lf_id = lf.get("id", "")
+
+                  # Persist to ApplicationFormFile
+                  context_node_id = state.get("context_node_id", "")
+                  if context_node_id:
+                      update_result = actions["graphology.update_node"](
+                          state=state,
+                          node_id=context_node_id,
+                          node_type="ApplicationFormFile",
+                          updates={
+                              "legalFieldName": lf_name,
+                              "legalFieldId": lf_id,
+                          },
+                          graphql_url=gql_url,
+                          graphql_api_key=gql_api_key,
+                      )
+                      if not update_result.get("success"):
+                          logger.warning(
+                              "derive_legal_field: update_node failed: %s",
+                              update_result.get("error", "unknown"),
+                          )
+
+                  return {"legal_field_name": lf_name, "legal_field_id": lf_id}
+
+          logger.warning("derive_legal_field: No LegalField found for PracticeArea %s", pa_id)
+          return {"legal_field_name": "", "legal_field_id": ""}
+
+      except Exception as e:
+          logger.warning("derive_legal_field: GraphQL query failed: %s", e)
+          return {"legal_field_name": "", "legal_field_id": ""}
 
   # Step 6: Save extraction result back to the node via GraphQL
   - name: save_payload

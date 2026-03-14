@@ -2634,3 +2634,1312 @@ class TestLlamaExtractYearOverride:
         assert classification["year_source"] == "llamaextract"
         # Original directory info preserved
         assert classification["directory"] == "iflr1000"
+
+
+# =============================================================================
+# STORY 2.2 — extract_practice_area node tests
+# =============================================================================
+
+class TestExtractPracticeArea:
+    """Tests for the extract_practice_area run block (Story 2.2)."""
+
+    # --- AC1: Chambers ---
+    def test_chambers_practice_area(self, agent_def):
+        """AC1: Chambers payloads yield practiceArea from preliminaryInformation."""
+        state = {
+            "payload_json": json.dumps({
+                "preliminaryInformation": {"practiceArea": "Tax: Southeast"}
+            }),
+            "directory_name": "chambers",
+        }
+        result = _exec_node(agent_def, "extract_practice_area", state)
+        assert result["extracted_practice_area"] == "Tax: Southeast"
+
+    # --- AC2: Legal 500 ---
+    def test_legal500_practice_area(self, agent_def):
+        """AC2: Legal 500 payloads yield practiceArea from top-level."""
+        state = {
+            "payload_json": json.dumps({
+                "practiceArea": "Brazil - City focus - Belo Horizonte - Commercial, corporate and M&A"
+            }),
+            "directory_name": "legal500",
+        }
+        result = _exec_node(agent_def, "extract_practice_area", state)
+        assert result["extracted_practice_area"] == "Brazil - City focus - Belo Horizonte - Commercial, corporate and M&A"
+
+    # --- AC3: IFLR1000 ---
+    def test_iflr1000_practice_area(self, agent_def):
+        """AC3: IFLR1000 payloads yield practiceArea from firmDetails."""
+        state = {
+            "payload_json": json.dumps({
+                "firmDetails": {"practiceArea": "M&A"}
+            }),
+            "directory_name": "iflr1000",
+        }
+        result = _exec_node(agent_def, "extract_practice_area", state)
+        assert result["extracted_practice_area"] == "M&A"
+
+    # --- AC4: ITR boolean flags ---
+    def test_itr_both_true(self, agent_def):
+        """AC4: ITR both=true -> 'Tax and Transfer Pricing'."""
+        state = {
+            "payload_json": json.dumps({
+                "firmInfo": {"primary_practice_area": {"tax": True, "transferPricing": True, "both": True}}
+            }),
+            "directory_name": "itr",
+        }
+        result = _exec_node(agent_def, "extract_practice_area", state)
+        assert result["extracted_practice_area"] == "Tax and Transfer Pricing"
+
+    def test_itr_tax_only(self, agent_def):
+        """AC4: ITR tax=true only -> 'Tax'."""
+        state = {
+            "payload_json": json.dumps({
+                "firmInfo": {"primary_practice_area": {"tax": True, "transferPricing": False, "both": False}}
+            }),
+            "directory_name": "itr",
+        }
+        result = _exec_node(agent_def, "extract_practice_area", state)
+        assert result["extracted_practice_area"] == "Tax"
+
+    def test_itr_transfer_pricing_only(self, agent_def):
+        """AC4: ITR transferPricing=true only -> 'Transfer Pricing'."""
+        state = {
+            "payload_json": json.dumps({
+                "firmInfo": {"primary_practice_area": {"tax": False, "transferPricing": True, "both": False}}
+            }),
+            "directory_name": "itr",
+        }
+        result = _exec_node(agent_def, "extract_practice_area", state)
+        assert result["extracted_practice_area"] == "Transfer Pricing"
+
+    def test_itr_all_false(self, agent_def):
+        """AC4: ITR all flags false -> empty string."""
+        state = {
+            "payload_json": json.dumps({
+                "firmInfo": {"primary_practice_area": {"tax": False, "transferPricing": False, "both": False}}
+            }),
+            "directory_name": "itr",
+        }
+        result = _exec_node(agent_def, "extract_practice_area", state)
+        assert result["extracted_practice_area"] == ""
+
+    def test_itr_string_passthrough(self, agent_def):
+        """AC4: ITR primary_practice_area already a string -> passthrough."""
+        state = {
+            "payload_json": json.dumps({
+                "firmInfo": {"primary_practice_area": "Tax"}
+            }),
+            "directory_name": "itr",
+        }
+        result = _exec_node(agent_def, "extract_practice_area", state)
+        assert result["extracted_practice_area"] == "Tax"
+
+    # --- AC5: Leaders League ---
+    def test_leadersleague_practice_area(self, agent_def):
+        """AC5: Leaders League payloads yield practiceArea from practice_area."""
+        state = {
+            "payload_json": json.dumps({
+                "practice_area": "Corporate / M&A"
+            }),
+            "directory_name": "leadersleague",
+        }
+        result = _exec_node(agent_def, "extract_practice_area", state)
+        assert result["extracted_practice_area"] == "Corporate / M&A"
+
+    # --- AC6: Missing practiceArea field ---
+    def test_empty_payload_json(self, agent_def):
+        """AC6: Empty payload_json -> empty string."""
+        state = {
+            "payload_json": "",
+            "directory_name": "chambers",
+        }
+        result = _exec_node(agent_def, "extract_practice_area", state)
+        assert result["extracted_practice_area"] == ""
+
+    def test_invalid_json(self, agent_def):
+        """AC6: Invalid JSON -> empty string."""
+        state = {
+            "payload_json": "not-json{",
+            "directory_name": "chambers",
+        }
+        result = _exec_node(agent_def, "extract_practice_area", state)
+        assert result["extracted_practice_area"] == ""
+
+    def test_missing_practice_area_field(self, agent_def):
+        """AC6: Valid payload but no practiceArea field -> empty string."""
+        state = {
+            "payload_json": json.dumps({"someOtherField": "value"}),
+            "directory_name": "chambers",
+        }
+        result = _exec_node(agent_def, "extract_practice_area", state)
+        assert result["extracted_practice_area"] == ""
+
+    # --- AC7: Unrecognized directory ---
+    def test_unknown_directory(self, agent_def):
+        """AC7: Unknown directory -> empty string."""
+        state = {
+            "payload_json": json.dumps({"practiceArea": "Something"}),
+            "directory_name": "unknown_dir",
+        }
+        result = _exec_node(agent_def, "extract_practice_area", state)
+        assert result["extracted_practice_area"] == ""
+
+    # --- AC8: Stored as stripped string ---
+    def test_whitespace_stripped(self, agent_def):
+        """AC8: Result is stripped."""
+        state = {
+            "payload_json": json.dumps({
+                "practiceArea": "  Brazil - Tax  "
+            }),
+            "directory_name": "legal500",
+        }
+        result = _exec_node(agent_def, "extract_practice_area", state)
+        assert result["extracted_practice_area"] == "Brazil - Tax"
+
+    # --- M2 fix: Skip extraction on error status ---
+    def test_error_status_skips_extraction(self, agent_def):
+        """M2: When upstream failed (status=error), skip extraction."""
+        state = {
+            "payload_json": json.dumps({"error": "Extraction failed", "status": "failed"}),
+            "directory_name": "chambers",
+            "status": "error",
+        }
+        result = _exec_node(agent_def, "extract_practice_area", state)
+        assert result["extracted_practice_area"] == ""
+
+    # --- M3 fix: "leaders league" with space ---
+    def test_leaders_league_with_space(self, agent_def):
+        """M3: 'leaders league' (with space) variant works."""
+        state = {
+            "payload_json": json.dumps({"practice_area": "Banking & Finance"}),
+            "directory_name": "leaders league",
+        }
+        result = _exec_node(agent_def, "extract_practice_area", state)
+        assert result["extracted_practice_area"] == "Banking & Finance"
+
+    # --- L1 fix: Verify warning logs ---
+    def test_unknown_directory_logs_warning(self, agent_def, caplog):
+        """L1/AC7: Unknown directory logs a warning."""
+        import logging
+        state = {
+            "payload_json": json.dumps({"practiceArea": "Something"}),
+            "directory_name": "unknown_dir",
+        }
+        with caplog.at_level(logging.WARNING):
+            _exec_node(agent_def, "extract_practice_area", state)
+        assert any("No practiceArea extractor for directory" in r.message for r in caplog.records)
+
+    def test_missing_field_logs_warning(self, agent_def, caplog):
+        """L1/AC6: Missing practiceArea field logs a warning."""
+        import logging
+        state = {
+            "payload_json": json.dumps({"someField": "value"}),
+            "directory_name": "legal500",
+        }
+        with caplog.at_level(logging.WARNING):
+            _exec_node(agent_def, "extract_practice_area", state)
+        assert any("No practiceArea found in payload" in r.message for r in caplog.records)
+
+    # --- L3 fix: ITR primary_practice_area as None ---
+    def test_itr_null_practice_area(self, agent_def):
+        """L3: ITR primary_practice_area is null -> empty string."""
+        state = {
+            "payload_json": json.dumps({
+                "firmInfo": {"primary_practice_area": None}
+            }),
+            "directory_name": "itr",
+        }
+        result = _exec_node(agent_def, "extract_practice_area", state)
+        assert result["extracted_practice_area"] == ""
+
+
+# =============================================================================
+# Story 2.3: PracticeArea Fuzzy Matching & Persistence
+# =============================================================================
+
+class TestResolvePracticeArea:
+    """Tests for resolve_practice_area node (Story 2.3)."""
+
+    def _make_mock_requests(self, practice_areas=None, status_code=200, raise_error=False):
+        """Create a mock requests module with configurable GraphQL response."""
+        from unittest.mock import MagicMock
+
+        mock_requests = MagicMock()
+        mock_response = MagicMock()
+
+        if raise_error:
+            mock_requests.post.side_effect = Exception("Connection refused")
+        else:
+            mock_response.status_code = status_code
+            if status_code >= 400:
+                mock_response.raise_for_status.side_effect = Exception(f"HTTP {status_code}")
+            else:
+                mock_response.raise_for_status.return_value = None
+            mock_response.json.return_value = {
+                "data": {"practiceArea": practice_areas or []}
+            }
+            mock_requests.post.return_value = mock_response
+
+        return mock_requests
+
+    def _make_mock_fuzzy_match_module(self, result=None):
+        """Create a mock fuzzy_match module."""
+        from unittest.mock import MagicMock
+        mock_module = MagicMock()
+        if result is None:
+            result = {
+                "matched_name": "Banking & Finance",
+                "matched_id": "pa-123",
+                "score": 1.0,
+                "via_hint": False,
+                "tier": "CA-1",
+            }
+        mock_module.fuzzy_match.return_value = result
+        return mock_module
+
+    # --- AC5: Empty extracted_practice_area -> early return ---
+    def test_empty_practice_area_returns_empty(self, agent_def):
+        """AC4/6.5: Empty extracted_practice_area -> early return, no GraphQL calls."""
+        state = {"extracted_practice_area": ""}
+        result = _exec_node_with_actions(agent_def, "resolve_practice_area", state)
+        assert result == {"practice_area_match": {}}
+
+    def test_missing_practice_area_returns_empty(self, agent_def):
+        """AC4: Missing extracted_practice_area key -> early return."""
+        state = {}
+        result = _exec_node_with_actions(agent_def, "resolve_practice_area", state)
+        assert result == {"practice_area_match": {}}
+
+    # --- AC1: Query PracticeArea nodes filtered by directory ---
+    def test_queries_by_directory_id(self, agent_def):
+        """AC1: Queries PracticeArea nodes filtered by directory_id."""
+        practice_areas = [
+            {"id": "pa-1", "name": "Banking & Finance", "hints": None},
+            {"id": "pa-2", "name": "Corporate Law", "hints": "M&A|Business"},
+        ]
+        mock_requests = self._make_mock_requests(practice_areas)
+        mock_fm = self._make_mock_fuzzy_match_module()
+        mock_actions = {"graphology.update_node": lambda **kwargs: {"success": True}}
+
+        state = {
+            "extracted_practice_area": "Banking & Finance",
+            "directory_id": "dir-uuid-1",
+            "context_node_id": "file-uuid-1",
+        }
+        result = _exec_node_with_actions(
+            agent_def, "resolve_practice_area", state,
+            mock_actions=mock_actions,
+            mock_modules={"requests": mock_requests, "actions.fuzzy_match": mock_fm},
+        )
+
+        assert result["practice_area_match"]["matched_name"] == "Banking & Finance"
+
+        # Verify directory-filtered query was used
+        call_args = mock_requests.post.call_args
+        query_body = call_args[1].get("json") or call_args.kwargs.get("json", {})
+        assert "practiceAreaInDirectory_SOME" in query_body["query"]
+        assert query_body["variables"]["directoryId"] == "dir-uuid-1"
+
+    # --- AC1 fallback: No directory_id -> fetch all PracticeAreas ---
+    def test_fallback_to_all_practice_areas(self, agent_def):
+        """6.8: Missing directory_id -> queries all PracticeAreas."""
+        practice_areas = [
+            {"id": "pa-1", "name": "Banking & Finance", "hints": None},
+        ]
+        mock_requests = self._make_mock_requests(practice_areas)
+        mock_fm = self._make_mock_fuzzy_match_module()
+        mock_actions = {"graphology.update_node": lambda **kwargs: {"success": True}}
+
+        state = {
+            "extracted_practice_area": "Banking & Finance",
+            "context_node_id": "file-uuid-1",
+        }
+        result = _exec_node_with_actions(
+            agent_def, "resolve_practice_area", state,
+            mock_actions=mock_actions,
+            mock_modules={"requests": mock_requests, "actions.fuzzy_match": mock_fm},
+        )
+
+        assert result["practice_area_match"]["matched_name"] == "Banking & Finance"
+
+        call_args = mock_requests.post.call_args
+        query_body = call_args[1].get("json") or call_args.kwargs.get("json", {})
+        assert "practiceAreaInDirectory_SOME" not in query_body["query"]
+
+    # --- AC2: Fuzzy match invoked ---
+    def test_invokes_fuzzy_match_with_master_list(self, agent_def):
+        """AC2: fuzzy_match() is invoked with the extracted PA and master list."""
+        practice_areas = [
+            {"id": "pa-1", "name": "Banking & Finance", "hints": None},
+            {"id": "pa-2", "name": "Corporate Law", "hints": "M&A|Business"},
+        ]
+        mock_requests = self._make_mock_requests(practice_areas)
+        mock_fm = self._make_mock_fuzzy_match_module()
+        mock_actions = {"graphology.update_node": lambda **kwargs: {"success": True}}
+
+        state = {
+            "extracted_practice_area": "Banking",
+            "directory_id": "dir-1",
+            "context_node_id": "file-1",
+        }
+        _exec_node_with_actions(
+            agent_def, "resolve_practice_area", state,
+            mock_actions=mock_actions,
+            mock_modules={"requests": mock_requests, "actions.fuzzy_match": mock_fm},
+        )
+
+        mock_fm.fuzzy_match.assert_called_once()
+        args = mock_fm.fuzzy_match.call_args[0]
+        assert args[0] == "Banking"
+        assert len(args[1]) == 2
+        assert args[1][0]["name"] == "Banking & Finance"
+        assert args[1][0]["hints"] == ""  # None converted to ""
+        assert args[1][1]["hints"] == "M&A|Business"
+
+    # --- AC3: Match found -> persist to ApplicationFormFile ---
+    def test_persists_match_to_graph(self, agent_def):
+        """AC3: Matched PA name and ID saved to ApplicationFormFile via graphology.update_node."""
+        from unittest.mock import MagicMock
+
+        practice_areas = [{"id": "pa-1", "name": "Banking & Finance", "hints": None}]
+        mock_requests = self._make_mock_requests(practice_areas)
+        mock_fm = self._make_mock_fuzzy_match_module({
+            "matched_name": "Banking & Finance",
+            "matched_id": "pa-1",
+            "score": 1.0,
+            "via_hint": False,
+            "tier": "CA-1",
+        })
+        mock_update = MagicMock(return_value={"success": True})
+        mock_actions = {"graphology.update_node": mock_update}
+
+        state = {
+            "extracted_practice_area": "Banking & Finance",
+            "directory_id": "dir-1",
+            "context_node_id": "file-uuid-42",
+        }
+        result = _exec_node_with_actions(
+            agent_def, "resolve_practice_area", state,
+            mock_actions=mock_actions,
+            mock_modules={"requests": mock_requests, "actions.fuzzy_match": mock_fm},
+        )
+
+        assert result["practice_area_match"]["matched_name"] == "Banking & Finance"
+        mock_update.assert_called_once()
+        call_kwargs = mock_update.call_args[1]
+        assert call_kwargs["node_id"] == "file-uuid-42"
+        assert call_kwargs["node_type"] == "ApplicationFormFile"
+        assert call_kwargs["updates"]["practiceAreaName"] == "Banking & Finance"
+        assert call_kwargs["updates"]["practiceAreaId"] == "pa-1"
+
+    # --- AC4: No match -> warning logged, empty result ---
+    def test_no_match_logs_warning(self, agent_def, caplog):
+        """AC4: No match found -> warning logged, no GraphQL update."""
+        import logging
+        from unittest.mock import MagicMock
+
+        practice_areas = [{"id": "pa-1", "name": "Banking & Finance", "hints": None}]
+        mock_requests = self._make_mock_requests(practice_areas)
+        no_match = {
+            "matched_name": "",
+            "matched_id": "",
+            "score": 0.0,
+            "via_hint": False,
+            "tier": "CA-3",
+        }
+        mock_fm = self._make_mock_fuzzy_match_module(no_match)
+        mock_update = MagicMock(return_value={"success": True})
+        mock_actions = {"graphology.update_node": mock_update}
+
+        state = {
+            "extracted_practice_area": "Completely Unknown Area",
+            "directory_id": "dir-1",
+            "context_node_id": "file-1",
+        }
+        with caplog.at_level(logging.WARNING):
+            result = _exec_node_with_actions(
+                agent_def, "resolve_practice_area", state,
+                mock_actions=mock_actions,
+                mock_modules={"requests": mock_requests, "actions.fuzzy_match": mock_fm},
+            )
+
+        assert result["practice_area_match"]["matched_name"] == ""
+        assert result["practice_area_match"]["tier"] == "CA-3"
+        mock_update.assert_not_called()
+        assert any("No match for" in r.message for r in caplog.records)
+
+    # --- AC5: GraphQL failure -> pipeline continues ---
+    def test_graphql_failure_continues(self, agent_def):
+        """AC5/6.6: GraphQL down -> pipeline continues with empty match."""
+        mock_requests = self._make_mock_requests(raise_error=True)
+
+        state = {
+            "extracted_practice_area": "Banking & Finance",
+            "directory_id": "dir-1",
+            "context_node_id": "file-1",
+        }
+        result = _exec_node_with_actions(
+            agent_def, "resolve_practice_area", state,
+            mock_modules={"requests": mock_requests},
+        )
+
+        assert result == {"practice_area_match": {}}
+
+    def test_graphql_http_error_continues(self, agent_def):
+        """AC5: GraphQL returns HTTP error -> pipeline continues."""
+        mock_requests = self._make_mock_requests(status_code=500)
+
+        state = {
+            "extracted_practice_area": "Banking & Finance",
+            "directory_id": "dir-1",
+            "context_node_id": "file-1",
+        }
+        result = _exec_node_with_actions(
+            agent_def, "resolve_practice_area", state,
+            mock_modules={"requests": mock_requests},
+        )
+
+        assert result == {"practice_area_match": {}}
+
+    # --- Empty GraphQL result ---
+    def test_zero_practice_areas_returns_empty(self, agent_def):
+        """AC1: Zero PracticeArea nodes returned -> empty match, no fuzzy_match call."""
+        mock_requests = self._make_mock_requests(practice_areas=[])
+
+        state = {
+            "extracted_practice_area": "Banking & Finance",
+            "directory_id": "dir-1",
+            "context_node_id": "file-1",
+        }
+        result = _exec_node_with_actions(
+            agent_def, "resolve_practice_area", state,
+            mock_modules={"requests": mock_requests},
+        )
+
+        assert result == {"practice_area_match": {}}
+
+    # --- AC6: Idempotency ---
+    def test_idempotent_same_result(self, agent_def):
+        """AC6/6.7: Re-running produces identical match result."""
+        practice_areas = [{"id": "pa-1", "name": "Banking & Finance", "hints": None}]
+        match_result = {
+            "matched_name": "Banking & Finance",
+            "matched_id": "pa-1",
+            "score": 1.0,
+            "via_hint": False,
+            "tier": "CA-1",
+        }
+
+        state = {
+            "extracted_practice_area": "Banking & Finance",
+            "directory_id": "dir-1",
+            "context_node_id": "file-1",
+        }
+        mock_actions = {"graphology.update_node": lambda **kwargs: {"success": True}}
+
+        results = []
+        for _ in range(2):
+            mock_requests = self._make_mock_requests(practice_areas)
+            mock_fm = self._make_mock_fuzzy_match_module(match_result)
+            r = _exec_node_with_actions(
+                agent_def, "resolve_practice_area", state,
+                mock_actions=mock_actions,
+                mock_modules={"requests": mock_requests, "actions.fuzzy_match": mock_fm},
+            )
+            results.append(r)
+
+        assert results[0] == results[1]
+
+    # --- Routing ---
+    def test_extract_practice_area_routes_to_extract_region(self, agent_def):
+        """5.1: extract_practice_area routes to extract_region (Story 3.1)."""
+        node = next(n for n in agent_def["nodes"] if n["name"] == "extract_practice_area")
+        goto = node.get("goto", [])
+        targets = [g["to"] if isinstance(g, dict) else g for g in goto]
+        assert "extract_region" in targets
+
+    def test_resolve_routes_to_derive_legal_field(self, agent_def):
+        """5.2: resolve_practice_area routes to derive_legal_field (Story 2.4)."""
+        node = next(n for n in agent_def["nodes"] if n["name"] == "resolve_practice_area")
+        goto = node.get("goto", [])
+        targets = [g["to"] if isinstance(g, dict) else g for g in goto]
+        assert "derive_legal_field" in targets
+
+    # --- State schema ---
+    def test_practice_area_match_in_state_schema(self, agent_def):
+        """1.2: practice_area_match is in state_schema."""
+        assert "practice_area_match" in agent_def["state_schema"]
+
+    # --- Code structure checks ---
+    def test_uses_graphology_update_node_action(self, agent_def):
+        """AC3: Uses actions['graphology.update_node'] for persistence."""
+        node = next(n for n in agent_def["nodes"] if n["name"] == "resolve_practice_area")
+        code = node["run"]
+        assert 'actions["graphology.update_node"]' in code
+
+    def test_wrapped_in_try_except(self, agent_def):
+        """AC5: Entire block wrapped in try/except for best-effort."""
+        node = next(n for n in agent_def["nodes"] if n["name"] == "resolve_practice_area")
+        code = node["run"]
+        assert "try:" in code
+        assert "except Exception" in code
+
+    def test_graphql_query_uses_correct_filter(self, agent_def):
+        """4.1: GraphQL query uses practiceAreaInDirectory_SOME filter."""
+        node = next(n for n in agent_def["nodes"] if n["name"] == "resolve_practice_area")
+        code = node["run"]
+        assert "practiceAreaInDirectory_SOME" in code
+
+    def test_null_hints_converted_to_empty_string(self, agent_def):
+        """AC1: PracticeArea hints=null -> empty string in master_list."""
+        practice_areas = [{"id": "pa-1", "name": "Banking & Finance", "hints": None}]
+        mock_requests = self._make_mock_requests(practice_areas)
+        mock_fm = self._make_mock_fuzzy_match_module()
+        mock_actions = {"graphology.update_node": lambda **kwargs: {"success": True}}
+
+        state = {
+            "extracted_practice_area": "Banking",
+            "directory_id": "dir-1",
+            "context_node_id": "file-1",
+        }
+        _exec_node_with_actions(
+            agent_def, "resolve_practice_area", state,
+            mock_actions=mock_actions,
+            mock_modules={"requests": mock_requests, "actions.fuzzy_match": mock_fm},
+        )
+
+        args = mock_fm.fuzzy_match.call_args[0]
+        assert args[1][0]["hints"] == ""  # None -> ""
+
+    # --- H1 fix: update_node failure -> pipeline continues ---
+    def test_update_node_failure_continues(self, agent_def):
+        """AC5: update_node raises exception -> pipeline continues, match still returned."""
+        from unittest.mock import MagicMock
+
+        practice_areas = [{"id": "pa-1", "name": "Banking & Finance", "hints": None}]
+        mock_requests = self._make_mock_requests(practice_areas)
+        mock_fm = self._make_mock_fuzzy_match_module({
+            "matched_name": "Banking & Finance",
+            "matched_id": "pa-1",
+            "score": 1.0,
+            "via_hint": False,
+            "tier": "CA-1",
+        })
+        mock_update = MagicMock(side_effect=Exception("GraphQL mutation failed"))
+        mock_actions = {"graphology.update_node": mock_update}
+
+        state = {
+            "extracted_practice_area": "Banking & Finance",
+            "directory_id": "dir-1",
+            "context_node_id": "file-uuid-42",
+        }
+        result = _exec_node_with_actions(
+            agent_def, "resolve_practice_area", state,
+            mock_actions=mock_actions,
+            mock_modules={"requests": mock_requests, "actions.fuzzy_match": mock_fm},
+        )
+
+        # Pipeline continues — returns empty match on any exception
+        assert result == {"practice_area_match": {}}
+
+    def test_update_node_returns_failure(self, agent_def, caplog):
+        """AC5: update_node returns success=False -> warning logged, match still returned."""
+        import logging
+        from unittest.mock import MagicMock
+
+        practice_areas = [{"id": "pa-1", "name": "Banking & Finance", "hints": None}]
+        mock_requests = self._make_mock_requests(practice_areas)
+        mock_fm = self._make_mock_fuzzy_match_module({
+            "matched_name": "Banking & Finance",
+            "matched_id": "pa-1",
+            "score": 1.0,
+            "via_hint": False,
+            "tier": "CA-1",
+        })
+        mock_update = MagicMock(return_value={"success": False, "error": "node_id is required"})
+        mock_actions = {"graphology.update_node": mock_update}
+
+        state = {
+            "extracted_practice_area": "Banking & Finance",
+            "directory_id": "dir-1",
+            "context_node_id": "file-uuid-42",
+        }
+        with caplog.at_level(logging.WARNING):
+            result = _exec_node_with_actions(
+                agent_def, "resolve_practice_area", state,
+                mock_actions=mock_actions,
+                mock_modules={"requests": mock_requests, "actions.fuzzy_match": mock_fm},
+            )
+
+        # Match result is still returned even when persistence fails
+        assert result["practice_area_match"]["matched_name"] == "Banking & Finance"
+        assert any("update_node failed" in r.message for r in caplog.records)
+
+    # --- M2 fix: missing context_node_id -> warning, no update_node call ---
+    def test_missing_context_node_id_skips_update(self, agent_def, caplog):
+        """M2: Missing context_node_id -> warning logged, update_node not called."""
+        import logging
+        from unittest.mock import MagicMock
+
+        practice_areas = [{"id": "pa-1", "name": "Banking & Finance", "hints": None}]
+        mock_requests = self._make_mock_requests(practice_areas)
+        mock_fm = self._make_mock_fuzzy_match_module({
+            "matched_name": "Banking & Finance",
+            "matched_id": "pa-1",
+            "score": 1.0,
+            "via_hint": False,
+            "tier": "CA-1",
+        })
+        mock_update = MagicMock(return_value={"success": True})
+        mock_actions = {"graphology.update_node": mock_update}
+
+        state = {
+            "extracted_practice_area": "Banking & Finance",
+            "directory_id": "dir-1",
+            # context_node_id intentionally missing
+        }
+        with caplog.at_level(logging.WARNING):
+            result = _exec_node_with_actions(
+                agent_def, "resolve_practice_area", state,
+                mock_actions=mock_actions,
+                mock_modules={"requests": mock_requests, "actions.fuzzy_match": mock_fm},
+            )
+
+        # Match still returned
+        assert result["practice_area_match"]["matched_name"] == "Banking & Finance"
+        # update_node NOT called
+        mock_update.assert_not_called()
+        # Warning logged
+        assert any("context_node_id missing" in r.message for r in caplog.records)
+
+
+# =============================================================================
+# derive_legal_field node tests (Story 2.4)
+# =============================================================================
+
+class TestDeriveLegalField:
+    """Tests for derive_legal_field node (Story 2.4)."""
+
+    def _make_mock_requests(self, practice_areas_response=None, status_code=200, raise_error=False):
+        """Create a mock requests module with configurable GraphQL response."""
+        from unittest.mock import MagicMock
+
+        mock_requests = MagicMock()
+        mock_response = MagicMock()
+
+        if raise_error:
+            mock_requests.post.side_effect = Exception("Connection refused")
+        else:
+            mock_response.status_code = status_code
+            if status_code >= 400:
+                mock_response.raise_for_status.side_effect = Exception(f"HTTP {status_code}")
+            else:
+                mock_response.raise_for_status.return_value = None
+            mock_response.json.return_value = {
+                "data": practice_areas_response or {}
+            }
+            mock_requests.post.return_value = mock_response
+
+        return mock_requests
+
+    # --- AC1: Successful LegalField retrieval via graph traversal ---
+    def test_successful_legal_field_retrieval(self, agent_def):
+        """AC1: PracticeArea with connected LegalField returns name and id."""
+        from unittest.mock import MagicMock
+
+        mock_requests = self._make_mock_requests({
+            "practiceAreas": [{
+                "practiceAreaHasLegalField": [{"id": "lf-123", "name": "Banking Law"}]
+            }]
+        })
+        mock_update = MagicMock(return_value={"success": True})
+        mock_actions = {"graphology.update_node": mock_update}
+
+        state = {
+            "practice_area_match": {"matched_id": "pa-456", "matched_name": "Banking"},
+            "context_node_id": "file-789",
+        }
+        result = _exec_node_with_actions(
+            agent_def, "derive_legal_field", state,
+            mock_actions=mock_actions,
+            mock_modules={"requests": mock_requests},
+        )
+
+        assert result["legal_field_name"] == "Banking Law"
+        assert result["legal_field_id"] == "lf-123"
+
+    # --- AC2: Persist legalFieldName and legalFieldId to ApplicationFormFile ---
+    def test_persists_legal_field_to_graph(self, agent_def):
+        """AC2: legalFieldName and legalFieldId saved via graphology.update_node."""
+        from unittest.mock import MagicMock
+
+        mock_requests = self._make_mock_requests({
+            "practiceAreas": [{
+                "practiceAreaHasLegalField": [{"id": "lf-100", "name": "Tax Law"}]
+            }]
+        })
+        mock_update = MagicMock(return_value={"success": True})
+        mock_actions = {"graphology.update_node": mock_update}
+
+        state = {
+            "practice_area_match": {"matched_id": "pa-200"},
+            "context_node_id": "file-300",
+        }
+        result = _exec_node_with_actions(
+            agent_def, "derive_legal_field", state,
+            mock_actions=mock_actions,
+            mock_modules={"requests": mock_requests},
+        )
+
+        mock_update.assert_called_once()
+        call_kwargs = mock_update.call_args[1]
+        assert call_kwargs["node_type"] == "ApplicationFormFile"
+        assert call_kwargs["updates"]["legalFieldName"] == "Tax Law"
+        assert call_kwargs["updates"]["legalFieldId"] == "lf-100"
+        assert call_kwargs["node_id"] == "file-300"
+
+    # --- AC3: No PracticeArea matched -> skip ---
+    def test_no_practice_area_id_skips(self, agent_def):
+        """AC3: Empty practiceAreaId -> step skipped, empty strings returned."""
+        state = {"practice_area_match": {"matched_id": ""}}
+        result = _exec_node_with_actions(agent_def, "derive_legal_field", state)
+        assert result == {"legal_field_name": "", "legal_field_id": ""}
+
+    def test_missing_practice_area_match_skips(self, agent_def):
+        """AC3: Missing practice_area_match key -> skip."""
+        state = {}
+        result = _exec_node_with_actions(agent_def, "derive_legal_field", state)
+        assert result == {"legal_field_name": "", "legal_field_id": ""}
+
+    def test_empty_practice_area_match_dict_skips(self, agent_def):
+        """AC3: Empty practice_area_match dict -> skip."""
+        state = {"practice_area_match": {}}
+        result = _exec_node_with_actions(agent_def, "derive_legal_field", state)
+        assert result == {"legal_field_name": "", "legal_field_id": ""}
+
+    # --- AC4: PracticeArea has no connected LegalField ---
+    def test_no_legal_field_connected(self, agent_def, caplog):
+        """AC4: PracticeArea has no LegalField edge -> empty, warning logged."""
+        import logging
+
+        mock_requests = self._make_mock_requests({
+            "practiceAreas": [{"practiceAreaHasLegalField": []}]
+        })
+        state = {
+            "practice_area_match": {"matched_id": "pa-no-lf"},
+            "context_node_id": "file-1",
+        }
+        with caplog.at_level(logging.WARNING):
+            result = _exec_node_with_actions(
+                agent_def, "derive_legal_field", state,
+                mock_modules={"requests": mock_requests},
+            )
+
+        assert result == {"legal_field_name": "", "legal_field_id": ""}
+        assert any("No LegalField found" in r.message for r in caplog.records)
+
+    def test_no_legal_field_null_field(self, agent_def, caplog):
+        """AC4: practiceAreaHasLegalField is null -> empty, warning logged."""
+        import logging
+
+        mock_requests = self._make_mock_requests({
+            "practiceAreas": [{"practiceAreaHasLegalField": None}]
+        })
+        state = {
+            "practice_area_match": {"matched_id": "pa-null-lf"},
+            "context_node_id": "file-1",
+        }
+        with caplog.at_level(logging.WARNING):
+            result = _exec_node_with_actions(
+                agent_def, "derive_legal_field", state,
+                mock_modules={"requests": mock_requests},
+            )
+
+        assert result == {"legal_field_name": "", "legal_field_id": ""}
+        assert any("No LegalField found" in r.message for r in caplog.records)
+
+    def test_empty_practice_areas_list(self, agent_def, caplog):
+        """AC4: practiceAreas returns empty list -> warning, empty result."""
+        import logging
+
+        mock_requests = self._make_mock_requests({
+            "practiceAreas": []
+        })
+        state = {
+            "practice_area_match": {"matched_id": "pa-missing"},
+            "context_node_id": "file-1",
+        }
+        with caplog.at_level(logging.WARNING):
+            result = _exec_node_with_actions(
+                agent_def, "derive_legal_field", state,
+                mock_modules={"requests": mock_requests},
+            )
+
+        assert result == {"legal_field_name": "", "legal_field_id": ""}
+        assert any("No LegalField found" in r.message for r in caplog.records)
+
+    # --- AC5: GraphQL typed API ---
+    def test_graphql_query_uses_practice_area_id(self, agent_def):
+        """AC5: GraphQL query passes practiceAreaId as variable."""
+        from unittest.mock import MagicMock
+
+        mock_requests = self._make_mock_requests({
+            "practiceAreas": [{
+                "practiceAreaHasLegalField": [{"id": "lf-1", "name": "IP"}]
+            }]
+        })
+        mock_actions = {"graphology.update_node": MagicMock(return_value={"success": True})}
+
+        state = {
+            "practice_area_match": {"matched_id": "pa-target-id"},
+            "context_node_id": "file-1",
+        }
+        _exec_node_with_actions(
+            agent_def, "derive_legal_field", state,
+            mock_actions=mock_actions,
+            mock_modules={"requests": mock_requests},
+        )
+
+        call_args = mock_requests.post.call_args
+        request_body = call_args[1].get("json") or call_args.kwargs.get("json", {})
+        assert request_body["variables"]["paId"] == "pa-target-id"
+        assert "practiceAreaHasLegalField" in request_body["query"]
+
+    # --- AC6: Best-effort error handling ---
+    def test_graphql_connection_failure(self, agent_def, caplog):
+        """AC6: GraphQL endpoint unreachable -> warning, empty, no crash."""
+        import logging
+
+        mock_requests = self._make_mock_requests(raise_error=True)
+        state = {
+            "practice_area_match": {"matched_id": "pa-1"},
+            "context_node_id": "file-1",
+        }
+        with caplog.at_level(logging.WARNING):
+            result = _exec_node_with_actions(
+                agent_def, "derive_legal_field", state,
+                mock_modules={"requests": mock_requests},
+            )
+
+        assert result == {"legal_field_name": "", "legal_field_id": ""}
+        assert any("GraphQL query failed" in r.message for r in caplog.records)
+
+    def test_graphql_http_error(self, agent_def, caplog):
+        """AC6: GraphQL returns HTTP 500 -> warning, empty, no crash."""
+        import logging
+
+        mock_requests = self._make_mock_requests(status_code=500)
+        state = {
+            "practice_area_match": {"matched_id": "pa-1"},
+            "context_node_id": "file-1",
+        }
+        with caplog.at_level(logging.WARNING):
+            result = _exec_node_with_actions(
+                agent_def, "derive_legal_field", state,
+                mock_modules={"requests": mock_requests},
+            )
+
+        assert result == {"legal_field_name": "", "legal_field_id": ""}
+
+    def test_malformed_graphql_response(self, agent_def):
+        """AC6: GraphQL response missing data key -> empty, no crash."""
+        from unittest.mock import MagicMock
+
+        mock_requests = MagicMock()
+        mock_response = MagicMock()
+        mock_response.raise_for_status.return_value = None
+        mock_response.json.return_value = {"errors": [{"message": "oops"}]}
+        mock_requests.post.return_value = mock_response
+
+        state = {
+            "practice_area_match": {"matched_id": "pa-1"},
+            "context_node_id": "file-1",
+        }
+        result = _exec_node_with_actions(
+            agent_def, "derive_legal_field", state,
+            mock_modules={"requests": mock_requests},
+        )
+
+        assert result == {"legal_field_name": "", "legal_field_id": ""}
+
+    # --- Edge cases ---
+    def test_single_object_instead_of_list(self, agent_def):
+        """Edge: practiceAreaHasLegalField returns single object, not list."""
+        from unittest.mock import MagicMock
+
+        mock_requests = self._make_mock_requests({
+            "practiceAreas": [{
+                "practiceAreaHasLegalField": {"id": "lf-single", "name": "Litigation"}
+            }]
+        })
+        mock_actions = {"graphology.update_node": MagicMock(return_value={"success": True})}
+
+        state = {
+            "practice_area_match": {"matched_id": "pa-1"},
+            "context_node_id": "file-1",
+        }
+        result = _exec_node_with_actions(
+            agent_def, "derive_legal_field", state,
+            mock_actions=mock_actions,
+            mock_modules={"requests": mock_requests},
+        )
+
+        assert result["legal_field_name"] == "Litigation"
+        assert result["legal_field_id"] == "lf-single"
+
+    def test_missing_context_node_id_skips_persistence(self, agent_def):
+        """Edge: No context_node_id -> LegalField returned but not persisted."""
+        from unittest.mock import MagicMock
+
+        mock_requests = self._make_mock_requests({
+            "practiceAreas": [{
+                "practiceAreaHasLegalField": [{"id": "lf-1", "name": "Tax"}]
+            }]
+        })
+        mock_update = MagicMock(return_value={"success": True})
+        mock_actions = {"graphology.update_node": mock_update}
+
+        state = {
+            "practice_area_match": {"matched_id": "pa-1"},
+            # context_node_id intentionally missing
+        }
+        result = _exec_node_with_actions(
+            agent_def, "derive_legal_field", state,
+            mock_actions=mock_actions,
+            mock_modules={"requests": mock_requests},
+        )
+
+        assert result["legal_field_name"] == "Tax"
+        assert result["legal_field_id"] == "lf-1"
+        mock_update.assert_not_called()
+
+    def test_api_key_header_sent_when_present(self, agent_def):
+        """Edge: API key from state.variables is sent as x-api-key header."""
+        from unittest.mock import MagicMock
+
+        mock_requests = self._make_mock_requests({
+            "practiceAreas": [{
+                "practiceAreaHasLegalField": [{"id": "lf-1", "name": "IP"}]
+            }]
+        })
+        mock_actions = {"graphology.update_node": MagicMock(return_value={"success": True})}
+
+        state = {
+            "practice_area_match": {"matched_id": "pa-1"},
+            "context_node_id": "file-1",
+            "variables": {
+                "GRAPHOLOGY_URL": "http://graph:4000",
+                "GRAPHOLOGY_API_KEY": "secret-key-123",
+            },
+        }
+        _exec_node_with_actions(
+            agent_def, "derive_legal_field", state,
+            mock_actions=mock_actions,
+            mock_modules={"requests": mock_requests},
+        )
+
+        call_args = mock_requests.post.call_args
+        headers = call_args[1].get("headers") or call_args.kwargs.get("headers", {})
+        assert headers.get("x-api-key") == "secret-key-123"
+
+    # --- Persistence failure handling ---
+    def test_update_node_failure_logs_warning(self, agent_def, caplog):
+        """M1: update_node failure is logged as warning (best-effort)."""
+        import logging
+        from unittest.mock import MagicMock
+
+        mock_requests = self._make_mock_requests({
+            "practiceAreas": [{
+                "practiceAreaHasLegalField": [{"id": "lf-1", "name": "Tax"}]
+            }]
+        })
+        mock_update = MagicMock(return_value={"success": False, "error": "node not found"})
+        mock_actions = {"graphology.update_node": mock_update}
+
+        state = {
+            "practice_area_match": {"matched_id": "pa-1"},
+            "context_node_id": "file-1",
+        }
+        with caplog.at_level(logging.WARNING):
+            result = _exec_node_with_actions(
+                agent_def, "derive_legal_field", state,
+                mock_actions=mock_actions,
+                mock_modules={"requests": mock_requests},
+            )
+
+        assert result["legal_field_name"] == "Tax"
+        assert result["legal_field_id"] == "lf-1"
+        mock_update.assert_called_once()
+        assert any("update_node failed" in r.message for r in caplog.records)
+
+    def test_update_node_failure_still_returns_result(self, agent_def):
+        """M1: Even when persistence fails, legal field values are returned."""
+        from unittest.mock import MagicMock
+
+        mock_requests = self._make_mock_requests({
+            "practiceAreas": [{
+                "practiceAreaHasLegalField": [{"id": "lf-2", "name": "IP Law"}]
+            }]
+        })
+        mock_update = MagicMock(return_value={"success": False})
+        mock_actions = {"graphology.update_node": mock_update}
+
+        state = {
+            "practice_area_match": {"matched_id": "pa-2"},
+            "context_node_id": "file-2",
+        }
+        result = _exec_node_with_actions(
+            agent_def, "derive_legal_field", state,
+            mock_actions=mock_actions,
+            mock_modules={"requests": mock_requests},
+        )
+
+        assert result["legal_field_name"] == "IP Law"
+        assert result["legal_field_id"] == "lf-2"
+
+    # --- Routing tests ---
+    def test_resolve_practice_area_routes_to_derive_legal_field(self, agent_def):
+        """Task 3.1: resolve_practice_area transitions to derive_legal_field."""
+        for node in agent_def["nodes"]:
+            if node["name"] == "resolve_practice_area":
+                goto_targets = [g.get("to") or g for g in node["goto"]]
+                assert "derive_legal_field" in goto_targets
+                return
+        pytest.fail("resolve_practice_area node not found")
+
+    def test_derive_legal_field_routes_to_save_payload(self, agent_def):
+        """Task 3.2: derive_legal_field transitions to save_payload."""
+        for node in agent_def["nodes"]:
+            if node["name"] == "derive_legal_field":
+                goto_targets = [g.get("to") or g for g in node["goto"]]
+                assert "save_payload" in goto_targets
+                return
+        pytest.fail("derive_legal_field node not found")
+
+    # --- State schema tests ---
+    def test_legal_field_name_in_state_schema(self, agent_def):
+        """Task 1.1: legal_field_name exists in state_schema."""
+        assert "legal_field_name" in agent_def["state_schema"]
+
+    def test_legal_field_id_in_state_schema(self, agent_def):
+        """Task 1.2: legal_field_id exists in state_schema."""
+        assert "legal_field_id" in agent_def["state_schema"]
+
+
+# =============================================================================
+# STORY 3.1 — extract_region node tests
+# =============================================================================
+
+class TestExtractRegion:
+    """Tests for the extract_region run block (Story 3.1)."""
+
+    # --- AC1: Chambers ---
+    def test_chambers_region(self, agent_def):
+        """AC1: Chambers payloads yield region from preliminaryInformation.jurisdiction."""
+        state = {
+            "payload_json": json.dumps({
+                "preliminaryInformation": {"jurisdiction": "Brazil"}
+            }),
+            "directory_name": "chambers",
+        }
+        result = _exec_node(agent_def, "extract_region", state)
+        assert result["extracted_region"] == "Brazil"
+
+    # --- AC2: Legal 500 ---
+    def test_legal500_region(self, agent_def):
+        """AC2: Legal 500 payloads yield region from top-level country."""
+        state = {
+            "payload_json": json.dumps({"country": "United Kingdom"}),
+            "directory_name": "legal500",
+        }
+        result = _exec_node(agent_def, "extract_region", state)
+        assert result["extracted_region"] == "United Kingdom"
+
+    # --- AC3: IFLR1000 ---
+    def test_iflr1000_region(self, agent_def):
+        """AC3: IFLR1000 payloads yield region from firmDetails.jurisdiction."""
+        state = {
+            "payload_json": json.dumps({
+                "firmDetails": {"jurisdiction": "Brazil"}
+            }),
+            "directory_name": "iflr1000",
+        }
+        result = _exec_node(agent_def, "extract_region", state)
+        assert result["extracted_region"] == "Brazil"
+
+    # --- AC4: ITR ---
+    def test_itr_region_dict(self, agent_def):
+        """AC4: ITR jurisdictions as dict -> extract jurisdiction_l1."""
+        state = {
+            "payload_json": json.dumps({
+                "firmInfo": {"jurisdictions": {"jurisdiction_l1": "United Kingdom", "jurisdiction_l2": "London"}}
+            }),
+            "directory_name": "itr",
+        }
+        result = _exec_node(agent_def, "extract_region", state)
+        assert result["extracted_region"] == "United Kingdom"
+
+    def test_itr_region_dict_empty_l1(self, agent_def):
+        """AC4: ITR jurisdictions dict with empty jurisdiction_l1 -> empty string."""
+        state = {
+            "payload_json": json.dumps({
+                "firmInfo": {"jurisdictions": {"jurisdiction_l1": "", "jurisdiction_l2": "Minas Gerais"}}
+            }),
+            "directory_name": "itr",
+        }
+        result = _exec_node(agent_def, "extract_region", state)
+        assert result["extracted_region"] == ""
+
+    def test_itr_region_string(self, agent_def):
+        """AC4: ITR jurisdictions as string (legacy) -> passthrough."""
+        state = {
+            "payload_json": json.dumps({
+                "firmInfo": {"jurisdictions": "Germany"}
+            }),
+            "directory_name": "itr",
+        }
+        result = _exec_node(agent_def, "extract_region", state)
+        assert result["extracted_region"] == "Germany"
+
+    def test_itr_region_list(self, agent_def):
+        """AC4: ITR jurisdictions as list (legacy) -> take first element."""
+        state = {
+            "payload_json": json.dumps({
+                "firmInfo": {"jurisdictions": ["Japan", "Korea"]}
+            }),
+            "directory_name": "itr",
+        }
+        result = _exec_node(agent_def, "extract_region", state)
+        assert result["extracted_region"] == "Japan"
+
+    def test_itr_region_empty_list(self, agent_def):
+        """AC4: ITR jurisdictions as empty list -> empty string."""
+        state = {
+            "payload_json": json.dumps({
+                "firmInfo": {"jurisdictions": []}
+            }),
+            "directory_name": "itr",
+        }
+        result = _exec_node(agent_def, "extract_region", state)
+        assert result["extracted_region"] == ""
+
+    # --- AC5: Leaders League top-level jurisdiction field ---
+    def test_leadersleague_jurisdiction(self, agent_def):
+        """AC5: Leaders League -> top-level jurisdiction field (extracted from header)."""
+        state = {
+            "payload_json": json.dumps({
+                "jurisdiction": "Brasil",
+                "practice_area": "DATA PROTECTION",
+            }),
+            "directory_name": "leadersleague",
+        }
+        result = _exec_node(agent_def, "extract_region", state)
+        assert result["extracted_region"] == "Brasil"
+
+    def test_leadersleague_jurisdiction_missing(self, agent_def):
+        """AC5: Leaders League -> missing jurisdiction returns empty."""
+        state = {
+            "payload_json": json.dumps({
+                "practice_area": "DATA PROTECTION",
+            }),
+            "directory_name": "leadersleague",
+        }
+        result = _exec_node(agent_def, "extract_region", state)
+        assert result["extracted_region"] == ""
+
+    def test_leaders_league_space_variant(self, agent_def):
+        """AC5: 'leaders league' (with space) also works."""
+        state = {
+            "payload_json": json.dumps({
+                "jurisdiction": "France",
+            }),
+            "directory_name": "leaders league",
+        }
+        result = _exec_node(agent_def, "extract_region", state)
+        assert result["extracted_region"] == "France"
+
+    # --- AC6: Missing/empty region field ---
+    def test_missing_region_field(self, agent_def):
+        """AC6: Region field not in payload -> empty string, warning logged."""
+        state = {
+            "payload_json": json.dumps({"preliminaryInformation": {}}),
+            "directory_name": "chambers",
+        }
+        result = _exec_node(agent_def, "extract_region", state)
+        assert result["extracted_region"] == ""
+
+    def test_empty_payload_json(self, agent_def):
+        """AC6: Empty payload_json -> empty string."""
+        state = {"payload_json": "", "directory_name": "chambers"}
+        result = _exec_node(agent_def, "extract_region", state)
+        assert result["extracted_region"] == ""
+
+    def test_invalid_json(self, agent_def):
+        """AC6: Invalid JSON -> empty string."""
+        state = {"payload_json": "not-json", "directory_name": "chambers"}
+        result = _exec_node(agent_def, "extract_region", state)
+        assert result["extracted_region"] == ""
+
+    # --- AC7: Unrecognized directory ---
+    def test_unknown_directory(self, agent_def):
+        """AC7: Unrecognized directory -> empty string, warning logged."""
+        state = {
+            "payload_json": json.dumps({"country": "Brazil"}),
+            "directory_name": "unknowndir",
+        }
+        result = _exec_node(agent_def, "extract_region", state)
+        assert result["extracted_region"] == ""
+
+    # --- AC8: Result stored stripped ---
+    def test_whitespace_stripped(self, agent_def):
+        """AC8: Region string is stripped of whitespace."""
+        state = {
+            "payload_json": json.dumps({
+                "preliminaryInformation": {"jurisdiction": "  Brazil  "}
+            }),
+            "directory_name": "chambers",
+        }
+        result = _exec_node(agent_def, "extract_region", state)
+        assert result["extracted_region"] == "Brazil"
+
+    # --- Error status skip ---
+    def test_error_status_skips(self, agent_def):
+        """Upstream error status -> empty region, no crash."""
+        state = {
+            "payload_json": json.dumps({"country": "Brazil"}),
+            "directory_name": "legal500",
+            "status": "error",
+        }
+        result = _exec_node(agent_def, "extract_region", state)
+        assert result["extracted_region"] == ""
+
+    # --- Case-insensitive directory ---
+    def test_directory_case_insensitive(self, agent_def):
+        """Directory name is lowercased before lookup."""
+        state = {
+            "payload_json": json.dumps({"country": "United Kingdom"}),
+            "directory_name": "Legal500",
+        }
+        result = _exec_node(agent_def, "extract_region", state)
+        assert result["extracted_region"] == "United Kingdom"
+
+    # --- Routing tests ---
+    def test_extract_region_routes_to_resolve_practice_area(self, agent_def):
+        """Task 3.2: extract_region transitions to resolve_practice_area."""
+        node = next(n for n in agent_def["nodes"] if n["name"] == "extract_region")
+        goto = node.get("goto", [])
+        targets = [g["to"] if isinstance(g, dict) else g for g in goto]
+        assert "resolve_practice_area" in targets
+
+    def test_extract_practice_area_routes_to_extract_region(self, agent_def):
+        """Task 3.1: extract_practice_area transitions to extract_region."""
+        node = next(n for n in agent_def["nodes"] if n["name"] == "extract_practice_area")
+        goto = node.get("goto", [])
+        targets = [g["to"] if isinstance(g, dict) else g for g in goto]
+        assert "extract_region" in targets
+
+    # --- State schema ---
+    def test_extracted_region_in_state_schema(self, agent_def):
+        """Task 1.1: extracted_region exists in state_schema."""
+        assert "extracted_region" in agent_def["state_schema"]
