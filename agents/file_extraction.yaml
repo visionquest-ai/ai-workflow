@@ -86,6 +86,9 @@ state_schema:
   legal_field_name: str          # Derived LegalField name from PracticeArea graph traversal
   legal_field_id: str            # Derived LegalField graph node ID
 
+  # Region matching (Story 3.2)
+  region_match: dict             # Fuzzy match result: matched_name, matched_id, score, tier, via_hint
+
   # Output
   update_result: dict        # Result from graphology.update_node
   status: str                # success, error
@@ -1011,7 +1014,7 @@ nodes:
   # Step 5d: Derive LegalField from matched PracticeArea via graph traversal (Story 2.4)
   - name: derive_legal_field
     goto:
-      - to: save_payload
+      - to: resolve_region
     run: |
       import os
       import logging
@@ -1096,6 +1099,123 @@ nodes:
       except Exception as e:
           logger.warning("derive_legal_field: GraphQL query failed: %s", e)
           return {"legal_field_name": "", "legal_field_id": ""}
+
+  # Step 5e: Resolve Region via fuzzy matching against graph Region nodes (Story 3.2)
+  - name: resolve_region
+    goto:
+      - to: save_payload
+    run: |
+      import os
+      import logging
+
+      logger = logging.getLogger(__name__)
+
+      extracted_region = state.get("extracted_region", "")
+      if not extracted_region:
+          logger.debug("resolve_region: no extracted_region, skipping")
+          return {"region_match": {}}
+
+      try:
+          # 1. Resolve GraphQL URL and API key
+          gql_url = (
+              state.get("variables", {}).get("GRAPHOLOGY_URL")
+              or os.environ.get("GRAPHOLOGY_URL")
+              or "http://localhost:4000"
+          )
+          gql_api_key = (
+              state.get("variables", {}).get("GRAPHOLOGY_API_KEY")
+              or os.environ.get("GRAPHOLOGY_API_KEY")
+          )
+          headers = {"Content-Type": "application/json"}
+          if gql_api_key:
+              headers["x-api-key"] = gql_api_key
+
+          # 2. Query all Region nodes (no directory filter — regions are global)
+          query = '''
+          query GetAllRegions {
+            region {
+              id
+              name
+              hints
+            }
+          }
+          '''
+
+          import requests
+          resp = requests.post(
+              gql_url,
+              json={"query": query, "variables": {}},
+              timeout=30,
+              headers=headers,
+          )
+          resp.raise_for_status()
+          data = resp.json().get("data", {})
+          regions = data.get("region", [])
+
+          if not regions:
+              logger.warning(
+                  "resolve_region: No Region nodes returned from graph"
+              )
+              return {"region_match": {}}
+
+          # 3. Build master list for fuzzy matching
+          master_list = [
+              {
+                  "name": r["name"],
+                  "id": r["id"],
+                  "hints": r.get("hints") or "",
+              }
+              for r in regions
+          ]
+
+          # 4. Import and run fuzzy matcher (from Story 2.1)
+          from actions.fuzzy_match import fuzzy_match
+          result = fuzzy_match(extracted_region, master_list)
+
+          # 5. Save to ApplicationFormFile if match found
+          if result.get("matched_name"):
+              context_node_id = state.get("context_node_id", "")
+              if not context_node_id:
+                  logger.warning(
+                      "resolve_region: match found but context_node_id missing, "
+                      "cannot persist to ApplicationFormFile"
+                  )
+              else:
+                  try:
+                      update_result = actions["graphology.update_node"](
+                          state=state,
+                          node_id=context_node_id,
+                          node_type="ApplicationFormFile",
+                          updates={
+                              "regionName": result["matched_name"],
+                              "regionId": result["matched_id"],
+                          },
+                          graphql_url=gql_url,
+                          graphql_api_key=gql_api_key,
+                      )
+                      if not update_result.get("success"):
+                          logger.warning(
+                              "resolve_region: update_node failed: %s",
+                              update_result.get("error", "unknown"),
+                          )
+                  except Exception as ue:
+                      logger.warning("resolve_region: update_node exception: %s", ue)
+              logger.info(
+                  "resolve_region: Matched '%s' -> '%s' (id=%s, score=%.4f, tier=%s)",
+                  extracted_region, result["matched_name"], result["matched_id"],
+                  result.get("score", 0), result.get("tier", "unknown"),
+              )
+          else:
+              logger.warning(
+                  "resolve_region: No match for '%s'. Tier: %s",
+                  extracted_region, result.get("tier", "unknown"),
+              )
+
+          return {"region_match": result}
+
+      except Exception as e:
+          logger.warning("resolve_region: Failed (best-effort): %s", e)
+          return {"region_match": {}}
 
   # Step 6: Save extraction result back to the node via GraphQL
   - name: save_payload

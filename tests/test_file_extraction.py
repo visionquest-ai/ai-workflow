@@ -3708,12 +3708,12 @@ class TestDeriveLegalField:
                 return
         pytest.fail("resolve_practice_area node not found")
 
-    def test_derive_legal_field_routes_to_save_payload(self, agent_def):
-        """Task 3.2: derive_legal_field transitions to save_payload."""
+    def test_derive_legal_field_routes_to_resolve_region(self, agent_def):
+        """Story 3.2: derive_legal_field now transitions to resolve_region."""
         for node in agent_def["nodes"]:
             if node["name"] == "derive_legal_field":
                 goto_targets = [g.get("to") or g for g in node["goto"]]
-                assert "save_payload" in goto_targets
+                assert "resolve_region" in goto_targets
                 return
         pytest.fail("derive_legal_field node not found")
 
@@ -3943,3 +3943,443 @@ class TestExtractRegion:
     def test_extracted_region_in_state_schema(self, agent_def):
         """Task 1.1: extracted_region exists in state_schema."""
         assert "extracted_region" in agent_def["state_schema"]
+
+
+# =============================================================================
+# resolve_region node tests (Story 3.2)
+# =============================================================================
+
+class TestResolveRegion:
+    """Tests for resolve_region node (Story 3.2)."""
+
+    def _make_mock_requests(self, regions=None, status_code=200, raise_error=False):
+        """Create a mock requests module with configurable GraphQL response."""
+        from unittest.mock import MagicMock
+
+        mock_requests = MagicMock()
+        mock_response = MagicMock()
+
+        if raise_error:
+            mock_requests.post.side_effect = Exception("Connection refused")
+        else:
+            mock_response.status_code = status_code
+            if status_code >= 400:
+                mock_response.raise_for_status.side_effect = Exception(f"HTTP {status_code}")
+            else:
+                mock_response.raise_for_status.return_value = None
+            mock_response.json.return_value = {
+                "data": {"region": regions or []}
+            }
+            mock_requests.post.return_value = mock_response
+
+        return mock_requests
+
+    def _make_mock_fuzzy_match_module(self, result=None):
+        """Create a mock fuzzy_match module."""
+        from unittest.mock import MagicMock
+        mock_module = MagicMock()
+        if result is None:
+            result = {
+                "matched_name": "Minas Gerais",
+                "matched_id": "region-123",
+                "score": 1.0,
+                "via_hint": False,
+                "tier": "CA-1",
+            }
+        mock_module.fuzzy_match.return_value = result
+        return mock_module
+
+    # --- 4.2: Empty extracted_region -> early return ---
+    def test_empty_region_returns_empty(self, agent_def):
+        """AC5: Empty extracted_region -> early return, no GraphQL calls."""
+        state = {"extracted_region": ""}
+        result = _exec_node_with_actions(agent_def, "resolve_region", state)
+        assert result == {"region_match": {}}
+
+    def test_missing_region_returns_empty(self, agent_def):
+        """AC5: Missing extracted_region key -> early return."""
+        state = {}
+        result = _exec_node_with_actions(agent_def, "resolve_region", state)
+        assert result == {"region_match": {}}
+
+    # --- 4.3: Successful GraphQL query -> correct master list ---
+    def test_builds_master_list_with_hints(self, agent_def):
+        """AC1/AC2: Queries Region nodes, builds master list with hint expansion."""
+        regions = [
+            {"id": "r-1", "name": "Minas Gerais", "hints": "MG|State of Minas Gerais"},
+            {"id": "r-2", "name": "São Paulo", "hints": None},
+        ]
+        mock_requests = self._make_mock_requests(regions)
+        mock_fm = self._make_mock_fuzzy_match_module()
+        mock_actions = {"graphology.update_node": lambda **kwargs: {"success": True}}
+
+        state = {
+            "extracted_region": "Minas Gerais",
+            "context_node_id": "file-uuid-1",
+        }
+        _exec_node_with_actions(
+            agent_def, "resolve_region", state,
+            mock_actions=mock_actions,
+            mock_modules={"requests": mock_requests, "actions.fuzzy_match": mock_fm},
+        )
+
+        mock_fm.fuzzy_match.assert_called_once()
+        args = mock_fm.fuzzy_match.call_args[0]
+        assert args[0] == "Minas Gerais"
+        assert len(args[1]) == 2
+        assert args[1][0]["name"] == "Minas Gerais"
+        assert args[1][0]["hints"] == "MG|State of Minas Gerais"
+        assert args[1][1]["hints"] == ""  # None converted to ""
+
+    # --- 4.4: Exact match -> persisted via update_node ---
+    def test_persists_match_to_graph(self, agent_def):
+        """AC4: Matched Region name and ID saved to ApplicationFormFile."""
+        from unittest.mock import MagicMock
+
+        regions = [{"id": "r-1", "name": "Minas Gerais", "hints": "MG"}]
+        mock_requests = self._make_mock_requests(regions)
+        mock_fm = self._make_mock_fuzzy_match_module({
+            "matched_name": "Minas Gerais",
+            "matched_id": "r-1",
+            "score": 1.0,
+            "via_hint": False,
+            "tier": "CA-1",
+        })
+        mock_update = MagicMock(return_value={"success": True})
+        mock_actions = {"graphology.update_node": mock_update}
+
+        state = {
+            "extracted_region": "Minas Gerais",
+            "context_node_id": "file-uuid-42",
+        }
+        result = _exec_node_with_actions(
+            agent_def, "resolve_region", state,
+            mock_actions=mock_actions,
+            mock_modules={"requests": mock_requests, "actions.fuzzy_match": mock_fm},
+        )
+
+        assert result["region_match"]["matched_name"] == "Minas Gerais"
+        mock_update.assert_called_once()
+        call_kwargs = mock_update.call_args[1]
+        assert call_kwargs["node_id"] == "file-uuid-42"
+        assert call_kwargs["node_type"] == "ApplicationFormFile"
+        assert call_kwargs["updates"]["regionName"] == "Minas Gerais"
+        assert call_kwargs["updates"]["regionId"] == "r-1"
+
+    # --- 4.5: Hint-based match (e.g., "MG" -> "Minas Gerais") ---
+    def test_hint_based_match(self, agent_def):
+        """AC3: Short hint like 'MG' matches via hint expansion."""
+        regions = [{"id": "r-1", "name": "Minas Gerais", "hints": "MG|State of Minas Gerais"}]
+        mock_requests = self._make_mock_requests(regions)
+        mock_fm = self._make_mock_fuzzy_match_module({
+            "matched_name": "Minas Gerais",
+            "matched_id": "r-1",
+            "score": 0.95,
+            "via_hint": True,
+            "tier": "CA-1",
+        })
+        mock_actions = {"graphology.update_node": lambda **kwargs: {"success": True}}
+
+        state = {
+            "extracted_region": "MG",
+            "context_node_id": "file-1",
+        }
+        result = _exec_node_with_actions(
+            agent_def, "resolve_region", state,
+            mock_actions=mock_actions,
+            mock_modules={"requests": mock_requests, "actions.fuzzy_match": mock_fm},
+        )
+
+        assert result["region_match"]["matched_name"] == "Minas Gerais"
+        assert result["region_match"]["via_hint"] is True
+
+    # --- 4.6: No match (CA-3) -> warning logged, empty fields ---
+    def test_no_match_logs_warning(self, agent_def, caplog):
+        """AC5: No match found -> warning logged, no GraphQL update."""
+        import logging
+        from unittest.mock import MagicMock
+
+        regions = [{"id": "r-1", "name": "Minas Gerais", "hints": "MG"}]
+        mock_requests = self._make_mock_requests(regions)
+        no_match = {
+            "matched_name": "",
+            "matched_id": "",
+            "score": 0.0,
+            "via_hint": False,
+            "tier": "CA-3",
+        }
+        mock_fm = self._make_mock_fuzzy_match_module(no_match)
+        mock_update = MagicMock(return_value={"success": True})
+        mock_actions = {"graphology.update_node": mock_update}
+
+        state = {
+            "extracted_region": "Completely Unknown Region",
+            "context_node_id": "file-1",
+        }
+        with caplog.at_level(logging.WARNING):
+            result = _exec_node_with_actions(
+                agent_def, "resolve_region", state,
+                mock_actions=mock_actions,
+                mock_modules={"requests": mock_requests, "actions.fuzzy_match": mock_fm},
+            )
+
+        assert result["region_match"]["matched_name"] == ""
+        assert result["region_match"]["tier"] == "CA-3"
+        mock_update.assert_not_called()
+        assert any("No match for" in r.message for r in caplog.records)
+
+    # --- 4.7: GraphQL query failure -> best-effort, returns empty ---
+    def test_graphql_failure_continues(self, agent_def):
+        """AC6: GraphQL down -> pipeline continues with empty match."""
+        mock_requests = self._make_mock_requests(raise_error=True)
+
+        state = {
+            "extracted_region": "Minas Gerais",
+            "context_node_id": "file-1",
+        }
+        result = _exec_node_with_actions(
+            agent_def, "resolve_region", state,
+            mock_modules={"requests": mock_requests},
+        )
+
+        assert result == {"region_match": {}}
+
+    def test_graphql_http_error_continues(self, agent_def):
+        """AC6: GraphQL returns HTTP error -> pipeline continues."""
+        mock_requests = self._make_mock_requests(status_code=500)
+
+        state = {
+            "extracted_region": "Minas Gerais",
+            "context_node_id": "file-1",
+        }
+        result = _exec_node_with_actions(
+            agent_def, "resolve_region", state,
+            mock_modules={"requests": mock_requests},
+        )
+
+        assert result == {"region_match": {}}
+
+    # --- 4.8: update_node failure -> warning logged, match result still returned ---
+    def test_update_node_failure_continues(self, agent_def, caplog):
+        """AC6: update_node raises exception -> pipeline continues, match result preserved."""
+        import logging
+        from unittest.mock import MagicMock
+
+        regions = [{"id": "r-1", "name": "Minas Gerais", "hints": "MG"}]
+        mock_requests = self._make_mock_requests(regions)
+        mock_fm = self._make_mock_fuzzy_match_module({
+            "matched_name": "Minas Gerais",
+            "matched_id": "r-1",
+            "score": 1.0,
+            "via_hint": False,
+            "tier": "CA-1",
+        })
+        mock_update = MagicMock(side_effect=Exception("GraphQL mutation failed"))
+        mock_actions = {"graphology.update_node": mock_update}
+
+        state = {
+            "extracted_region": "Minas Gerais",
+            "context_node_id": "file-uuid-42",
+        }
+        with caplog.at_level(logging.WARNING):
+            result = _exec_node_with_actions(
+                agent_def, "resolve_region", state,
+                mock_actions=mock_actions,
+                mock_modules={"requests": mock_requests, "actions.fuzzy_match": mock_fm},
+            )
+
+        # Match result preserved even when persistence raises exception
+        assert result["region_match"]["matched_name"] == "Minas Gerais"
+        assert result["region_match"]["matched_id"] == "r-1"
+        assert any("update_node exception" in r.message for r in caplog.records)
+
+    def test_update_node_returns_failure(self, agent_def, caplog):
+        """AC6: update_node returns success=False -> warning logged, match still returned."""
+        import logging
+        from unittest.mock import MagicMock
+
+        regions = [{"id": "r-1", "name": "Minas Gerais", "hints": "MG"}]
+        mock_requests = self._make_mock_requests(regions)
+        mock_fm = self._make_mock_fuzzy_match_module({
+            "matched_name": "Minas Gerais",
+            "matched_id": "r-1",
+            "score": 1.0,
+            "via_hint": False,
+            "tier": "CA-1",
+        })
+        mock_update = MagicMock(return_value={"success": False, "error": "node_id is required"})
+        mock_actions = {"graphology.update_node": mock_update}
+
+        state = {
+            "extracted_region": "Minas Gerais",
+            "context_node_id": "file-uuid-42",
+        }
+        with caplog.at_level(logging.WARNING):
+            result = _exec_node_with_actions(
+                agent_def, "resolve_region", state,
+                mock_actions=mock_actions,
+                mock_modules={"requests": mock_requests, "actions.fuzzy_match": mock_fm},
+            )
+
+        # Match result is still returned even when persistence fails
+        assert result["region_match"]["matched_name"] == "Minas Gerais"
+        assert any("update_node failed" in r.message for r in caplog.records)
+
+    # --- 4.9: Missing context_node_id -> match found but persistence skipped ---
+    def test_missing_context_node_id_skips_update(self, agent_def, caplog):
+        """AC4: Missing context_node_id -> warning logged, update_node not called."""
+        import logging
+        from unittest.mock import MagicMock
+
+        regions = [{"id": "r-1", "name": "Minas Gerais", "hints": "MG"}]
+        mock_requests = self._make_mock_requests(regions)
+        mock_fm = self._make_mock_fuzzy_match_module({
+            "matched_name": "Minas Gerais",
+            "matched_id": "r-1",
+            "score": 1.0,
+            "via_hint": False,
+            "tier": "CA-1",
+        })
+        mock_update = MagicMock(return_value={"success": True})
+        mock_actions = {"graphology.update_node": mock_update}
+
+        state = {
+            "extracted_region": "Minas Gerais",
+            # context_node_id intentionally missing
+        }
+        with caplog.at_level(logging.WARNING):
+            result = _exec_node_with_actions(
+                agent_def, "resolve_region", state,
+                mock_actions=mock_actions,
+                mock_modules={"requests": mock_requests, "actions.fuzzy_match": mock_fm},
+            )
+
+        # Match still returned
+        assert result["region_match"]["matched_name"] == "Minas Gerais"
+        # update_node NOT called
+        mock_update.assert_not_called()
+        # Warning logged
+        assert any("context_node_id missing" in r.message for r in caplog.records)
+
+    # --- 4.10: Idempotency -> same inputs produce same output ---
+    def test_idempotent_same_result(self, agent_def):
+        """AC7: Re-running produces identical match result."""
+        regions = [{"id": "r-1", "name": "Minas Gerais", "hints": "MG"}]
+        match_result = {
+            "matched_name": "Minas Gerais",
+            "matched_id": "r-1",
+            "score": 1.0,
+            "via_hint": False,
+            "tier": "CA-1",
+        }
+
+        state = {
+            "extracted_region": "Minas Gerais",
+            "context_node_id": "file-1",
+        }
+        mock_actions = {"graphology.update_node": lambda **kwargs: {"success": True}}
+
+        results = []
+        for _ in range(2):
+            mock_requests = self._make_mock_requests(regions)
+            mock_fm = self._make_mock_fuzzy_match_module(match_result)
+            r = _exec_node_with_actions(
+                agent_def, "resolve_region", state,
+                mock_actions=mock_actions,
+                mock_modules={"requests": mock_requests, "actions.fuzzy_match": mock_fm},
+            )
+            results.append(r)
+
+        assert results[0] == results[1]
+
+    # --- Empty GraphQL result ---
+    def test_zero_regions_returns_empty(self, agent_def):
+        """AC1: Zero Region nodes returned -> empty match, no fuzzy_match call."""
+        mock_requests = self._make_mock_requests(regions=[])
+
+        state = {
+            "extracted_region": "Minas Gerais",
+            "context_node_id": "file-1",
+        }
+        result = _exec_node_with_actions(
+            agent_def, "resolve_region", state,
+            mock_modules={"requests": mock_requests},
+        )
+
+        assert result == {"region_match": {}}
+
+    # --- Routing tests ---
+    def test_derive_legal_field_routes_to_resolve_region(self, agent_def):
+        """Task 3.1: derive_legal_field routes to resolve_region."""
+        node = next(n for n in agent_def["nodes"] if n["name"] == "derive_legal_field")
+        goto = node.get("goto", [])
+        targets = [g["to"] if isinstance(g, dict) else g for g in goto]
+        assert "resolve_region" in targets
+
+    def test_resolve_region_routes_to_save_payload(self, agent_def):
+        """Task 3.2: resolve_region routes to save_payload."""
+        node = next(n for n in agent_def["nodes"] if n["name"] == "resolve_region")
+        goto = node.get("goto", [])
+        targets = [g["to"] if isinstance(g, dict) else g for g in goto]
+        assert "save_payload" in targets
+
+    # --- State schema ---
+    def test_region_match_in_state_schema(self, agent_def):
+        """Task 1.1: region_match is in state_schema."""
+        assert "region_match" in agent_def["state_schema"]
+
+    # --- Code structure checks ---
+    def test_uses_graphology_update_node_action(self, agent_def):
+        """AC4: Uses actions['graphology.update_node'] for persistence."""
+        node = next(n for n in agent_def["nodes"] if n["name"] == "resolve_region")
+        code = node["run"]
+        assert 'actions["graphology.update_node"]' in code
+
+    def test_wrapped_in_try_except(self, agent_def):
+        """AC6: Entire block wrapped in try/except for best-effort."""
+        node = next(n for n in agent_def["nodes"] if n["name"] == "resolve_region")
+        code = node["run"]
+        assert "try:" in code
+        assert "except Exception" in code
+
+    def test_graphql_query_uses_singular_region(self, agent_def):
+        """AC1: GraphQL query uses singular 'region' field name (Neo4j GQL v6)."""
+        node = next(n for n in agent_def["nodes"] if n["name"] == "resolve_region")
+        code = node["run"]
+        assert "region {" in code or "region{" in code
+        # Query data key must use singular "region", not plural
+        assert '.get("region"' in code
+
+    def test_no_directory_filter(self, agent_def):
+        """Regions are global — no directory filter in query."""
+        node = next(n for n in agent_def["nodes"] if n["name"] == "resolve_region")
+        code = node["run"]
+        assert "where" not in code.lower() or "practiceAreaInDirectory" not in code
+
+    def test_null_hints_converted_to_empty_string(self, agent_def):
+        """AC1: Region hints=null -> empty string in master_list."""
+        regions = [{"id": "r-1", "name": "Minas Gerais", "hints": None}]
+        mock_requests = self._make_mock_requests(regions)
+        mock_fm = self._make_mock_fuzzy_match_module()
+        mock_actions = {"graphology.update_node": lambda **kwargs: {"success": True}}
+
+        state = {
+            "extracted_region": "Minas Gerais",
+            "context_node_id": "file-1",
+        }
+        _exec_node_with_actions(
+            agent_def, "resolve_region", state,
+            mock_actions=mock_actions,
+            mock_modules={"requests": mock_requests, "actions.fuzzy_match": mock_fm},
+        )
+
+        args = mock_fm.fuzzy_match.call_args[0]
+        assert args[1][0]["hints"] == ""  # None -> ""
+
+    def test_no_cypher_queries(self, agent_def):
+        """Task 5.5: No direct Cypher queries — all operations use GraphQL API."""
+        node = next(n for n in agent_def["nodes"] if n["name"] == "resolve_region")
+        code = node["run"]
+        assert "MATCH" not in code
+        assert "MERGE" not in code
+        assert "cypher" not in code.lower()

@@ -1,0 +1,15 @@
+{
+  "_comment": "Country hints for fuzzy matching. Keys are canonical Country node names (11 total). Values are pipe-delimited aliases. Story 3.3. Country hints field added via Graph Consistency Guardian during Story 3.3 implementation.",
+
+  "Argentina": "AR|ARG|República Argentina|Republica Argentina|Buenos Aires",
+  "Brazil": "BR|BRA|Brasil|República Federativa do Brasil|Republica Federativa do Brasil",
+  "Canada": "CA|CAN|Canadá",
+  "Chile": "CL|CHL|República de Chile|Republica de Chile|Santiago",
+  "Colombia": "CO|COL|República de Colombia|Republica de Colombia|Colômbia",
+  "France": "FR|FRA|França|Franca|République française|Republique francaise",
+  "Germany": "DE|DEU|Alemanha|Deutschland|Bundesrepublik Deutschland",
+  "Mexico": "MX|MEX|México|Mejico",
+  "Peru": "PE|PER|República del Perú|Republica del Peru",
+  "United Kingdom": "UK|GB|GBR|Reino Unido|Great Britain|England|Britain",
+  "United States": "US|USA|Estados Unidos|EUA|United States of America"
+}

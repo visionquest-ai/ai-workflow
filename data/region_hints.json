@@ -1,0 +1,43 @@
+{
+  "_comment": "Region hints for fuzzy matching. Keys are canonical Region node names (35 total). Values are pipe-delimited aliases. Story 3.3.",
+
+  "São Paulo": "SP|Sao Paulo|State of São Paulo|State of Sao Paulo|São Paulo - SP|Sao Paulo - SP",
+  "Rio de Janeiro": "RJ|State of Rio de Janeiro|Rio de Janeiro - RJ",
+  "Minas Gerais": "MG|Minas|Belo Horizonte|BH|State of Minas Gerais|Minas Gerais - MG",
+  "Distrito Federal": "DF|Brasilia|Brasília|State of Distrito Federal",
+  "Paraná": "PR|Parana|State of Paraná|State of Parana|Paraná - PR|Parana - PR",
+  "Rio Grande do Sul": "RS|State of Rio Grande do Sul|Rio Grande do Sul - RS",
+  "Santa Catarina": "SC|State of Santa Catarina|Joinville|Santa Catarina - SC",
+  "Bahia": "BA|State of Bahia|Bahia - BA",
+  "Pernambuco": "PE|State of Pernambuco|Pernambuco - PE",
+  "Espírito Santo": "ES|Espirito Santo|State of Espírito Santo|State of Espirito Santo|Vitoria|Vitória|Espírito Santo - ES|Espirito Santo - ES",
+  "Pará": "PA|Para|State of Pará|State of Para|Pará - PA|Para - PA",
+  "Amazonas": "AM|State of Amazonas|Amazonas - AM",
+  "Maranhão": "MA|Maranhao|State of Maranhão|State of Maranhao|São Luís|Sao Luis|Maranhão - MA|Maranhao - MA",
+  "Paraíba": "PB|Paraiba|State of Paraíba|State of Paraiba|João Pessoa|Joao Pessoa|Paraíba - PB|Paraiba - PB",
+  "Mato Grosso do Sul": "MS|State of Mato Grosso do Sul|Campo Grande|Mato Grosso do Sul - MS",
+
+  "Belo Horizonte": "BH|MG|City focus - Belo Horizonte|Belo Horizonte - MG|Belo Horizonte MG",
+  "Belém": "Belem|PA|City focus - Belém|City focus - Belem|Belém - PA|Belem - PA",
+  "Brasília": "DF|Distrito Federal|Brasilia|City focus - Brasília|City focus - Brasilia|Brasília - DF|Brasilia - DF|Brasilia DF",
+  "Campinas": "SP|City focus - Campinas|Campinas - SP|Campinas SP",
+  "Curitiba": "PR|City focus - Curitiba|Curitiba - PR|Curitiba PR",
+  "Florianópolis": "Florianopolis|SC|City focus - Florianópolis|City focus - Florianopolis|Florianópolis - SC|Florianopolis - SC",
+  "Fortaleza": "CE|City focus - Fortaleza|Fortaleza - CE|Fortaleza CE|Ceará|Ceara",
+  "Goiânia": "Goiania|GO|City focus - Goiânia|City focus - Goiania|Goiânia - GO|Goiania - GO|Goiás|Goias",
+  "Manaus": "AM|City focus - Manaus|Manaus - AM|Manaus AM",
+  "Porto Alegre": "RS|City focus - Porto Alegre|Porto Alegre - RS|Porto Alegre RS",
+  "Recife": "PE|City focus - Recife|Recife - PE|Recife PE",
+  "Salvador": "BA|City focus - Salvador|Salvador - BA|Salvador BA",
+
+  "North": "Norte|Northern Brazil|Amazonas|Pará|Para|Acre|Amapá|Amapa|Rondônia|Rondonia|Roraima|Tocantins",
+  "North East": "Northeast|Nordeste|Northeastern Brazil|Bahia|Pernambuco|Ceará|Ceara|Paraíba|Paraiba|Maranhão|Maranhao|Alagoas|Sergipe|Rio Grande do Norte|Piauí|Piaui",
+  "South": "Sul|Southern Brazil|Paraná|Parana|Santa Catarina|Rio Grande do Sul",
+  "Southeast": "Sudeste|South East|Southeastern Brazil|São Paulo|Sao Paulo|Rio de Janeiro|Minas Gerais|Espírito Santo|Espirito Santo",
+  "Center West": "Centro-Oeste|Centro Oeste|Central West|Distrito Federal|Mato Grosso do Sul|Goiás|Goias|Mato Grosso",
+
+  "Brazil": "Brasil|BR|Nacional|National|Brazil - Regional|Brazilian",
+
+  "Regional firms of São Paulo": "Regional firms of Sao Paulo|Regional SP|São Paulo regional|Sao Paulo regional",
+  "Campinas & Surrounds": "Campinas e Região|Campinas region|Campinas & Region|Campinas and Surrounds"
+}
