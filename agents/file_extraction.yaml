@@ -78,6 +78,7 @@ state_schema:
 
   # Region extraction (Story 3.1)
   extracted_region: str           # Raw region string for downstream fuzzy matching
+  extracted_region_display: str   # Human-readable combined region (e.g. "Brazil - Regional, Minas Gerais")
 
   # Practice area matching (Story 2.3)
   practice_area_match: dict     # Fuzzy match result: matched_name, matched_id, score, tier, via_hint
@@ -852,11 +853,14 @@ nodes:
       def _extract_itr_region(p):
           jurisdictions = p.get("firmInfo", {}).get("jurisdictions", "")
           if isinstance(jurisdictions, dict):
-              # Prefer jurisdiction_l2 (state/region) over l1 (country-level)
-              return jurisdictions.get("jurisdiction_l2", "") or jurisdictions.get("jurisdiction_l1", "")
+              l1 = jurisdictions.get("jurisdiction_l1", "")
+              l2 = jurisdictions.get("jurisdiction_l2", "")
+              # Use l2 for fuzzy matching (more specific), l1 for context
+              return l2 or l1, l1, l2
           if isinstance(jurisdictions, list):
-              return jurisdictions[0] if jurisdictions else ""
-          return str(jurisdictions)
+              val = jurisdictions[0] if jurisdictions else ""
+              return val, "", ""
+          return str(jurisdictions), "", ""
 
       def _extract_leaders_region(p):
           return p.get("jurisdiction", "") or ""
@@ -873,13 +877,27 @@ nodes:
       extractor = extractors.get(directory)
       if not extractor:
           logger.warning("No region extractor for directory: %s", directory)
-          return {"extracted_region": ""}
+          return {"extracted_region": "", "extracted_region_display": ""}
 
-      region = extractor(payload) or ""
+      raw = extractor(payload)
+
+      # ITR returns (region, l1, l2) tuple; others return a string
+      if isinstance(raw, tuple):
+          region, l1, l2 = raw
+          # Build display: "l1, l2" when both present
+          parts = [p for p in (l1, l2) if p]
+          display = ", ".join(parts) if parts else ""
+      else:
+          region = raw or ""
+          display = ""
+
       if not region:
           logger.warning("No region found in payload for directory: %s", directory)
 
-      return {"extracted_region": str(region).strip()}
+      return {
+          "extracted_region": str(region).strip(),
+          "extracted_region_display": display.strip(),
+      }
 
   # Step 5c: Fuzzy match practiceArea against graph PracticeArea nodes (Story 2.3)
   - name: resolve_practice_area
@@ -1176,6 +1194,9 @@ nodes:
           # 5. Save to ApplicationFormFile if match found
           if result.get("matched_name"):
               context_node_id = state.get("context_node_id", "")
+              # Use display string (e.g. "Brazil - Regional, Minas Gerais") if available,
+              # otherwise fall back to the canonical matched node name
+              region_display = state.get("extracted_region_display") or result["matched_name"]
               if not context_node_id:
                   logger.warning(
                       "resolve_region: match found but context_node_id missing, "
@@ -1188,7 +1209,7 @@ nodes:
                           node_id=context_node_id,
                           node_type="ApplicationFormFile",
                           updates={
-                              "regionName": result["matched_name"],
+                              "regionName": region_display,
                               "regionId": result["matched_id"],
                           },
                           graphql_url=gql_url,
