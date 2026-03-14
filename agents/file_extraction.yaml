@@ -84,8 +84,8 @@ state_schema:
   practice_area_match: dict     # Fuzzy match result: matched_name, matched_id, score, tier, via_hint
 
   # Legal field derivation (Story 2.4)
-  legal_field_name: str          # Derived LegalField name from PracticeArea graph traversal
-  legal_field_id: str            # Derived LegalField graph node ID
+  legal_field_name: list         # Derived LegalField names from PracticeArea graph traversal
+  legal_field_id: list           # Derived LegalField graph node IDs
 
   # Region matching (Story 3.2)
   region_match: dict             # Fuzzy match result: matched_name, matched_id, score, tier, via_hint
@@ -1044,7 +1044,7 @@ nodes:
 
       if not pa_id:
           logger.debug("derive_legal_field: no practiceAreaId, skipping")
-          return {"legal_field_name": "", "legal_field_id": ""}
+          return {"legal_field_name": [], "legal_field_id": []}
 
       gql_url = (
           state.get("variables", {}).get("GRAPHOLOGY_URL")
@@ -1084,21 +1084,22 @@ nodes:
 
           if pas and pas[0].get("practiceAreaHasLegalField"):
               lf_list = pas[0]["practiceAreaHasLegalField"]
+              if not isinstance(lf_list, list):
+                  lf_list = [lf_list]
               if lf_list:
-                  lf = lf_list[0] if isinstance(lf_list, list) else lf_list
-                  lf_name = lf.get("name", "")
-                  lf_id = lf.get("id", "")
+                  lf_names = [lf.get("name", "") for lf in lf_list if lf.get("name")]
+                  lf_ids = [lf.get("id", "") for lf in lf_list if lf.get("id")]
 
-                  # Persist to ApplicationFormFile
+                  # Persist to ApplicationFormFile (now [String] arrays)
                   context_node_id = state.get("context_node_id", "")
-                  if context_node_id:
+                  if context_node_id and lf_names:
                       update_result = actions["graphology.update_node"](
                           state=state,
                           node_id=context_node_id,
                           node_type="ApplicationFormFile",
                           updates={
-                              "legalFieldName": lf_name,
-                              "legalFieldId": lf_id,
+                              "legalFieldName": lf_names,
+                              "legalFieldId": lf_ids,
                           },
                           graphql_url=gql_url,
                           graphql_api_key=gql_api_key,
@@ -1109,14 +1110,18 @@ nodes:
                               update_result.get("error", "unknown"),
                           )
 
-                  return {"legal_field_name": lf_name, "legal_field_id": lf_id}
+                  logger.info(
+                      "derive_legal_field: Found %d LegalField(s): %s",
+                      len(lf_names), lf_names,
+                  )
+                  return {"legal_field_name": lf_names, "legal_field_id": lf_ids}
 
           logger.warning("derive_legal_field: No LegalField found for PracticeArea %s", pa_id)
-          return {"legal_field_name": "", "legal_field_id": ""}
+          return {"legal_field_name": [], "legal_field_id": []}
 
       except Exception as e:
           logger.warning("derive_legal_field: GraphQL query failed: %s", e)
-          return {"legal_field_name": "", "legal_field_id": ""}
+          return {"legal_field_name": [], "legal_field_id": []}
 
   # Step 5e: Resolve Region via fuzzy matching against graph Region nodes (Story 3.2)
   - name: resolve_region

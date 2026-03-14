@@ -3366,8 +3366,8 @@ class TestDeriveLegalField:
             mock_modules={"requests": mock_requests},
         )
 
-        assert result["legal_field_name"] == "Banking Law"
-        assert result["legal_field_id"] == "lf-123"
+        assert result["legal_field_name"] == ["Banking Law"]
+        assert result["legal_field_id"] == ["lf-123"]
 
     # --- AC2: Persist legalFieldName and legalFieldId to ApplicationFormFile ---
     def test_persists_legal_field_to_graph(self, agent_def):
@@ -3395,28 +3395,28 @@ class TestDeriveLegalField:
         mock_update.assert_called_once()
         call_kwargs = mock_update.call_args[1]
         assert call_kwargs["node_type"] == "ApplicationFormFile"
-        assert call_kwargs["updates"]["legalFieldName"] == "Tax Law"
-        assert call_kwargs["updates"]["legalFieldId"] == "lf-100"
+        assert call_kwargs["updates"]["legalFieldName"] == ["Tax Law"]
+        assert call_kwargs["updates"]["legalFieldId"] == ["lf-100"]
         assert call_kwargs["node_id"] == "file-300"
 
     # --- AC3: No PracticeArea matched -> skip ---
     def test_no_practice_area_id_skips(self, agent_def):
-        """AC3: Empty practiceAreaId -> step skipped, empty strings returned."""
+        """AC3: Empty practiceAreaId -> step skipped, empty lists returned."""
         state = {"practice_area_match": {"matched_id": ""}}
         result = _exec_node_with_actions(agent_def, "derive_legal_field", state)
-        assert result == {"legal_field_name": "", "legal_field_id": ""}
+        assert result == {"legal_field_name": [], "legal_field_id": []}
 
     def test_missing_practice_area_match_skips(self, agent_def):
         """AC3: Missing practice_area_match key -> skip."""
         state = {}
         result = _exec_node_with_actions(agent_def, "derive_legal_field", state)
-        assert result == {"legal_field_name": "", "legal_field_id": ""}
+        assert result == {"legal_field_name": [], "legal_field_id": []}
 
     def test_empty_practice_area_match_dict_skips(self, agent_def):
         """AC3: Empty practice_area_match dict -> skip."""
         state = {"practice_area_match": {}}
         result = _exec_node_with_actions(agent_def, "derive_legal_field", state)
-        assert result == {"legal_field_name": "", "legal_field_id": ""}
+        assert result == {"legal_field_name": [], "legal_field_id": []}
 
     # --- AC4: PracticeArea has no connected LegalField ---
     def test_no_legal_field_connected(self, agent_def, caplog):
@@ -3436,7 +3436,7 @@ class TestDeriveLegalField:
                 mock_modules={"requests": mock_requests},
             )
 
-        assert result == {"legal_field_name": "", "legal_field_id": ""}
+        assert result == {"legal_field_name": [], "legal_field_id": []}
         assert any("No LegalField found" in r.message for r in caplog.records)
 
     def test_no_legal_field_null_field(self, agent_def, caplog):
@@ -3456,7 +3456,7 @@ class TestDeriveLegalField:
                 mock_modules={"requests": mock_requests},
             )
 
-        assert result == {"legal_field_name": "", "legal_field_id": ""}
+        assert result == {"legal_field_name": [], "legal_field_id": []}
         assert any("No LegalField found" in r.message for r in caplog.records)
 
     def test_empty_practice_areas_list(self, agent_def, caplog):
@@ -3476,7 +3476,7 @@ class TestDeriveLegalField:
                 mock_modules={"requests": mock_requests},
             )
 
-        assert result == {"legal_field_name": "", "legal_field_id": ""}
+        assert result == {"legal_field_name": [], "legal_field_id": []}
         assert any("No LegalField found" in r.message for r in caplog.records)
 
     # --- AC5: GraphQL typed API ---
@@ -3522,7 +3522,7 @@ class TestDeriveLegalField:
                 mock_modules={"requests": mock_requests},
             )
 
-        assert result == {"legal_field_name": "", "legal_field_id": ""}
+        assert result == {"legal_field_name": [], "legal_field_id": []}
         assert any("GraphQL query failed" in r.message for r in caplog.records)
 
     def test_graphql_http_error(self, agent_def, caplog):
@@ -3540,7 +3540,7 @@ class TestDeriveLegalField:
                 mock_modules={"requests": mock_requests},
             )
 
-        assert result == {"legal_field_name": "", "legal_field_id": ""}
+        assert result == {"legal_field_name": [], "legal_field_id": []}
 
     def test_malformed_graphql_response(self, agent_def):
         """AC6: GraphQL response missing data key -> empty, no crash."""
@@ -3561,7 +3561,7 @@ class TestDeriveLegalField:
             mock_modules={"requests": mock_requests},
         )
 
-        assert result == {"legal_field_name": "", "legal_field_id": ""}
+        assert result == {"legal_field_name": [], "legal_field_id": []}
 
     # --- Edge cases ---
     def test_single_object_instead_of_list(self, agent_def):
@@ -3585,8 +3585,8 @@ class TestDeriveLegalField:
             mock_modules={"requests": mock_requests},
         )
 
-        assert result["legal_field_name"] == "Litigation"
-        assert result["legal_field_id"] == "lf-single"
+        assert result["legal_field_name"] == ["Litigation"]
+        assert result["legal_field_id"] == ["lf-single"]
 
     def test_missing_context_node_id_skips_persistence(self, agent_def):
         """Edge: No context_node_id -> LegalField returned but not persisted."""
@@ -3610,8 +3610,8 @@ class TestDeriveLegalField:
             mock_modules={"requests": mock_requests},
         )
 
-        assert result["legal_field_name"] == "Tax"
-        assert result["legal_field_id"] == "lf-1"
+        assert result["legal_field_name"] == ["Tax"]
+        assert result["legal_field_id"] == ["lf-1"]
         mock_update.assert_not_called()
 
     def test_api_key_header_sent_when_present(self, agent_def):
@@ -3668,8 +3668,8 @@ class TestDeriveLegalField:
                 mock_modules={"requests": mock_requests},
             )
 
-        assert result["legal_field_name"] == "Tax"
-        assert result["legal_field_id"] == "lf-1"
+        assert result["legal_field_name"] == ["Tax"]
+        assert result["legal_field_id"] == ["lf-1"]
         mock_update.assert_called_once()
         assert any("update_node failed" in r.message for r in caplog.records)
 
@@ -3695,8 +3695,8 @@ class TestDeriveLegalField:
             mock_modules={"requests": mock_requests},
         )
 
-        assert result["legal_field_name"] == "IP Law"
-        assert result["legal_field_id"] == "lf-2"
+        assert result["legal_field_name"] == ["IP Law"]
+        assert result["legal_field_id"] == ["lf-2"]
 
     # --- Routing tests ---
     def test_resolve_practice_area_routes_to_derive_legal_field(self, agent_def):
