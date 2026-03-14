@@ -78,7 +78,7 @@ state_schema:
 
   # Region extraction (Story 3.1)
   extracted_region: str           # Raw region string for downstream fuzzy matching
-  extracted_region_display: str   # Human-readable combined region (e.g. "Brazil - Regional, Minas Gerais")
+  extracted_region_context: str   # Parent jurisdiction context for display (e.g. "Brazil - Regional" from ITR l1)
 
   # Practice area matching (Story 2.3)
   practice_area_match: dict     # Fuzzy match result: matched_name, matched_id, score, tier, via_hint
@@ -877,26 +877,25 @@ nodes:
       extractor = extractors.get(directory)
       if not extractor:
           logger.warning("No region extractor for directory: %s", directory)
-          return {"extracted_region": "", "extracted_region_display": ""}
+          return {"extracted_region": "", "extracted_region_context": ""}
 
       raw = extractor(payload)
 
       # ITR returns (region, l1, l2) tuple; others return a string
       if isinstance(raw, tuple):
           region, l1, l2 = raw
-          # Build display: "l1, l2" when both present
-          parts = [p for p in (l1, l2) if p]
-          display = ", ".join(parts) if parts else ""
+          # Store l1 as context only when both levels present
+          context = l1 if (l1 and l2) else ""
       else:
           region = raw or ""
-          display = ""
+          context = ""
 
       if not region:
           logger.warning("No region found in payload for directory: %s", directory)
 
       return {
           "extracted_region": str(region).strip(),
-          "extracted_region_display": display.strip(),
+          "extracted_region_context": context.strip(),
       }
 
   # Step 5c: Fuzzy match practiceArea against graph PracticeArea nodes (Story 2.3)
@@ -1194,9 +1193,18 @@ nodes:
           # 5. Save to ApplicationFormFile if match found
           if result.get("matched_name"):
               context_node_id = state.get("context_node_id", "")
-              # Use display string (e.g. "Brazil - Regional, Minas Gerais") if available,
-              # otherwise fall back to the canonical matched node name
-              region_display = state.get("extracted_region_display") or result["matched_name"]
+              # Build regionName using canonical names for both levels
+              # e.g. "Brazil, Southeast" (not raw "Brazil - Regional, Minas Gerais")
+              region_context_raw = state.get("extracted_region_context", "")
+              if region_context_raw:
+                  ctx_result = fuzzy_match(region_context_raw, master_list)
+                  ctx_name = ctx_result.get("matched_name", "")
+                  if ctx_name and ctx_name != result["matched_name"]:
+                      region_display = f"{ctx_name}, {result['matched_name']}"
+                  else:
+                      region_display = result["matched_name"]
+              else:
+                  region_display = result["matched_name"]
               if not context_node_id:
                   logger.warning(
                       "resolve_region: match found but context_node_id missing, "

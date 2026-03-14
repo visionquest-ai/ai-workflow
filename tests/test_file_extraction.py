@@ -3779,7 +3779,7 @@ class TestExtractRegion:
         }
         result = _exec_node(agent_def, "extract_region", state)
         assert result["extracted_region"] == "London"
-        assert result["extracted_region_display"] == "United Kingdom, London"
+        assert result["extracted_region_context"] == "United Kingdom"
 
     def test_itr_region_dict_falls_back_to_l1(self, agent_def):
         """AC4: ITR jurisdictions dict with empty jurisdiction_l2 -> fall back to l1."""
@@ -3791,7 +3791,7 @@ class TestExtractRegion:
         }
         result = _exec_node(agent_def, "extract_region", state)
         assert result["extracted_region"] == "Brazil - Regional"
-        assert result["extracted_region_display"] == "Brazil - Regional"
+        assert result["extracted_region_context"] == ""  # no context when only one level
 
     def test_itr_region_dict_l2_only(self, agent_def):
         """AC4: ITR jurisdictions dict with only jurisdiction_l2 -> returns l2."""
@@ -3803,10 +3803,10 @@ class TestExtractRegion:
         }
         result = _exec_node(agent_def, "extract_region", state)
         assert result["extracted_region"] == "Minas Gerais"
-        assert result["extracted_region_display"] == "Minas Gerais"
+        assert result["extracted_region_context"] == ""  # no l1, no context
 
-    def test_itr_region_dict_both_levels_display(self, agent_def):
-        """ITR with both l1 and l2 -> display combines as 'l1, l2'."""
+    def test_itr_region_dict_both_levels(self, agent_def):
+        """ITR with both l1 and l2 -> context stores l1 for display composition."""
         state = {
             "payload_json": json.dumps({
                 "firmInfo": {"jurisdictions": {"jurisdiction_l1": "Brazil - Regional", "jurisdiction_l2": "Minas Gerais"}}
@@ -3815,7 +3815,7 @@ class TestExtractRegion:
         }
         result = _exec_node(agent_def, "extract_region", state)
         assert result["extracted_region"] == "Minas Gerais"
-        assert result["extracted_region_display"] == "Brazil - Regional, Minas Gerais"
+        assert result["extracted_region_context"] == "Brazil - Regional"
 
     def test_itr_region_string(self, agent_def):
         """AC4: ITR jurisdictions as string (legacy) -> passthrough."""
@@ -4092,25 +4092,30 @@ class TestResolveRegion:
         assert call_kwargs["updates"]["regionName"] == "Minas Gerais"
         assert call_kwargs["updates"]["regionId"] == "r-1"
 
-    def test_persists_display_name_when_available(self, agent_def):
-        """regionName uses extracted_region_display when present (ITR l1+l2)."""
+    def test_persists_canonical_context_plus_matched_name(self, agent_def):
+        """regionName resolves both levels to canonical names: 'Brazil, Southeast'."""
         from unittest.mock import MagicMock
 
-        regions = [{"id": "r-1", "name": "Southeast", "hints": "Minas Gerais"}]
+        regions = [
+            {"id": "r-1", "name": "Southeast", "hints": "Minas Gerais"},
+            {"id": "r-2", "name": "Brazil", "hints": "Brasil|BR|Brazil - Regional"},
+        ]
         mock_requests = self._make_mock_requests(regions)
-        mock_fm = self._make_mock_fuzzy_match_module({
-            "matched_name": "Southeast",
-            "matched_id": "r-1",
-            "score": 1.0,
-            "via_hint": True,
-            "tier": "CA-1",
-        })
+        # fuzzy_match is called twice: once for l2 (main), once for l1 (context)
+        mock_fm = self._make_mock_fuzzy_match_module()  # default won't work for two calls
+
+        # Override: first call returns Southeast (l2 match), second returns Brazil (l1 context)
+        mock_fm.fuzzy_match.side_effect = [
+            {"matched_name": "Southeast", "matched_id": "r-1", "score": 1.0, "via_hint": True, "tier": "CA-1"},
+            {"matched_name": "Brazil", "matched_id": "r-2", "score": 1.0, "via_hint": True, "tier": "CA-1"},
+        ]
+
         mock_update = MagicMock(return_value={"success": True})
         mock_actions = {"graphology.update_node": mock_update}
 
         state = {
             "extracted_region": "Minas Gerais",
-            "extracted_region_display": "Brazil - Regional, Minas Gerais",
+            "extracted_region_context": "Brazil - Regional",
             "context_node_id": "file-uuid-42",
         }
         _exec_node_with_actions(
@@ -4120,7 +4125,7 @@ class TestResolveRegion:
         )
 
         call_kwargs = mock_update.call_args[1]
-        assert call_kwargs["updates"]["regionName"] == "Brazil - Regional, Minas Gerais"
+        assert call_kwargs["updates"]["regionName"] == "Brazil, Southeast"
         assert call_kwargs["updates"]["regionId"] == "r-1"
 
     # --- 4.5: Hint-based match (e.g., "MG" -> "Minas Gerais") ---
