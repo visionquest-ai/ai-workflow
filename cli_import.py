@@ -5,10 +5,13 @@ CLI tool to import a file through the AI Workflow pipeline.
 Flow:
   1. Upload file to GCS → storageUrl
   2. Create ApplicationFormFile node in the graph
-  3. Run file_extraction agent → extracts payload, creates ProtoMatters
+     → NODE_CREATED trigger auto-fires file_extraction agent
+  3. Poll until extraction completes (ApplicationFormFile.status = succeeded/failed)
+  4. Report ProtoMatters created
 
-The import_matter_qa step is handled automatically by database triggers
-when ProtoMatters are created with status "pending".
+The file_extraction agent is triggered automatically by the Apollo middleware
+(On ApplicationFormFile Created trigger). The import_matter_qa agent fires
+automatically when ProtoMatters are created (On ProtoMatter Created trigger).
 
 Usage:
   python cli_import.py /path/to/file.docx
@@ -16,8 +19,7 @@ Usage:
   python cli_import.py /path/to/file.docx --dry-run
 
 Environment variables (from .env):
-  GRAPHOLOGY_URL, GRAPHOLOGY_API_KEY, RUN_AGENT_API_KEY (or AI_WORKFLOW_API_KEY)
-  AI_WORKFLOW_URL (defaults to https://neo4j.visionquest.space/ai-workflow)
+  GRAPHOLOGY_URL, GRAPHOLOGY_API_KEY
   GCS_BUCKET (defaults to rankellix-law.firebasestorage.app)
 """
 
@@ -54,11 +56,6 @@ def load_config():
         "graphql_api_key": os.environ.get("GRAPHOLOGY_API_KEY")
             or os.environ.get("GRAPHQL_API_KEY")
             or "",
-        "ai_workflow_url": os.environ.get("AI_WORKFLOW_URL")
-            or "https://neo4j.visionquest.space/ai-workflow",
-        "ai_workflow_api_key": os.environ.get("RUN_AGENT_API_KEY")
-            or os.environ.get("AI_WORKFLOW_API_KEY")
-            or "",
         "gcs_bucket": os.environ.get("GCS_BUCKET")
             or "rankellix-law.firebasestorage.app",
         "gcs_prefix": os.environ.get("GCS_PREFIX")
@@ -68,20 +65,12 @@ def load_config():
     missing = []
     if not config["graphql_api_key"]:
         missing.append("GRAPHOLOGY_API_KEY")
-    if not config["ai_workflow_api_key"]:
-        missing.append("RUN_AGENT_API_KEY or AI_WORKFLOW_API_KEY")
     if missing:
         print(f"ERROR: Missing environment variables: {', '.join(missing)}", file=sys.stderr)
         sys.exit(1)
 
     return config
 
-
-# =============================================================================
-# WORKFLOW IDS (from production graph)
-# =============================================================================
-
-FILE_EXTRACTION_WORKFLOW_ID = "07646202-ddd7-4086-8acf-4c51561328fc"
 
 
 # =============================================================================
@@ -183,42 +172,28 @@ def create_application_form_file(
 
 
 # =============================================================================
-# STEP 3: Run file_extraction agent
+# STEP 3: Poll for extraction completion
 # =============================================================================
 
-def run_agent(agent: str, workflow_id: str, context_node_id: str, config: dict) -> dict:
-    """Call the /run-agent endpoint and return the result."""
-    url = f"{config['ai_workflow_url']}/run-agent"
-    headers = {
-        "Content-Type": "application/json",
-        "x-api-key": config["ai_workflow_api_key"],
-    }
-    payload = {
-        "agent": agent,
-        "workflow_id": workflow_id,
-        "context_node_id": context_node_id,
-    }
-
-    resp = requests.post(url, json=payload, headers=headers, timeout=600)
-    resp.raise_for_status()
-    return resp.json()
+POLL_INTERVAL = 5       # seconds between polls
+POLL_TIMEOUT = 600      # max seconds to wait (10 min)
+TERMINAL_STATUSES = {"succeeded", "failed"}
 
 
-# =============================================================================
-# STEP 4: Query ProtoMatters linked to file
-# =============================================================================
-
-def get_proto_matters(file_id: str, config: dict) -> list[dict]:
-    """Query ProtoMatter nodes linked to an ApplicationFormFile."""
+def get_file_status(file_id: str, config: dict) -> dict:
+    """Query ApplicationFormFile status and ProtoMatter count."""
     query = """
-    query GetProtoMatters($fileId: ID!) {
-      protoMatter(where: {
-        fileHasProtoMatterFrom_SOME: { id_EQ: $fileId }
-      }) {
-        id
+    query GetFileStatus($fileId: ID!) {
+      applicationFormFile(where: { id_EQ: $fileId }) {
         status
-        directory
-        payload
+        practiceAreaName
+        regionName
+        legalFieldName
+        fileHasProtoMatter {
+          id
+          status
+          payload
+        }
       }
     }
     """
@@ -238,7 +213,56 @@ def get_proto_matters(file_id: str, config: dict) -> list[dict]:
     if "errors" in result:
         raise RuntimeError(f"GraphQL error: {result['errors'][0]['message']}")
 
-    return result["data"]["protoMatter"]
+    files = result["data"]["applicationFormFile"]
+    if not files:
+        raise RuntimeError(f"ApplicationFormFile {file_id} not found")
+
+    return files[0]
+
+
+def poll_until_complete(file_id: str, config: dict) -> dict:
+    """Poll ApplicationFormFile until status is terminal or timeout."""
+    t0 = time.time()
+    last_status = None
+    last_pm_count = 0
+
+    while True:
+        elapsed = time.time() - t0
+        if elapsed > POLL_TIMEOUT:
+            raise RuntimeError(
+                f"Timeout after {POLL_TIMEOUT}s. Last status: {last_status}, "
+                f"ProtoMatters: {last_pm_count}"
+            )
+
+        try:
+            file_data = get_file_status(file_id, config)
+        except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as e:
+            print(f"  [{elapsed:5.0f}s] poll error: {type(e).__name__}, retrying...")
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        status = file_data.get("status") or "pending"
+        proto_matters = file_data.get("fileHasProtoMatter", [])
+        pm_count = len(proto_matters)
+        imported_count = sum(
+            1 for pm in proto_matters if pm.get("status") == "imported"
+        )
+
+        if status != last_status or pm_count != last_pm_count:
+            print(
+                f"  [{elapsed:5.0f}s] status={status}, "
+                f"ProtoMatters={pm_count} (imported={imported_count})"
+            )
+            last_status = status
+            last_pm_count = pm_count
+
+        if status in TERMINAL_STATUSES and pm_count > 0 and imported_count == pm_count:
+            return file_data
+
+        if status == "failed":
+            return file_data
+
+        time.sleep(POLL_INTERVAL)
 
 
 # =============================================================================
@@ -291,9 +315,8 @@ Examples:
     if args.dry_run:
         print("[DRY RUN] Would execute:")
         print(f"  1. Upload {file_name} to GCS")
-        print(f"  2. Create ApplicationFormFile node")
-        print(f"  3. Run file_extraction agent")
-        print(f"  Q&A is handled automatically by database triggers.")
+        print(f"  2. Create ApplicationFormFile node (triggers file_extraction automatically)")
+        print(f"  3. Poll until extraction + import completes")
         print("\nNo changes made.")
         return
 
@@ -306,6 +329,7 @@ Examples:
         storage_url = upload_to_gcs(args.file, config)
 
     # --- Step 2: Create ApplicationFormFile ---
+    # The NODE_CREATED trigger auto-fires file_extraction agent
     print("\n[2/3] Creating ApplicationFormFile node...")
     file_id = create_application_form_file(
         storage_url=storage_url,
@@ -315,33 +339,55 @@ Examples:
         year=args.year,
         config=config,
     )
+    print("  file_extraction triggered automatically via NODE_CREATED trigger")
 
-    # --- Step 3: Run file_extraction ---
-    print("\n[3/3] Running file_extraction agent...")
+    # --- Step 3: Poll until complete ---
+    print("\n[3/3] Waiting for extraction + import to complete...")
     t0 = time.time()
-    result = run_agent("file_extraction", FILE_EXTRACTION_WORKFLOW_ID, file_id, config)
-    elapsed = time.time() - t0
-    print(f"  Result: {result.get('status', 'unknown')} ({elapsed:.1f}s)")
-
-    if not result.get("success"):
-        print(f"  ERROR: {result.get('error', 'Unknown error')}", file=sys.stderr)
+    try:
+        file_data = poll_until_complete(file_id, config)
+    except RuntimeError as e:
+        print(f"  ERROR: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # --- Query ProtoMatters ---
-    print("\n  Querying ProtoMatter nodes...")
-    proto_matters = get_proto_matters(file_id, config)
-    print(f"  Found {len(proto_matters)} ProtoMatter(s)")
+    elapsed = time.time() - t0
+    status = file_data.get("status", "unknown")
+    proto_matters = file_data.get("fileHasProtoMatter", [])
 
-    for i, pm in enumerate(proto_matters, 1):
-        payload = json.loads(pm.get("payload", "{}")) if pm.get("payload") else {}
-        matter_name = payload.get("matter_name", "(unnamed)")
-        print(f"    {i}. {pm['id'][:12]}... — {matter_name} [{pm['status']}]")
+    if status == "failed":
+        print(f"\n  FAILED after {elapsed:.1f}s", file=sys.stderr)
+        sys.exit(1)
 
     # --- Summary ---
     print(f"\n{'='*60}")
-    print(f"Done. ApplicationFormFile: {file_id}")
-    print(f"ProtoMatters created: {len(proto_matters)}")
-    print(f"Q&A will be triggered automatically by the database.")
+    print(f"Done in {elapsed:.1f}s. ApplicationFormFile: {file_id}")
+    print(f"  status:           {status}")
+    print(f"  practiceAreaName: {file_data.get('practiceAreaName') or '(empty)'}")
+    print(f"  regionName:       {file_data.get('regionName') or '(empty)'}")
+    print(f"  legalFieldName:   {file_data.get('legalFieldName') or '(empty)'}")
+    print(f"  ProtoMatters:     {len(proto_matters)}")
+
+    for i, pm in enumerate(proto_matters, 1):
+        payload = json.loads(pm.get("payload", "{}")) if pm.get("payload") else {}
+        # Try client name fields across all directory schemas
+        client = (
+            payload.get("clientName")           # chambers
+            or payload.get("clientsAdvised")     # iflr1000
+            or payload.get("client_advised")     # itr
+            or payload.get("client")             # leadersleague
+            or payload.get("nameOfClient")       # legal500
+            or ""
+        )
+        deal = (
+            payload.get("dealName")              # iflr1000
+            or payload.get("matter_name")        # itr, leadersleague
+            or ""
+        )
+        label = client or deal or "(unnamed)"
+        if len(label) > 60:
+            label = label[:57] + "..."
+        print(f"    {i}. {pm['id'][:12]}... — {label} [{pm['status']}]")
+
     print(f"{'='*60}")
 
 

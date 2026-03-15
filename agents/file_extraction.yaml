@@ -546,14 +546,6 @@ nodes:
           return {}
 
       try:
-          dir_query = '''
-          query FindDirectory($name: String!) {
-            directories(where: { name_EQ: $name }) {
-              id
-              name
-            }
-          }
-          '''
           gql_url = (
               state.get("variables", {}).get("GRAPHOLOGY_URL")
               or os.environ.get("GRAPHOLOGY_URL")
@@ -567,27 +559,40 @@ nodes:
           if gql_api_key:
               headers["x-api-key"] = gql_api_key
 
-          resp = req.post(
-              gql_url,
-              json={"query": dir_query, "variables": {"name": directory_name}},
-              timeout=30,
-              headers=headers,
-          )
+          # Fetch all Directory nodes
+          all_query = '{ directory { id name } }'
+          resp = req.post(gql_url, json={"query": all_query}, timeout=30, headers=headers)
           resp.raise_for_status()
-          dir_data = resp.json().get("data", {})
-          dirs = dir_data.get("directories", [])
+          all_dirs = resp.json().get("data", {}).get("directory", [])
 
-          # Case-insensitive fallback: if exact match fails, try lowercase comparison
-          if not dirs:
-              all_query = '{ directories { id name } }'
-              resp2 = req.post(gql_url, json={"query": all_query}, timeout=30, headers=headers)
-              resp2.raise_for_status()
-              all_dirs = resp2.json().get("data", {}).get("directories", [])
-              dirs = [d for d in all_dirs if (d.get("name") or "").lower() == directory_name.lower()]
+          if not all_dirs:
+              logger.warning("lookup_directory_id: No Directory nodes in graph")
+              return {"directory_id": ""}
 
-          if dirs:
-              directory_id = dirs[0].get("id", "")
-              logger.info("lookup_directory_id: Found Directory '%s' -> id=%s", directory_name, directory_id)
+          # Build hints inline — Directory nodes don't have a hints field,
+          # so we inject common aliases here for the fuzzy matcher
+          DIRECTORY_HINTS = {
+              "Chambers and Partners": "chambers, chambers and partners, C&P",
+              "IFLR1000": "iflr1000, iflr, iflr 1000",
+              "The Legal 500": "legal500, legal 500, L500, thelegal500",
+              "ITR World Tax": "itr, itr world tax, international tax review",
+              "Leaders League": "leadersleague, leaders league, leaders",
+          }
+
+          from actions.fuzzy_match import fuzzy_match
+          master_list = [
+              {"name": d["name"], "id": d["id"], "hints": DIRECTORY_HINTS.get(d["name"], "")}
+              for d in all_dirs
+          ]
+          result = fuzzy_match(directory_name, master_list)
+
+          if result.get("matched_name"):
+              directory_id = result["matched_id"]
+              logger.info(
+                  "lookup_directory_id: Matched '%s' -> '%s' (id=%s, score=%.4f, tier=%s)",
+                  directory_name, result["matched_name"], directory_id,
+                  result.get("score", 0), result.get("tier", "unknown"),
+              )
               actions["graphology.update_node"](
                   state=state,
                   node_id=file_id,
@@ -597,7 +602,7 @@ nodes:
               )
               return {"directory_id": directory_id}
           else:
-              logger.warning("lookup_directory_id: No Directory node found for name '%s'", directory_name)
+              logger.warning("lookup_directory_id: No Directory match for '%s'", directory_name)
               return {"directory_id": ""}
 
       except Exception as e:
