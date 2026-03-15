@@ -84,6 +84,10 @@ _job_store: dict[str, dict] = {}
 _job_lock = threading.Lock()
 _MAX_COMPLETED_JOBS = 1000
 
+# Track active agent executions so the liveness probe waits for them to finish
+_active_requests = 0
+_active_requests_lock = threading.Lock()
+
 
 def _generate_job_id() -> str:
     return str(uuid.uuid4())
@@ -142,6 +146,7 @@ def _load_and_run_agent(
     3. Validate workflow_id (AC3b)
     4. Load TEA engine, register actions, run agent
     """
+    global _active_requests
     agents_dir = agents_dir or AGENTS_DIR
     actions_dir = actions_dir or ACTIONS_DIR
 
@@ -164,6 +169,10 @@ def _load_and_run_agent(
     context_node_type = node_result["node_type"]
     node_data = node_result["data"]
     matter_context = json.dumps(node_data) if isinstance(node_data, dict) else str(node_data)
+
+    # Track active execution so liveness probe waits for completion
+    with _active_requests_lock:
+        _active_requests += 1
 
     # Run TEA engine
     try:
@@ -230,6 +239,9 @@ def _load_and_run_agent(
     except Exception as e:
         logger.error(f"Agent execution failed: {e}")
         return {"success": False, "error": str(e)}
+    finally:
+        with _active_requests_lock:
+            _active_requests -= 1
 
 
 # =============================================================================
@@ -269,10 +281,63 @@ def _check_api_key(x_api_key: Optional[str]):
 # ENDPOINTS
 # =============================================================================
 
+def _get_rss_mb() -> float:
+    """Return current process RSS in megabytes (Linux /proc)."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024  # kB -> MB
+    except (OSError, ValueError):
+        pass
+    return 0.0
+
+
 @app.get("/health")
 async def health():
-    """Health check endpoint (AC: no auth required)."""
-    return {"status": "ok"}
+    """Health check with memory threshold — returns 503 when RSS exceeds limit
+    AND no agent executions are in progress.
+
+    The livenessProbe uses this to trigger a pod restart when memory grows
+    too large (Python/glibc don't always return freed memory to the OS).
+    Restart is deferred while any agent is still processing to avoid
+    interrupting work mid-execution.
+    """
+    rss_mb = _get_rss_mb()
+    limit_mb = float(os.environ.get("MEMORY_LIMIT_MB", "768"))
+
+    with _active_requests_lock:
+        active = _active_requests
+
+    if rss_mb > limit_mb:
+        if active > 0:
+            logger.warning(
+                f"Memory threshold exceeded: RSS={rss_mb:.0f}MB > limit={limit_mb:.0f}MB "
+                f"— but {active} request(s) still active, staying healthy"
+            )
+            return {
+                "status": "ok",
+                "rss_mb": round(rss_mb),
+                "active_requests": active,
+                "memory_pressure": True,
+            }
+
+        logger.warning(
+            f"Memory threshold exceeded: RSS={rss_mb:.0f}MB > limit={limit_mb:.0f}MB "
+            f"— no active requests, reporting unhealthy for restart"
+        )
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "unhealthy",
+                "reason": "memory_threshold_exceeded",
+                "rss_mb": round(rss_mb),
+                "limit_mb": round(limit_mb),
+                "active_requests": 0,
+            },
+        )
+
+    return {"status": "ok", "rss_mb": round(rss_mb), "active_requests": active}
 
 
 @app.post("/run-agent")

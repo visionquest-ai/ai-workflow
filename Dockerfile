@@ -14,7 +14,7 @@ FROM python:3.11.14-slim-trixie
 
 # System dependencies
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends libreoffice-writer && \
+    apt-get install -y --no-install-recommends libreoffice-writer default-jre-headless && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Non-root user for security (AC10)
