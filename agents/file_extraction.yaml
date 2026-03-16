@@ -58,7 +58,7 @@ state_schema:
 
   # Detection
   directory_source: str      # How directory was detected: "input", "filename", "content", "llm"
-  document_text: str         # First 3500 chars extracted from file for content scanning
+  document_text: str         # Full text extracted from file for content scanning and LLM classification
   detected_year: str         # Year detected from any tier
   year_source: str           # How year was detected: "input", "filename", "content", "llm", "llamaextract"
   classification_result: str # Full JSON from LLM classification agent (TIER 3)
@@ -211,7 +211,7 @@ nodes:
                   for row in table.rows:
                       for cell in row.cells:
                           parts.append(cell.text)
-              document_text = "\n".join(parts)[:3500]
+              document_text = "\n".join(parts)
           except Exception:
               document_text = ""
       elif ext == ".pdf":
@@ -222,9 +222,7 @@ nodes:
                   for page in pdf.pages:
                       text = page.extract_text() or ""
                       parts.append(text)
-                      if len("\n".join(parts)) >= 3500:
-                          break
-                  document_text = "\n".join(parts)[:3500]
+                  document_text = "\n".join(parts)
           except Exception:
               document_text = ""
 
@@ -260,9 +258,7 @@ nodes:
                   for page in pdf.pages:
                       text = page.extract_text() or ""
                       parts.append(text)
-                      if len("\n".join(parts)) >= 3500:
-                          break
-                  document_text = "\n".join(parts)[:3500]
+                  document_text = "\n".join(parts)
           except Exception:
               document_text = ""
 
@@ -335,56 +331,82 @@ nodes:
               if directory_name:
                   break
 
-          # TIER 2: Content keyword scanning (if TIER 1 missed)
+          # TIER 2: Weighted content keyword scoring (if TIER 1 missed)
+          # Score-all-then-decide replaces first-match-wins to handle ambiguous keywords.
+          # Weight tiers: 3=URL/domain (unique), 2=directory-specific term, 1=generic/ambiguous
           if not directory_name and document_text:
               text_lower = document_text.lower()
 
-              # Note: Generic overlapping keywords like "leading individual", "rising star",
-              # "leading", "excellent" are intentionally omitted to avoid false positives.
-              # Ambiguous cases fall through to TIER 3 LLM classification (Story 16.2).
-              content_patterns = {
+              weighted_content_patterns = {
                   "chambers": [
-                      "chambers.com", "myaccount.chambers.com", "chambers and partners",
-                      "chambers & partners", "band 1", "band 2", "band 3", "band 4",
-                      "ranked individual", "leading individual", "recognised practitioner",
-                      "associate to watch", "up and coming", "star individual",
-                      "pab006", "pam006",
-                      "chambers global", "chambers latin america", "chambers asia",
-                      "chambers europe", "chambers usa",
+                      (3, "chambers.com"), (3, "myaccount.chambers.com"),
+                      (2, "chambers and partners"), (2, "chambers & partners"),
+                      (2, "band 1"), (2, "band 2"), (2, "band 3"), (2, "band 4"),
+                      (2, "ranked individual"), (2, "recognised practitioner"),
+                      (2, "star individual"), (2, "associate to watch"),
+                      (2, "pab006"), (2, "pam006"),
+                      (2, "chambers global"), (2, "chambers latin america"),
+                      (2, "chambers asia"), (2, "chambers europe"), (2, "chambers usa"),
+                      (1, "up and coming"), (1, "leading individual"),
                   ],
                   "iflr1000": [
-                      "iflr1000.com", "iflr.com", "accreditation.euromoney.com",
-                      "iflr1000", "market leader", "highly regarded",
-                      "notable practitioner", "rising star",
+                      (3, "iflr1000.com"), (3, "iflr.com"), (3, "accreditation.euromoney.com"),
+                      (3, "iflr1000"),
+                      (2, "market leader"), (2, "highly regarded"),
+                      (2, "notable practitioner"),
+                      (1, "rising star"),
                   ],
                   "legal500": [
-                      "legal500.com", "thelegal500.com", "the legal 500",
-                      "legal 500", "hall of fame",
-                      "next generation partner",
-                      "recommended lawyer", "tier 1", "tier 2", "tier 3",
+                      (3, "legal500.com"), (3, "thelegal500.com"),
+                      (2, "the legal 500"), (2, "legal 500"),
+                      (2, "hall of fame"), (2, "next generation partner"),
+                      (2, "recommended lawyer"),
+                      (1, "tier 1"), (1, "tier 2"), (1, "tier 3"),
                   ],
                   "itr": [
-                      "itrworldtax.com", "itr world tax", "international tax review",
-                      "world tax", "world transfer pricing",
-                      "tax controversy leaders", "indirect tax leaders",
-                      "women in tax leaders",
+                      (3, "itrworldtax.com"),
+                      (2, "itr world tax"), (2, "international tax review"),
+                      (2, "world tax"), (2, "world transfer pricing"),
+                      (2, "tax controversy leaders"), (2, "indirect tax leaders"),
+                      (2, "women in tax leaders"),
                   ],
                   "leadersleague": [
-                      "leadersleague.com", "leaders league", "décideurs",
-                      "decideurs", "classement", "peer feedback",
-                      "highly recommended",
-                      "strong reputation",
+                      (3, "leadersleague.com"), (3, "@leadersleague.com"),
+                      (2, "leaders league"),
+                      (2, "décideurs"), (2, "decideurs"), (2, "classement"),
+                      (2, "peer feedback"),
+                      (1, "highly recommended"), (1, "strong reputation"),
+                      (1, "rising star"),
                   ],
               }
 
-              for dir_name, keywords in content_patterns.items():
-                  for keyword in keywords:
+              # Score all directories
+              scores = {}
+              matched_keywords = {}
+              for dir_name, patterns in weighted_content_patterns.items():
+                  score = 0
+                  hits = []
+                  for weight, keyword in patterns:
                       if keyword in text_lower:
-                          directory_name = dir_name
-                          directory_source = "content"
-                          break
-                  if directory_name:
-                      break
+                          score += weight
+                          hits.append(keyword)
+                  scores[dir_name] = score
+                  if hits:
+                      matched_keywords[dir_name] = hits
+
+              # Pick winner with margin check
+              sorted_scores = sorted(scores.values(), reverse=True)
+              max_score = sorted_scores[0] if sorted_scores else 0
+              runner_up = sorted_scores[1] if len(sorted_scores) > 1 else 0
+
+              MIN_SCORE = 2    # at least 1 medium-weight keyword (or 2 low-weight)
+              MIN_MARGIN = 2   # must beat runner-up by 2+ points
+
+              if max_score >= MIN_SCORE and (max_score - runner_up) >= MIN_MARGIN:
+                  winner = max(scores, key=scores.get)
+                  directory_name = winner
+                  directory_source = "content"
+              # else: inconclusive — fall through to TIER 3 LLM classification
 
       # Year detection
       year_from_node = state.get("year") or ""
@@ -419,6 +441,7 @@ nodes:
       input_state:
         document_text: "{{ state.document_text }}"
         detected_directory: "{{ state.directory_name or '' }}"
+        pdf_path: "{{ state.storage_url }}"
     output: classification_invoke_result
 
   # Step 3c: Process classification result

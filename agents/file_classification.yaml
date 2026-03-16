@@ -9,6 +9,9 @@
 #   2. Known directory: Category/region/year extraction only (when directory
 #      was detected by TIER 1/2 but year was not)
 #
+# Input: PDF file (vision) preferred, falls back to document_text (plain text).
+# PDF provides logos, headers, and layout as additional classification signals.
+#
 # Story: 16.2 - TIER 3 LLM Classification Agent
 
 name: file_classification
@@ -16,10 +19,11 @@ description: |
   LLM-based classification of legal directory documents.
   Identifies directory, category, region, year, and form status
   when pattern-based detection (TIER 1+2) fails.
+  Uses PDF vision input when available for logo/layout signals.
 
 settings:
   llm:
-    model: gpt-5.2-chat
+    model: gpt-5.3-chat
     temperature: 1
     max_completion_tokens: 200
 
@@ -27,10 +31,18 @@ state_schema:
   # Input
   document_text:
     type: str
-    description: "First 3500 chars of document for classification"
+    description: "Full document text for classification (used for cache key and text fallback)"
   detected_directory:
     type: str
     description: "Pre-detected directory from TIER 1/2, or null"
+  pdf_path:
+    type: str
+    description: "Local path to PDF file for vision-based classification"
+
+  # Intermediate
+  llm_messages:
+    type: list
+    description: "Constructed messages array for LLM call (with PDF vision or text fallback)"
 
   # Cache
   cache_result:
@@ -98,6 +110,198 @@ nodes:
           "status": "success",
       }
 
+  # Step 0c: Build LLM messages — PDF pages as images (preferred) or text fallback
+  # Converts PDF pages to PNG via pymupdf for vision-based classification.
+  # Sends first 3 pages to keep token usage reasonable while capturing logos/headers.
+  - name: build_messages
+    run: |
+      import base64
+      import os
+      import logging
+
+      _logger = logging.getLogger(__name__)
+
+      detected_directory = state.get("detected_directory") or ""
+      pdf_path = state.get("pdf_path", "")
+      document_text = state.get("document_text", "")
+
+      MAX_PAGES = 3  # First 3 pages capture logos, headers, branding
+
+      # System prompt — XML-structured following Anthropic prompt engineering principles
+      if detected_directory:
+          system_content = (
+              "<general_context>\n"
+              "<persona>You are an expert legal document metadata extractor. You specialize in analyzing award submission forms "
+              f"from the {detected_directory} legal directory.</persona>\n"
+              "<main_objective>Extract the practice area category, geographic region, submission year, and form status from the document. "
+              "The directory is already known — focus only on metadata extraction.</main_objective>\n"
+              "<key_information>\n"
+              "  - The document is a legal directory award submission form.\n"
+              "  - If the document contains images, pay attention to logos, headers, and visual branding for context.\n"
+              "  - Forms may be in English or Brazilian Portuguese.\n"
+              "  - Region codes follow ISO 3166 standards.\n"
+              "</key_information>\n"
+              "</general_context>\n\n"
+              "<decision_policy>\n"
+              "<general_constraints>\n"
+              "  - DO NOT invent or guess a year if no year is clearly stated in the document. Return null.\n"
+              "  - DO NOT return any text outside the JSON object. No explanations, no markdown.\n"
+              "  - If the form is blank/empty (no firm name, no matters filled in), set is_empty_form to true.\n"
+              "  - Confidence must reflect your actual certainty: 0.9+ only when strong evidence is present.\n"
+              "</general_constraints>\n"
+              "<conditional_logic>\n"
+              "  - If the document mentions a specific year (e.g. '2025 submission', 'Year of Establishment: 2024'), extract that year.\n"
+              "  - If no year is found anywhere in the document, return year as null.\n"
+              "  - If the form has section headers but no content filled in, set is_empty_form to true.\n"
+              "  - If the document is in Portuguese and mentions Brazilian states, use BR- prefix for region_state (e.g. BR-MG, BR-SP).\n"
+              "</conditional_logic>\n"
+              "</decision_policy>\n\n"
+              "<output_format>\n"
+              "Return ONLY this JSON structure, nothing else:\n"
+              '{"category": "<practice area>", "region_country": "<ISO 3166-1 alpha-3>", '
+              '"region_state": "<ISO 3166-2 or empty string>", "confidence": <0.0-1.0>, "year": <int or null>, "is_empty_form": <bool>}\n'
+              "</output_format>\n\n"
+              "<practical_examples>\n"
+              "<positive_example>\n"
+              '{"category": "Arbitration", "region_country": "BRA", "region_state": "BR-MG", "confidence": 0.95, "year": 2025, "is_empty_form": false}\n'
+              "</positive_example>\n"
+              "<negative_example>\n"
+              '{"category": "Arbitration", "region_country": "Brazil", "region_state": "Minas Gerais", "confidence": 1.0, "year": 2025, "is_empty_form": false}\n'
+              "Error: region_country must be ISO 3166-1 alpha-3 (BRA not Brazil), region_state must be ISO 3166-2 (BR-MG not Minas Gerais), "
+              "confidence of 1.0 is never appropriate.\n"
+              "</negative_example>\n"
+              "</practical_examples>"
+          )
+      else:
+          system_content = (
+              "<general_context>\n"
+              "<persona>You are an expert legal document classifier specialized in identifying which legal directory "
+              "a submission form belongs to. You have deep knowledge of the 5 major legal directories that rank law firms "
+              "in Latin America and globally.</persona>\n"
+              "<main_objective>Classify the document into exactly one of 5 supported legal directories, extract the practice area, "
+              "geographic region, submission year, and whether it is an empty form. Pay close attention to logos, headers, "
+              "formatting, URLs, email addresses, and visual branding — these are the strongest classification signals.</main_objective>\n"
+              "<key_information>\n"
+              "  - Documents are award submission forms from law firms in Latin America (primarily Brazil).\n"
+              "  - Forms may be in English or Brazilian Portuguese.\n"
+              "  - Each directory has unique visual branding, form structure, and terminology.\n"
+              "  - Some keywords like 'rising star' appear across multiple directories — do NOT rely on a single keyword.\n"
+              "  - The strongest signals are: URLs/domains, logos, email addresses, and directory-specific ranking terminology.\n"
+              "</key_information>\n"
+              "</general_context>\n\n"
+              "<directories>\n"
+              "<directory slug=\"chambers\">\n"
+              "  <name>Chambers and Partners</name>\n"
+              "  <strong_signals>chambers.com, myaccount.chambers.com, Chambers logo</strong_signals>\n"
+              "  <terminology>Band 1/2/3/4, Ranked Individual, Recognised Practitioner, Star Individual, Associate to Watch, "
+              "Up and Coming, PAB006, PAM006</terminology>\n"
+              "  <editions>Chambers Global, Chambers Latin America, Chambers Asia, Chambers Europe, Chambers USA</editions>\n"
+              "</directory>\n"
+              "<directory slug=\"iflr1000\">\n"
+              "  <name>IFLR1000</name>\n"
+              "  <strong_signals>iflr1000.com, iflr.com, accreditation.euromoney.com, IFLR logo</strong_signals>\n"
+              "  <terminology>Market Leader, Highly Regarded, Notable Practitioner, Rising Star (also used by Leaders League)</terminology>\n"
+              "</directory>\n"
+              "<directory slug=\"legal500\">\n"
+              "  <name>The Legal 500</name>\n"
+              "  <strong_signals>legal500.com, thelegal500.com, Legal 500 logo</strong_signals>\n"
+              "  <terminology>Tier 1/2/3, Hall of Fame, Next Generation Partner, Recommended Lawyer, Leading Individual</terminology>\n"
+              "</directory>\n"
+              "<directory slug=\"itr\">\n"
+              "  <name>International Tax Review (ITR World Tax)</name>\n"
+              "  <strong_signals>itrworldtax.com, ITR logo</strong_signals>\n"
+              "  <terminology>World Tax, World Transfer Pricing, Tax Controversy Leaders, Indirect Tax Leaders, Women in Tax Leaders</terminology>\n"
+              "</directory>\n"
+              "<directory slug=\"leadersleague\">\n"
+              "  <name>Leaders League</name>\n"
+              "  <strong_signals>leadersleague.com, @leadersleague.com email addresses, Leaders League logo</strong_signals>\n"
+              "  <terminology>Décideurs, Classement, Peer Feedback, Highly Recommended, Strong Reputation, Rising Star (also used by IFLR1000)</terminology>\n"
+              "  <form_characteristics>Questions about 'rising stars', 'peer feedback' sections, matter submissions with French-influenced structure</form_characteristics>\n"
+              "</directory>\n"
+              "</directories>\n\n"
+              "<decision_policy>\n"
+              "<general_constraints>\n"
+              "  - DO NOT classify based on a single ambiguous keyword. 'Rising star' alone is NOT enough to choose IFLR1000 or Leaders League.\n"
+              "  - DO NOT return any text outside the JSON object. No explanations, no markdown, no commentary.\n"
+              "  - DO NOT invent or guess a year if no year is clearly stated. Return null.\n"
+              "  - DO NOT set confidence above 0.95 unless you found a URL, logo, or email domain that uniquely identifies the directory.\n"
+              "  - The directory slug MUST be exactly one of: chambers, iflr1000, legal500, itr, leadersleague.\n"
+              "</general_constraints>\n"
+              "<conditional_logic>\n"
+              "  - If you see a URL or email domain (e.g. leadersleague.com, chambers.com), that is the strongest signal — classify accordingly with high confidence.\n"
+              "  - If you see a logo matching a known directory, classify accordingly with confidence >= 0.9.\n"
+              "  - If you see only ambiguous keywords (e.g. 'rising star' without any URL/logo), classify based on the overall form structure but set confidence <= 0.7.\n"
+              "  - If you cannot confidently identify the directory, still make your best guess but set confidence < 0.5.\n"
+              "  - If the form is blank/empty (section headers but no content filled in), set is_empty_form to true.\n"
+              "  - If the document is in Portuguese and mentions Brazilian states, use BR- prefix for region_state (e.g. BR-MG, BR-SP).\n"
+              "</conditional_logic>\n"
+              "</decision_policy>\n\n"
+              "<output_format>\n"
+              "Return ONLY this JSON structure, nothing else:\n"
+              '{"directory": "<slug>", "category": "<practice area>", "region_country": "<ISO 3166-1 alpha-3>", '
+              '"region_state": "<ISO 3166-2 or empty string>", "confidence": <0.0-1.0>, "year": <int or null>, "is_empty_form": <bool>}\n'
+              "</output_format>\n\n"
+              "<practical_examples>\n"
+              "<positive_example>\n"
+              "Document with leadersleague.com URL in footer and 'Peer Feedback' section:\n"
+              '{"directory": "leadersleague", "category": "Arbitration", "region_country": "BRA", "region_state": "", "confidence": 0.99, "year": 2025, "is_empty_form": false}\n'
+              "</positive_example>\n"
+              "<positive_example>\n"
+              "Document with 'Band 1' rankings and myaccount.chambers.com link:\n"
+              '{"directory": "chambers", "category": "Corporate/M&A", "region_country": "BRA", "region_state": "BR-MG", "confidence": 0.98, "year": 2026, "is_empty_form": false}\n'
+              "</positive_example>\n"
+              "<negative_example>\n"
+              "Document only mentions 'rising star' with no URL/logo — classified as IFLR1000 with high confidence:\n"
+              '{"directory": "iflr1000", "category": "Dispute Resolution", "region_country": "BRA", "region_state": "", "confidence": 0.95, "year": null, "is_empty_form": false}\n'
+              "Error: 'rising star' is ambiguous (used by both IFLR1000 and Leaders League). Without a URL or logo, confidence should be <= 0.7, "
+              "and the form structure should be analyzed to determine the correct directory.\n"
+              "</negative_example>\n"
+              "</practical_examples>\n\n"
+              "<final_reinforcement>\n"
+              "Remember: URLs, email domains, and logos are the strongest signals. A single ambiguous keyword is never sufficient for high-confidence classification. "
+              "The directory slug must be exactly one of: chambers, iflr1000, legal500, itr, leadersleague.\n"
+              "</final_reinforcement>"
+          )
+
+      # User message — PDF page images or text fallback
+      use_pdf = pdf_path and os.path.exists(pdf_path)
+      if use_pdf:
+          try:
+              import fitz  # pymupdf
+              doc = fitz.open(pdf_path)
+              page_count = min(len(doc), MAX_PAGES)
+
+              content_parts = [
+                  {"type": "text", "text": f"Classify this legal directory document ({len(doc)} pages, showing first {page_count}):"},
+              ]
+
+              for i in range(page_count):
+                  page = doc[i]
+                  # Render at 150 DPI (good balance of quality vs token cost)
+                  pix = page.get_pixmap(dpi=150)
+                  png_bytes = pix.tobytes("png")
+                  b64 = base64.b64encode(png_bytes).decode("utf-8")
+                  content_parts.append({
+                      "type": "image_url",
+                      "image_url": {"url": f"data:image/png;base64,{b64}"},
+                  })
+
+              doc.close()
+              user_content = content_parts
+              _logger.info(f"TIER 3: Using PDF vision input ({page_count} pages as PNG from {pdf_path})")
+          except Exception as e:
+              _logger.warning(f"TIER 3: Failed to render PDF {pdf_path}: {e}, falling back to text")
+              user_content = document_text
+      else:
+          user_content = document_text
+
+      messages = [
+          {"role": "system", "content": system_content},
+          {"role": "user", "content": user_content},
+      ]
+
+      return {"llm_messages": messages}
+
   # Step 1: Classify document using LLM
   - name: classify_document
     uses: ratelimit.wrap
@@ -109,23 +313,7 @@ nodes:
         model: "{{ settings.llm.model }}"
         temperature: "{{ settings.llm.temperature }}"
         max_completion_tokens: "{{ settings.llm.max_completion_tokens }}"
-        messages:
-          - role: system
-            content: >-
-              {% if state.detected_directory %}You are a legal document classifier. The document is from the {{ state.detected_directory }} legal directory. Extract the practice area category, region (country as ISO 3166-1 alpha-3 code, state as ISO 3166-2 code if applicable), year of the submission/ranking, and whether this is an empty/blank form.
-
-              Return ONLY valid JSON: {"category": "<practice area>", "region_country": "<ISO 3166-1 alpha-3>", "region_state": "<ISO 3166-2 or empty string>", "confidence": <0.0-1.0>, "year": <int or null>, "is_empty_form": <bool>}{% else %}You are a legal document classifier. Analyze the following document text and classify it into one of the supported legal directories.
-
-              SUPPORTED DIRECTORIES:
-              1. chambers (Chambers & Partners) — Indicators: Band rankings (Band 1-4), PAB006/PAM006 reference codes, "Chambers Global/Latin America/Asia/Europe/USA", myaccount.chambers.com
-              2. iflr1000 (IFLR1000) — Indicators: "Market Leader", "Highly Regarded", "Notable Practitioner", "Rising Star", accreditation.euromoney.com, iflr1000.com
-              3. legal500 (The Legal 500) — Indicators: Tier rankings (Tier 1-3), "Hall of Fame", "Next Generation Partner", thelegal500.com, legal500.com
-              4. itr (International Tax Review) — Indicators: "World Tax", "World Transfer Pricing", "Tax Controversy Leaders", itrworldtax.com
-              5. leadersleague (Leaders League) — Indicators: "Décideurs", "Classement", "Peer Feedback", leadersleague.com
-
-              Return ONLY valid JSON: {"directory": "<slug>", "category": "<practice area>", "region_country": "<ISO 3166-1 alpha-3>", "region_state": "<ISO 3166-2 or empty string>", "confidence": <0.0-1.0>, "year": <int or null>, "is_empty_form": <bool>}{% endif %}
-          - role: user
-            content: "{{ state.document_text }}"
+        messages: "{{ state.llm_messages }}"
     output: llm_result
 
   # Step 2: Parse LLM response and resolve ISO codes
@@ -249,8 +437,10 @@ edges:
     to: apply_cache
     condition: "{{ state.cache_result and state.cache_result.hit }}"
   - from: check_cache
-    to: classify_document
+    to: build_messages
     condition: "{{ not state.cache_result or not state.cache_result.hit }}"
+  - from: build_messages
+    to: classify_document
   - from: classify_document
     to: parse_result
   - from: parse_result
