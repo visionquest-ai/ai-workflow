@@ -70,6 +70,7 @@ This document provides the complete epic and story breakdown for ai-workflow, im
 | 1 | Law Firm Website Scraper Agent | 3 | P0 (done) |
 | 15 | File Extraction Button Trigger with PathNode Input Mapping | 3 | P0 |
 | 16 | Automatic File Classification for Directory & Year Detection | 3 | P0 |
+| 17 | Directory Enrichment & Fuzzy Matching | 9 | P0 (done) |
 
 ---
 
