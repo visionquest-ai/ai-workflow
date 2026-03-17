@@ -59,6 +59,7 @@ query GetWorkflowQuestions($workflowId: ID!) {
           versionNumber
           status
           content
+          systemPrompt
         }
       }
     }
@@ -188,6 +189,7 @@ def _flatten_questions(workflow_data: dict) -> List[dict]:
                     "versionId": version.get("id"),
                     "versionNumber": version.get("versionNumber"),
                     "content": version.get("content", ""),
+                    "systemPrompt": version.get("systemPrompt", ""),
                     "stepName": step_name,
                     "stepOrder": step_order,
                 })

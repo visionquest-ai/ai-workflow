@@ -37,7 +37,7 @@ description: |
 
 settings:
   llm:
-    model: gpt-5.2-chat
+    model: gpt-5.3-chat
     temperature: 1
   parallel:
     max_concurrency: 5
@@ -46,6 +46,12 @@ settings:
       rpm: 60
   opik:
     project_name: "import-matter-qa"
+  # Response control — governs tone, verbosity, and accuracy of QA answers
+  response:
+    mode: extractive         # extractive = only from document | generative = may infer
+    verbosity: concise       # concise | balanced | detailed
+    format: direct           # direct = plain answer | structured = with headers/bullets
+    language: match_source   # match_source = same as document | pt-br | en
 
 state_schema:
   # Input (required)
@@ -114,13 +120,7 @@ nodes:
           messages:
             - role: system
               content: >-
-                {{ state.system_prompt | default(
-                  'You are an expert legal analyst. You will be given a matter document '
-                  'as context and a specific question about that matter. Answer the question '
-                  'based on the provided context with clear, detailed, and well-structured '
-                  'responses. Focus on the specific aspects requested.',
-                  true
-                ) }}
+                {{ state.prompt.systemPrompt or state.system_prompt }}
             - role: user
               content: >-
                 {% set context = state.matter_context or (state.context_result.data_json if state.context_result else '') %}{% if context %}MATTER CONTEXT:
