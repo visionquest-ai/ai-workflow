@@ -937,6 +937,7 @@ nodes:
     run: |
       import json
       import os
+      import time
       import logging
 
       logger = logging.getLogger(__name__)
@@ -948,118 +949,138 @@ nodes:
 
       directory_id = state.get("directory_id", "")
 
-      try:
-          # 1. Query PracticeArea nodes from graph
-          gql_url = (
-              state.get("variables", {}).get("GRAPHOLOGY_URL")
-              or os.environ.get("GRAPHOLOGY_URL")
-              or "http://localhost:4000"
-          )
-          gql_api_key = (
-              state.get("variables", {}).get("GRAPHOLOGY_API_KEY")
-              or os.environ.get("GRAPHOLOGY_API_KEY")
-          )
-          headers = {"Content-Type": "application/json"}
-          if gql_api_key:
-              headers["x-api-key"] = gql_api_key
+      # Resolve GraphQL connection (consistent pattern across all steps)
+      gql_url = (
+          state.get("variables", {}).get("GRAPHOLOGY_URL")
+          or os.environ.get("GRAPHOLOGY_URL")
+          or os.environ.get("GRAPHQL_ENDPOINT")
+          or "http://localhost:4000"
+      )
+      gql_api_key = (
+          state.get("variables", {}).get("GRAPHOLOGY_API_KEY")
+          or os.environ.get("GRAPHOLOGY_API_KEY")
+          or os.environ.get("GRAPHQL_API_KEY")
+      )
 
-          # Filter by directory if directory_id is available
-          if directory_id:
-              query = '''
-              query GetPracticeAreasByDirectory($directoryId: ID!) {
-                practiceArea(where: { practiceAreaInDirectory_SOME: { id_EQ: $directoryId } }) {
-                  id
-                  name
-                  hints
-                }
-              }
-              '''
-              variables = {"directoryId": directory_id}
-          else:
-              query = '''
-              query GetAllPracticeAreas {
-                practiceArea {
-                  id
-                  name
-                  hints
-                }
-              }
-              '''
-              variables = {}
+      MAX_RETRIES = 2
+      RETRY_DELAY = 2
 
-          import requests
-          resp = requests.post(
-              gql_url,
-              json={"query": query, "variables": variables},
-              timeout=30,
-              headers=headers,
-          )
-          resp.raise_for_status()
-          data = resp.json().get("data", {})
-          practice_areas = data.get("practiceArea", [])
+      for attempt in range(1, MAX_RETRIES + 1):
+          try:
+              headers = {"Content-Type": "application/json"}
+              if gql_api_key:
+                  headers["x-api-key"] = gql_api_key
 
-          if not practice_areas:
-              logger.warning(
-                  "resolve_practice_area: No PracticeArea nodes returned from graph "
-                  "(directory_id=%s)", directory_id
+              # Filter by directory if directory_id is available
+              if directory_id:
+                  query = '''
+                  query GetPracticeAreasByDirectory($directoryId: ID!) {
+                    practiceArea(where: { practiceAreaInDirectory_SOME: { id_EQ: $directoryId } }) {
+                      id
+                      name
+                      hints
+                    }
+                  }
+                  '''
+                  variables = {"directoryId": directory_id}
+              else:
+                  query = '''
+                  query GetAllPracticeAreas {
+                    practiceArea {
+                      id
+                      name
+                      hints
+                    }
+                  }
+                  '''
+                  variables = {}
+
+              import requests
+              resp = requests.post(
+                  gql_url,
+                  json={"query": query, "variables": variables},
+                  timeout=30,
+                  headers=headers,
               )
-              return {"practice_area_match": {}}
+              resp.raise_for_status()
+              data = resp.json().get("data", {})
+              practice_areas = data.get("practiceArea", [])
 
-          # 2. Build master list for fuzzy matching
-          master_list = [
-              {
-                  "name": pa["name"],
-                  "id": pa["id"],
-                  "hints": pa.get("hints") or "",
-              }
-              for pa in practice_areas
-          ]
-
-          # 3. Import and run fuzzy matcher (from Story 2.1)
-          from actions.fuzzy_match import fuzzy_match
-          result = fuzzy_match(extracted_pa, master_list)
-
-          # 4. Save to ApplicationFormFile if match found
-          if result.get("matched_name"):
-              context_node_id = state.get("context_node_id", "")
-              if not context_node_id:
+              if not practice_areas:
                   logger.warning(
-                      "resolve_practice_area: match found but context_node_id missing, "
-                      "cannot persist to ApplicationFormFile"
+                      "resolve_practice_area: No PracticeArea nodes returned from graph "
+                      "(directory_id=%s, url=%s)", directory_id, gql_url
+                  )
+                  return {"practice_area_match": {}}
+
+              # 2. Build master list for fuzzy matching
+              master_list = [
+                  {
+                      "name": pa["name"],
+                      "id": pa["id"],
+                      "hints": pa.get("hints") or "",
+                  }
+                  for pa in practice_areas
+              ]
+
+              # 3. Import and run fuzzy matcher (from Story 2.1)
+              from actions.fuzzy_match import fuzzy_match
+              result = fuzzy_match(extracted_pa, master_list)
+
+              # 4. Save to ApplicationFormFile if match found
+              if result.get("matched_name"):
+                  context_node_id = state.get("context_node_id", "")
+                  if not context_node_id:
+                      logger.warning(
+                          "resolve_practice_area: match found but context_node_id missing, "
+                          "cannot persist to ApplicationFormFile"
+                      )
+                  else:
+                      try:
+                          update_result = actions["graphology.update_node"](
+                              state=state,
+                              node_id=context_node_id,
+                              node_type="ApplicationFormFile",
+                              updates={
+                                  "practiceAreaName": result["matched_name"],
+                                  "practiceAreaId": result["matched_id"],
+                              },
+                              graphql_url=gql_url,
+                              graphql_api_key=gql_api_key,
+                          )
+                          if not update_result.get("success"):
+                              logger.warning(
+                                  "resolve_practice_area: update_node failed (url=%s): %s",
+                                  gql_url, update_result.get("error", "unknown"),
+                              )
+                      except Exception as ue:
+                          logger.warning("resolve_practice_area: update_node exception (url=%s): %s", gql_url, ue)
+                  logger.info(
+                      "resolve_practice_area: Matched '%s' -> '%s' (id=%s, score=%.4f, tier=%s)",
+                      extracted_pa, result["matched_name"], result["matched_id"],
+                      result.get("score", 0), result.get("tier", "unknown"),
                   )
               else:
-                  update_result = actions["graphology.update_node"](
-                      state=state,
-                      node_id=context_node_id,
-                      node_type="ApplicationFormFile",
-                      updates={
-                          "practiceAreaName": result["matched_name"],
-                          "practiceAreaId": result["matched_id"],
-                      },
-                      graphql_url=gql_url,
-                      graphql_api_key=gql_api_key,
+                  logger.warning(
+                      "resolve_practice_area: No match for '%s'. Tier: %s",
+                      extracted_pa, result.get("tier", "unknown"),
                   )
-                  if not update_result.get("success"):
-                      logger.warning(
-                          "resolve_practice_area: update_node failed: %s",
-                          update_result.get("error", "unknown"),
-                      )
-              logger.info(
-                  "resolve_practice_area: Matched '%s' -> '%s' (id=%s, score=%.4f, tier=%s)",
-                  extracted_pa, result["matched_name"], result["matched_id"],
-                  result.get("score", 0), result.get("tier", "unknown"),
-              )
-          else:
-              logger.warning(
-                  "resolve_practice_area: No match for '%s'. Tier: %s",
-                  extracted_pa, result.get("tier", "unknown"),
-              )
 
-          return {"practice_area_match": result}
+              return {"practice_area_match": result}
 
-      except Exception as e:
-          logger.warning("resolve_practice_area: Failed (best-effort): %s", e)
-          return {"practice_area_match": {}}
+          except Exception as e:
+              if attempt < MAX_RETRIES:
+                  logger.warning(
+                      "resolve_practice_area: attempt %d/%d failed (url=%s): %s — retrying in %ds",
+                      attempt, MAX_RETRIES, gql_url, e, RETRY_DELAY,
+                  )
+                  time.sleep(RETRY_DELAY)
+              else:
+                  logger.warning(
+                      "resolve_practice_area: all %d attempts failed (url=%s): %s",
+                      MAX_RETRIES, gql_url, e,
+                  )
+                  return {"practice_area_match": {}}
 
   # Step 5d: Derive LegalField from matched PracticeArea via graph traversal (Story 2.4)
   - name: derive_legal_field
@@ -1067,6 +1088,7 @@ nodes:
       - to: resolve_region
     run: |
       import os
+      import time
       import logging
 
       logger = logging.getLogger(__name__)
@@ -1078,18 +1100,18 @@ nodes:
           logger.debug("derive_legal_field: no practiceAreaId, skipping")
           return {"legal_field_name": [], "legal_field_id": []}
 
+      # Resolve GraphQL connection (consistent pattern across all steps)
       gql_url = (
           state.get("variables", {}).get("GRAPHOLOGY_URL")
           or os.environ.get("GRAPHOLOGY_URL")
+          or os.environ.get("GRAPHQL_ENDPOINT")
           or "http://localhost:4000"
       )
       gql_api_key = (
           state.get("variables", {}).get("GRAPHOLOGY_API_KEY")
           or os.environ.get("GRAPHOLOGY_API_KEY")
+          or os.environ.get("GRAPHQL_API_KEY")
       )
-      headers = {"Content-Type": "application/json"}
-      if gql_api_key:
-          headers["x-api-key"] = gql_api_key
 
       query = '''
       query GetLegalField($paId: ID!) {
@@ -1102,58 +1124,79 @@ nodes:
       }
       '''
 
+      MAX_RETRIES = 2
+      RETRY_DELAY = 2
+
       import requests as req
-      try:
-          resp = req.post(
-              gql_url,
-              json={"query": query, "variables": {"paId": pa_id}},
-              timeout=30,
-              headers=headers,
-          )
-          resp.raise_for_status()
-          data = resp.json().get("data", {})
-          pas = data.get("practiceArea", [])
+      for attempt in range(1, MAX_RETRIES + 1):
+          try:
+              headers = {"Content-Type": "application/json"}
+              if gql_api_key:
+                  headers["x-api-key"] = gql_api_key
 
-          if pas and pas[0].get("practiceAreaHasLegalField"):
-              lf_list = pas[0]["practiceAreaHasLegalField"]
-              if not isinstance(lf_list, list):
-                  lf_list = [lf_list]
-              if lf_list:
-                  lf_names = [lf.get("name", "") for lf in lf_list if lf.get("name")]
-                  lf_ids = [lf.get("id", "") for lf in lf_list if lf.get("id")]
+              resp = req.post(
+                  gql_url,
+                  json={"query": query, "variables": {"paId": pa_id}},
+                  timeout=30,
+                  headers=headers,
+              )
+              resp.raise_for_status()
+              data = resp.json().get("data", {})
+              pas = data.get("practiceArea", [])
 
-                  # Persist to ApplicationFormFile (now [String] arrays)
-                  context_node_id = state.get("context_node_id", "")
-                  if context_node_id and lf_names:
-                      update_result = actions["graphology.update_node"](
-                          state=state,
-                          node_id=context_node_id,
-                          node_type="ApplicationFormFile",
-                          updates={
-                              "legalFieldName": lf_names,
-                              "legalFieldId": lf_ids,
-                          },
-                          graphql_url=gql_url,
-                          graphql_api_key=gql_api_key,
+              if pas and pas[0].get("practiceAreaHasLegalField"):
+                  lf_list = pas[0]["practiceAreaHasLegalField"]
+                  if not isinstance(lf_list, list):
+                      lf_list = [lf_list]
+                  if lf_list:
+                      lf_names = [lf.get("name", "") for lf in lf_list if lf.get("name")]
+                      lf_ids = [lf.get("id", "") for lf in lf_list if lf.get("id")]
+
+                      # Persist to ApplicationFormFile (now [String] arrays)
+                      context_node_id = state.get("context_node_id", "")
+                      if context_node_id and lf_names:
+                          try:
+                              update_result = actions["graphology.update_node"](
+                                  state=state,
+                                  node_id=context_node_id,
+                                  node_type="ApplicationFormFile",
+                                  updates={
+                                      "legalFieldName": lf_names,
+                                      "legalFieldId": lf_ids,
+                                  },
+                                  graphql_url=gql_url,
+                                  graphql_api_key=gql_api_key,
+                              )
+                              if not update_result.get("success"):
+                                  logger.warning(
+                                      "derive_legal_field: update_node failed (url=%s): %s",
+                                      gql_url, update_result.get("error", "unknown"),
+                                  )
+                          except Exception as ue:
+                              logger.warning("derive_legal_field: update_node exception (url=%s): %s", gql_url, ue)
+
+                      logger.info(
+                          "derive_legal_field: Found %d LegalField(s): %s",
+                          len(lf_names), lf_names,
                       )
-                      if not update_result.get("success"):
-                          logger.warning(
-                              "derive_legal_field: update_node failed: %s",
-                              update_result.get("error", "unknown"),
-                          )
+                      return {"legal_field_name": lf_names, "legal_field_id": lf_ids}
 
-                  logger.info(
-                      "derive_legal_field: Found %d LegalField(s): %s",
-                      len(lf_names), lf_names,
+              logger.warning("derive_legal_field: No LegalField found for PracticeArea %s", pa_id)
+              return {"legal_field_name": [], "legal_field_id": []}
+
+          except Exception as e:
+              if attempt < MAX_RETRIES:
+                  logger.warning(
+                      "derive_legal_field: attempt %d/%d failed (url=%s): %s — retrying in %ds",
+                      attempt, MAX_RETRIES, gql_url, e, RETRY_DELAY,
                   )
-                  return {"legal_field_name": lf_names, "legal_field_id": lf_ids}
-
-          logger.warning("derive_legal_field: No LegalField found for PracticeArea %s", pa_id)
-          return {"legal_field_name": [], "legal_field_id": []}
-
-      except Exception as e:
-          logger.warning("derive_legal_field: GraphQL query failed: %s", e)
-          return {"legal_field_name": [], "legal_field_id": []}
+                  time.sleep(RETRY_DELAY)
+              else:
+                  logger.warning(
+                      "derive_legal_field: all %d attempts failed (url=%s): %s",
+                      MAX_RETRIES, gql_url, e,
+                  )
+                  return {"legal_field_name": [], "legal_field_id": []}
 
   # Step 5e: Resolve Region via fuzzy matching against graph Region nodes (Story 3.2)
   - name: resolve_region
@@ -1161,6 +1204,7 @@ nodes:
       - to: extract_firm_department
     run: |
       import os
+      import time
       import logging
 
       logger = logging.getLogger(__name__)
@@ -1170,119 +1214,136 @@ nodes:
           logger.debug("resolve_region: no extracted_region, skipping")
           return {"region_match": {}}
 
-      try:
-          # 1. Resolve GraphQL URL and API key
-          gql_url = (
-              state.get("variables", {}).get("GRAPHOLOGY_URL")
-              or os.environ.get("GRAPHOLOGY_URL")
-              or "http://localhost:4000"
-          )
-          gql_api_key = (
-              state.get("variables", {}).get("GRAPHOLOGY_API_KEY")
-              or os.environ.get("GRAPHOLOGY_API_KEY")
-          )
-          headers = {"Content-Type": "application/json"}
-          if gql_api_key:
-              headers["x-api-key"] = gql_api_key
+      # Resolve GraphQL connection (consistent pattern across all steps)
+      gql_url = (
+          state.get("variables", {}).get("GRAPHOLOGY_URL")
+          or os.environ.get("GRAPHOLOGY_URL")
+          or os.environ.get("GRAPHQL_ENDPOINT")
+          or "http://localhost:4000"
+      )
+      gql_api_key = (
+          state.get("variables", {}).get("GRAPHOLOGY_API_KEY")
+          or os.environ.get("GRAPHOLOGY_API_KEY")
+          or os.environ.get("GRAPHQL_API_KEY")
+      )
 
-          # 2. Query all Region nodes (no directory filter — regions are global)
-          query = '''
-          query GetAllRegions {
-            region {
-              id
-              name
-              hints
-            }
-          }
-          '''
+      MAX_RETRIES = 2
+      RETRY_DELAY = 2
 
-          import requests
-          resp = requests.post(
-              gql_url,
-              json={"query": query, "variables": {}},
-              timeout=30,
-              headers=headers,
-          )
-          resp.raise_for_status()
-          data = resp.json().get("data", {})
-          regions = data.get("region", [])
+      for attempt in range(1, MAX_RETRIES + 1):
+          try:
+              headers = {"Content-Type": "application/json"}
+              if gql_api_key:
+                  headers["x-api-key"] = gql_api_key
 
-          if not regions:
-              logger.warning(
-                  "resolve_region: No Region nodes returned from graph"
-              )
-              return {"region_match": {}}
-
-          # 3. Build master list for fuzzy matching
-          master_list = [
-              {
-                  "name": r["name"],
-                  "id": r["id"],
-                  "hints": r.get("hints") or "",
+              # Query all Region nodes (no directory filter — regions are global)
+              query = '''
+              query GetAllRegions {
+                region {
+                  id
+                  name
+                  hints
+                }
               }
-              for r in regions
-          ]
+              '''
 
-          # 4. Import and run fuzzy matcher (from Story 2.1)
-          from actions.fuzzy_match import fuzzy_match
-          result = fuzzy_match(extracted_region, master_list)
+              import requests
+              resp = requests.post(
+                  gql_url,
+                  json={"query": query, "variables": {}},
+                  timeout=30,
+                  headers=headers,
+              )
+              resp.raise_for_status()
+              data = resp.json().get("data", {})
+              regions = data.get("region", [])
 
-          # 5. Save to ApplicationFormFile if match found
-          if result.get("matched_name"):
-              context_node_id = state.get("context_node_id", "")
-              # Build regionName using canonical names for both levels
-              # e.g. "Brazil, Southeast" (not raw "Brazil - Regional, Minas Gerais")
-              region_context_raw = state.get("extracted_region_context", "")
-              if region_context_raw:
-                  ctx_result = fuzzy_match(region_context_raw, master_list)
-                  ctx_name = ctx_result.get("matched_name", "")
-                  if ctx_name and ctx_name != result["matched_name"]:
-                      region_display = f"{ctx_name}, {result['matched_name']}"
+              if not regions:
+                  logger.warning(
+                      "resolve_region: No Region nodes returned from graph (url=%s)", gql_url
+                  )
+                  return {"region_match": {}}
+
+              # Build master list for fuzzy matching
+              master_list = [
+                  {
+                      "name": r["name"],
+                      "id": r["id"],
+                      "hints": r.get("hints") or "",
+                  }
+                  for r in regions
+              ]
+
+              # Import and run fuzzy matcher (from Story 2.1)
+              from actions.fuzzy_match import fuzzy_match
+              result = fuzzy_match(extracted_region, master_list)
+
+              # Save to ApplicationFormFile if match found
+              if result.get("matched_name"):
+                  context_node_id = state.get("context_node_id", "")
+                  # Build regionName using canonical names for both levels
+                  # e.g. "Brazil, Southeast" (not raw "Brazil - Regional, Minas Gerais")
+                  region_context_raw = state.get("extracted_region_context", "")
+                  if region_context_raw:
+                      ctx_result = fuzzy_match(region_context_raw, master_list)
+                      ctx_name = ctx_result.get("matched_name", "")
+                      if ctx_name and ctx_name != result["matched_name"]:
+                          region_display = f"{ctx_name}, {result['matched_name']}"
+                      else:
+                          region_display = result["matched_name"]
                   else:
                       region_display = result["matched_name"]
-              else:
-                  region_display = result["matched_name"]
-              if not context_node_id:
-                  logger.warning(
-                      "resolve_region: match found but context_node_id missing, "
-                      "cannot persist to ApplicationFormFile"
+                  if not context_node_id:
+                      logger.warning(
+                          "resolve_region: match found but context_node_id missing, "
+                          "cannot persist to ApplicationFormFile"
+                      )
+                  else:
+                      try:
+                          update_result = actions["graphology.update_node"](
+                              state=state,
+                              node_id=context_node_id,
+                              node_type="ApplicationFormFile",
+                              updates={
+                                  "regionName": region_display,
+                                  "regionId": result["matched_id"],
+                              },
+                              graphql_url=gql_url,
+                              graphql_api_key=gql_api_key,
+                          )
+                          if not update_result.get("success"):
+                              logger.warning(
+                                  "resolve_region: update_node failed (url=%s): %s",
+                                  gql_url, update_result.get("error", "unknown"),
+                              )
+                      except Exception as ue:
+                          logger.warning("resolve_region: update_node exception (url=%s): %s", gql_url, ue)
+                  logger.info(
+                      "resolve_region: Matched '%s' -> '%s' (id=%s, score=%.4f, tier=%s)",
+                      extracted_region, result["matched_name"], result["matched_id"],
+                      result.get("score", 0), result.get("tier", "unknown"),
                   )
               else:
-                  try:
-                      update_result = actions["graphology.update_node"](
-                          state=state,
-                          node_id=context_node_id,
-                          node_type="ApplicationFormFile",
-                          updates={
-                              "regionName": region_display,
-                              "regionId": result["matched_id"],
-                          },
-                          graphql_url=gql_url,
-                          graphql_api_key=gql_api_key,
-                      )
-                      if not update_result.get("success"):
-                          logger.warning(
-                              "resolve_region: update_node failed: %s",
-                              update_result.get("error", "unknown"),
-                          )
-                  except Exception as ue:
-                      logger.warning("resolve_region: update_node exception: %s", ue)
-              logger.info(
-                  "resolve_region: Matched '%s' -> '%s' (id=%s, score=%.4f, tier=%s)",
-                  extracted_region, result["matched_name"], result["matched_id"],
-                  result.get("score", 0), result.get("tier", "unknown"),
-              )
-          else:
-              logger.warning(
-                  "resolve_region: No match for '%s'. Tier: %s",
-                  extracted_region, result.get("tier", "unknown"),
-              )
+                  logger.warning(
+                      "resolve_region: No match for '%s'. Tier: %s",
+                      extracted_region, result.get("tier", "unknown"),
+                  )
 
-          return {"region_match": result}
+              return {"region_match": result}
 
-      except Exception as e:
-          logger.warning("resolve_region: Failed (best-effort): %s", e)
-          return {"region_match": {}}
+          except Exception as e:
+              if attempt < MAX_RETRIES:
+                  logger.warning(
+                      "resolve_region: attempt %d/%d failed (url=%s): %s — retrying in %ds",
+                      attempt, MAX_RETRIES, gql_url, e, RETRY_DELAY,
+                  )
+                  time.sleep(RETRY_DELAY)
+              else:
+                  logger.warning(
+                      "resolve_region: all %d attempts failed (url=%s): %s",
+                      MAX_RETRIES, gql_url, e,
+                  )
+                  return {"region_match": {}}
 
   # Step 5f: Extract fileFirm and fileDepartment from payload
   - name: extract_firm_department
@@ -1338,8 +1399,18 @@ nodes:
 
       if firm_name or department_name:
           import os
-          gql_url = state.get("graphql_url") or os.environ.get("GRAPHOLOGY_URL", "")
-          gql_api_key = os.environ.get("GRAPHOLOGY_API_KEY", "")
+          # Resolve GraphQL connection (consistent pattern across all steps)
+          gql_url = (
+              state.get("variables", {}).get("GRAPHOLOGY_URL")
+              or os.environ.get("GRAPHOLOGY_URL")
+              or os.environ.get("GRAPHQL_ENDPOINT")
+              or "http://localhost:4000"
+          )
+          gql_api_key = (
+              state.get("variables", {}).get("GRAPHOLOGY_API_KEY")
+              or os.environ.get("GRAPHOLOGY_API_KEY")
+              or os.environ.get("GRAPHQL_API_KEY")
+          )
           context_node_id = state.get("context_node_id", "")
 
           if context_node_id:
@@ -1359,11 +1430,11 @@ nodes:
                   )
                   if not update_result.get("success"):
                       logger.warning(
-                          "extract_firm_department: update_node failed: %s",
-                          update_result.get("error", "unknown"),
+                          "extract_firm_department: update_node failed (url=%s): %s",
+                          gql_url, update_result.get("error", "unknown"),
                       )
               except Exception as ue:
-                  logger.warning("extract_firm_department: update_node exception: %s", ue)
+                  logger.warning("extract_firm_department: update_node exception (url=%s): %s", gql_url, ue)
 
       if firm_name:
           logger.info("extract_firm_department: fileFirm='%s' for directory=%s", firm_name, directory)
