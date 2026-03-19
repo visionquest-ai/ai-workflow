@@ -90,6 +90,10 @@ state_schema:
   # Region matching (Story 3.2)
   region_match: dict             # Fuzzy match result: matched_name, matched_id, score, tier, via_hint
 
+  # Firm and department extraction
+  extracted_firm_name: str       # Firm name extracted from LlamaExtract payload
+  extracted_department_name: str # Department/team name extracted from payload (chambers, legal500 only)
+
   # Output
   update_result: dict        # Result from graphology.update_node
   status: str                # success, error
@@ -1154,7 +1158,7 @@ nodes:
   # Step 5e: Resolve Region via fuzzy matching against graph Region nodes (Story 3.2)
   - name: resolve_region
     goto:
-      - to: save_payload
+      - to: extract_firm_department
     run: |
       import os
       import logging
@@ -1279,6 +1283,94 @@ nodes:
       except Exception as e:
           logger.warning("resolve_region: Failed (best-effort): %s", e)
           return {"region_match": {}}
+
+  # Step 5f: Extract fileFirm and fileDepartment from payload
+  - name: extract_firm_department
+    goto:
+      - to: save_payload
+    run: |
+      import json
+      import logging
+
+      logger = logging.getLogger(__name__)
+
+      if state.get("status") == "error":
+          return {"extracted_firm_name": "", "extracted_department_name": ""}
+
+      payload_json = state.get("payload_json", "")
+      if not payload_json:
+          return {"extracted_firm_name": "", "extracted_department_name": ""}
+
+      try:
+          payload = json.loads(payload_json)
+      except (json.JSONDecodeError, TypeError):
+          return {"extracted_firm_name": "", "extracted_department_name": ""}
+
+      directory = (state.get("directory_name") or "").lower().strip()
+
+      # --- fileFirm: available in all 5 directories ---
+      firm_extractors = {
+          "chambers": lambda p: p.get("preliminaryInformation", {}).get("firmName", ""),
+          "iflr1000": lambda p: p.get("firmDetails", {}).get("firmName", ""),
+          "legal500": lambda p: p.get("firmName", ""),
+          "itr": lambda p: p.get("firmInfo", {}).get("firm_name", ""),
+          "leadersleague": lambda p: p.get("firm_information", {}).get("firm_name", ""),
+          "leaders league": lambda p: p.get("firm_information", {}).get("firm_name", ""),
+      }
+
+      # --- fileDepartment: only available in chambers and legal500 ---
+      department_extractors = {
+          "chambers": lambda p: p.get("departmentInfo", {}).get("name", ""),
+          "legal500": lambda p: p.get("teamOrDepartmentName", ""),
+      }
+
+      firm_name = ""
+      firm_ext = firm_extractors.get(directory)
+      if firm_ext:
+          firm_name = str(firm_ext(payload) or "").strip()
+      else:
+          logger.warning("No fileFirm extractor for directory: %s", directory)
+
+      department_name = ""
+      dept_ext = department_extractors.get(directory)
+      if dept_ext:
+          department_name = str(dept_ext(payload) or "").strip()
+
+      if firm_name or department_name:
+          import os
+          gql_url = state.get("graphql_url") or os.environ.get("GRAPHOLOGY_URL", "")
+          gql_api_key = os.environ.get("GRAPHOLOGY_API_KEY", "")
+          context_node_id = state.get("context_node_id", "")
+
+          if context_node_id:
+              updates = {}
+              if firm_name:
+                  updates["fileFirm"] = firm_name
+              if department_name:
+                  updates["fileDepartment"] = department_name
+              try:
+                  update_result = actions["graphology.update_node"](
+                      state=state,
+                      node_id=context_node_id,
+                      node_type="ApplicationFormFile",
+                      updates=updates,
+                      graphql_url=gql_url,
+                      graphql_api_key=gql_api_key,
+                  )
+                  if not update_result.get("success"):
+                      logger.warning(
+                          "extract_firm_department: update_node failed: %s",
+                          update_result.get("error", "unknown"),
+                      )
+              except Exception as ue:
+                  logger.warning("extract_firm_department: update_node exception: %s", ue)
+
+      if firm_name:
+          logger.info("extract_firm_department: fileFirm='%s' for directory=%s", firm_name, directory)
+      if department_name:
+          logger.info("extract_firm_department: fileDepartment='%s' for directory=%s", department_name, directory)
+
+      return {"extracted_firm_name": firm_name, "extracted_department_name": department_name}
 
   # Step 6: Save extraction result back to the node via GraphQL
   - name: save_payload
