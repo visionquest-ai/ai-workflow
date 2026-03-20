@@ -1,0 +1,200 @@
+# TEA YAML Agent - Generic LLM Prompt Agent
+#
+# Purpose: Generic agent that receives a system prompt, user message,
+# and optional output_schema to call the LLM with structured output.
+#
+# Uses response_format (json_schema) when output_schema is provided,
+# ensuring the LLM returns valid JSON matching the schema.
+#
+# Input state:
+#   - system_prompt: System message for the LLM
+#   - user_message: User message content
+#   - output_schema: (optional) JSON Schema dict — when provided, enables
+#                    response_format: json_schema for structured output
+#
+# Output state:
+#   - result: Parsed dict (when output_schema provided) or raw string
+#   - status: "success" or "error"
+#   - error: Error message if failed
+
+name: llm_prompt
+description: |
+  Generic LLM prompt agent with optional structured output.
+  Receives a system prompt, user message, and optional JSON schema.
+  When output_schema is provided, uses response_format to guarantee
+  valid JSON output matching the schema.
+
+settings:
+  llm:
+    model: gpt-5.3-chat
+    temperature: 1
+    max_completion_tokens: 2000
+
+state_schema:
+  # Input
+  system_prompt:
+    type: str
+    description: "System message for the LLM"
+  user_message:
+    type: str
+    description: "User message content"
+  output_schema:
+    type: dict
+    description: "Optional JSON Schema — enables structured output via response_format"
+
+  # Intermediate
+  llm_messages:
+    type: list
+    description: "Constructed messages array for LLM call"
+  response_format:
+    type: dict
+    description: "Constructed response_format for structured output"
+  use_structured:
+    type: bool
+    description: "Whether to use structured output mode"
+
+  # Output
+  result:
+    type: any
+    description: "Parsed dict (structured) or raw string (unstructured)"
+  status:
+    type: str
+    description: "success or error"
+  error:
+    type: str
+    description: "Error message if failed"
+
+nodes:
+  # Step 1: Build messages and determine mode
+  - name: build_request
+    run: |
+      import logging
+
+      _logger = logging.getLogger(__name__)
+
+      system_prompt = state.get("system_prompt", "")
+      user_message = state.get("user_message", "")
+      output_schema = state.get("output_schema")
+
+      if not system_prompt or not user_message:
+          _logger.error("LLM prompt agent: missing system_prompt or user_message")
+          return {"use_structured": False}
+
+      messages = [
+          {"role": "system", "content": system_prompt},
+          {"role": "user", "content": user_message},
+      ]
+
+      result = {"llm_messages": messages, "use_structured": bool(output_schema)}
+
+      if output_schema:
+          result["response_format"] = {
+              "type": "json_schema",
+              "json_schema": {
+                  "name": output_schema.get("title", "response"),
+                  "strict": True,
+                  "schema": output_schema,
+              },
+          }
+          _logger.info("LLM prompt agent: using json_schema response_format")
+      else:
+          _logger.info("LLM prompt agent: plain text mode (no output_schema)")
+
+      return result
+
+  # Step 2a: LLM call WITH structured output (response_format in args)
+  - name: invoke_llm_structured
+    uses: ratelimit.wrap
+    with:
+      action: llm.call
+      limiter: llm_prompt
+      rpm: 60
+      args:
+        model: "{{ settings.llm.model }}"
+        temperature: "{{ settings.llm.temperature }}"
+        max_completion_tokens: "{{ settings.llm.max_completion_tokens }}"
+        messages: "{{ state.llm_messages }}"
+        response_format: "{{ state.response_format }}"
+    output: llm_result
+
+  # Step 2b: LLM call WITHOUT structured output (no response_format)
+  - name: invoke_llm_plain
+    uses: ratelimit.wrap
+    with:
+      action: llm.call
+      limiter: llm_prompt
+      rpm: 60
+      args:
+        model: "{{ settings.llm.model }}"
+        temperature: "{{ settings.llm.temperature }}"
+        max_completion_tokens: "{{ settings.llm.max_completion_tokens }}"
+        messages: "{{ state.llm_messages }}"
+    output: llm_result
+
+  # Step 3: Parse result
+  - name: parse_result
+    run: |
+      import json
+      import logging
+
+      _logger = logging.getLogger(__name__)
+
+      llm_result = state.get("llm_result", {})
+      use_structured = state.get("use_structured", False)
+
+      # Unwrap ratelimit.wrap envelope
+      if isinstance(llm_result, dict):
+          if not llm_result.get("success", True):
+              return {
+                  "status": "error",
+                  "error": llm_result.get("error", "LLM call failed"),
+              }
+          inner = llm_result.get("result", llm_result)
+          if isinstance(inner, dict):
+              raw_text = inner.get("content", inner.get("text", ""))
+          elif isinstance(inner, str):
+              raw_text = inner
+          else:
+              raw_text = str(inner)
+      elif isinstance(llm_result, str):
+          raw_text = llm_result
+      else:
+          return {"status": "error", "error": "Unexpected LLM result type"}
+
+      # If structured mode, parse JSON
+      if use_structured:
+          try:
+              parsed = json.loads(raw_text)
+              return {"result": parsed, "status": "success"}
+          except json.JSONDecodeError as e:
+              _logger.warning(f"LLM prompt agent: JSON parse failed: {e}")
+              brace_idx = raw_text.find("{")
+              if brace_idx != -1:
+                  try:
+                      decoder = json.JSONDecoder()
+                      parsed, _ = decoder.raw_decode(raw_text, brace_idx)
+                      return {"result": parsed, "status": "success"}
+                  except json.JSONDecodeError:
+                      pass
+              return {
+                  "status": "error",
+                  "error": f"Failed to parse JSON: {raw_text[:200]}",
+              }
+      else:
+          return {"result": raw_text, "status": "success"}
+
+edges:
+  - from: __start__
+    to: build_request
+  - from: build_request
+    to: invoke_llm_structured
+    condition: "{{ state.use_structured }}"
+  - from: build_request
+    to: invoke_llm_plain
+    condition: "{{ not state.use_structured }}"
+  - from: invoke_llm_structured
+    to: parse_result
+  - from: invoke_llm_plain
+    to: parse_result
+  - from: parse_result
+    to: __end__

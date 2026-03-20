@@ -82,3 +82,8 @@ development_status:
   16-3-persist-classification-metadata: done
   16-4-expand-proto-matters-from-payload: review
   epic-16-retrospective: optional
+
+  # Epic 18: Generic LLM Prompt Agent with Structured Output
+  epic-18: in-progress
+  18-1-generic-llm-prompt-agent-with-structured-output: review
+  epic-18-retrospective: optional

@@ -202,6 +202,63 @@ def invoke_agent(
 
 
 # =============================================================================
+# LLM PROMPT SUB-AGENT (Story 18.1, Task 4)
+# =============================================================================
+
+def invoke_llm_prompt(
+    state: Dict[str, Any],
+    system_prompt: str = "",
+    user_message: str = "",
+    output_schema: Dict[str, Any] = None,
+    **kwargs,
+) -> Dict[str, Any]:
+    """
+    Invoke the llm_prompt agent as a sub-agent with direct parameter mapping.
+
+    TEA Custom Action: agents.llm_prompt
+
+    Provides a clean interface for calling the generic LLM prompt agent.
+    Callers pass system_prompt, user_message, and optional output_schema directly
+    instead of using agents.invoke_agent with manual input_state mapping.
+
+    Args:
+        state: Current agent state
+        system_prompt: System message for the LLM
+        user_message: User message content
+        output_schema: Optional JSON Schema dict for structured output
+
+    Returns:
+        Dict with result (parsed dict or raw string), status, and error fields
+    """
+    input_state = {
+        "system_prompt": system_prompt,
+        "user_message": user_message,
+    }
+    if output_schema is not None:
+        input_state["output_schema"] = output_schema
+
+    invoke_result = invoke_agent(
+        state,
+        agent_name="llm_prompt",
+        input_state=input_state,
+        **kwargs,
+    )
+
+    if not invoke_result.get("success"):
+        return {
+            "status": "error",
+            "error": invoke_result.get("error", "llm_prompt sub-agent invocation failed"),
+        }
+
+    agent_state = invoke_result.get("result", {})
+    return {
+        "result": agent_state.get("result"),
+        "status": agent_state.get("status", "error"),
+        "error": agent_state.get("error", ""),
+    }
+
+
+# =============================================================================
 # ACTION REGISTRATION
 # =============================================================================
 
@@ -216,8 +273,9 @@ def register_actions(registry: Dict[str, Callable], engine: Any) -> None:
     registry["agents.invoke_agent"] = invoke_agent
     registry["agents.cache_get"] = cache_get_classification
     registry["agents.cache_set"] = cache_set_classification
+    registry["agents.llm_prompt"] = invoke_llm_prompt
 
     logger.info(
         "Agent actions registered: "
-        "agents.invoke_agent, agents.cache_get, agents.cache_set"
+        "agents.invoke_agent, agents.cache_get, agents.cache_set, agents.llm_prompt"
     )
