@@ -481,9 +481,12 @@ def _load_and_run_prompt(
         if agent_error:
             result["error"] = agent_error
 
+        # Surface agent result — check payload_json first, then state.result
         payload_json = agent_state.get("payload_json")
         if payload_json:
             result["payload"] = json.loads(payload_json)
+        elif "result" in agent_state:
+            result["result"] = agent_state["result"]
 
         return result
 
