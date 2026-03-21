@@ -115,7 +115,10 @@ Claude Opus 4.6 (1M context)
 - `visionQuest/vq-charts/values.yaml` — Updated `openaiApiVersion` to `2024-08-01-preview`
 - `visionQuest/ai-workflow/the_edge_agent/docs/shared/yaml-reference/actions/llm.md` — Added `response_format` section (AC8)
 - `visionQuest/vq-charts/charts/ai-workflow/values.yaml` — Updated `openaiApiVersion` to `2024-08-01-preview`
+- `visionQuest/ai-workflow/app.py` — Added `RunPromptRequest` model, `_load_and_run_prompt` helper, `POST /run-prompt` endpoint
+- `visionQuest/ai-workflow/tests/test_app.py` — Added 10 tests (T30-T38) for `/run-prompt` endpoint
 
 ## Change Log
 
 - 2026-03-20: Completed Tasks 4-6. Agent registered for sub-agent invocation, Helm API version updated, comprehensive unit tests added. All 16 new tests pass.
+- 2026-03-20: Added `POST /run-prompt` endpoint to `app.py` — enables running generic agents (like `llm_prompt`) without graphology context. Separate from `/run-agent` to avoid production risk. 10 new tests in `test_app.py` (T30-T38).

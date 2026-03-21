@@ -73,6 +73,12 @@ class RunAgentRequest(BaseModel):
         return self
 
 
+class RunPromptRequest(BaseModel):
+    """Request model for /run-prompt — runs a TEA agent with arbitrary input state."""
+    agent: str
+    input_state: dict
+
+
 class JobStatus(str, Enum):
     ACCEPTED = "accepted"
     RUNNING = "running"
@@ -405,3 +411,105 @@ def get_job_status(
             response["result"] = job["result"]
 
     return response
+
+
+# =============================================================================
+# /run-prompt — Generic agent endpoint (no graphology context)
+# =============================================================================
+
+def _load_and_run_prompt(
+    agent: str,
+    input_state: dict,
+    agents_dir: Optional[str] = None,
+    actions_dir: Optional[str] = None,
+) -> dict:
+    """
+    Load a YAML agent and run it with arbitrary input state.
+
+    Unlike _load_and_run_agent, this skips graphology entirely —
+    input_state is passed directly to the TEA agent.
+    """
+    global _active_requests
+    agents_dir = agents_dir or AGENTS_DIR
+    actions_dir = actions_dir or ACTIONS_DIR
+
+    agent_path = Path(agents_dir) / f"{agent}.yaml"
+    if not agent_path.exists():
+        return {"success": False, "error": f"Agent not found: {agent}"}
+
+    with _active_requests_lock:
+        _active_requests += 1
+
+    try:
+        from the_edge_agent import YAMLEngine
+
+        engine = YAMLEngine()
+        register_actions(engine.actions_registry, engine)
+        register_agent_actions(engine.actions_registry, engine)
+
+        engine.variables["GRAPHOLOGY_URL"] = os.environ.get("GRAPHOLOGY_URL", "http://localhost:4000")
+        engine.variables["GRAPHOLOGY_API_KEY"] = os.environ.get("GRAPHOLOGY_API_KEY", "")
+
+        graph = engine.load_from_file(str(agent_path))
+
+        final_state = None
+        for event in graph.invoke(input_state):
+            logger.info(f"TEA event type: {type(event).__name__}")
+            final_state = event
+
+        agent_state = {}
+        if final_state and isinstance(final_state, dict):
+            agent_state = final_state.get("state", final_state)
+            logger.info(f"Agent state keys: {list(agent_state.keys()) if isinstance(agent_state, dict) else 'N/A'}")
+        else:
+            logger.warning(f"Unexpected final_state type: {type(final_state)}, value: {str(final_state)[:500]}")
+
+        agent_status = agent_state.get("status", "unknown")
+        agent_error = agent_state.get("error")
+
+        if agent_status == "unknown" and not agent_error:
+            save_result = agent_state.get("save_result")
+            if save_result and isinstance(save_result, dict) and save_result.get("success"):
+                agent_status = "success"
+            elif agent_state.get("answers") or agent_state.get("save_result"):
+                agent_status = "success"
+
+        result = {
+            "success": agent_status == "success",
+            "status": agent_status,
+        }
+        if agent_error:
+            result["error"] = agent_error
+
+        payload_json = agent_state.get("payload_json")
+        if payload_json:
+            result["payload"] = json.loads(payload_json)
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Agent execution failed: {e}")
+        return {"success": False, "error": str(e)}
+    finally:
+        with _active_requests_lock:
+            _active_requests -= 1
+
+
+@app.post("/run-prompt")
+def run_prompt(
+    request: RunPromptRequest,
+    x_api_key: Optional[str] = Header(None),
+):
+    """
+    Run a TEA agent with arbitrary input state (no graphology context).
+
+    Designed for agents like llm_prompt that don't need a context node.
+    Requires x-api-key header.
+    """
+    _check_api_key(x_api_key)
+
+    result = _load_and_run_prompt(
+        agent=request.agent,
+        input_state=request.input_state,
+    )
+    return result

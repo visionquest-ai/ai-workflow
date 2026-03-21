@@ -567,3 +567,163 @@ class TestJobStatusEndpoint:
             headers=auth_headers,
         )
         assert poll.status_code == 404
+
+
+# =============================================================================
+# Story 18.1: /run-prompt endpoint (generic agents without graphology context)
+# =============================================================================
+
+class TestRunPromptEndpoint:
+    """Tests for /run-prompt — runs TEA agents with arbitrary input_state."""
+
+    def test_missing_api_key_returns_401(self, client):
+        """T30: POST /run-prompt without x-api-key returns 401."""
+        response = client.post("/run-prompt", json={
+            "agent": "llm_prompt",
+            "input_state": {"user_message": "hello"},
+        })
+        assert response.status_code == 401
+
+    def test_invalid_api_key_returns_401(self, client):
+        """T31: POST /run-prompt with wrong key returns 401."""
+        response = client.post(
+            "/run-prompt",
+            json={"agent": "llm_prompt", "input_state": {"user_message": "hello"}},
+            headers={"x-api-key": "wrong-key"},
+        )
+        assert response.status_code == 401
+
+    def test_missing_input_state_returns_422(self, client, auth_headers):
+        """T32: POST /run-prompt without input_state returns 422."""
+        response = client.post(
+            "/run-prompt",
+            json={"agent": "llm_prompt"},
+            headers=auth_headers,
+        )
+        assert response.status_code == 422
+
+    def test_missing_agent_returns_422(self, client, auth_headers):
+        """T33: POST /run-prompt without agent returns 422."""
+        response = client.post(
+            "/run-prompt",
+            json={"input_state": {"user_message": "hello"}},
+            headers=auth_headers,
+        )
+        assert response.status_code == 422
+
+    def test_successful_run(self, client, auth_headers):
+        """T34: POST /run-prompt with valid request calls _load_and_run_prompt."""
+        with patch("app._load_and_run_prompt") as mock_run:
+            mock_run.return_value = {
+                "success": True,
+                "status": "success",
+                "payload": {"response": "4"},
+            }
+            response = client.post(
+                "/run-prompt",
+                json={
+                    "agent": "llm_prompt",
+                    "input_state": {
+                        "system_prompt": "You are helpful.",
+                        "user_message": "What is 2+2?",
+                    },
+                },
+                headers=auth_headers,
+            )
+            assert response.status_code == 200
+            data = response.json()
+            assert data["success"] is True
+            assert data["payload"]["response"] == "4"
+            mock_run.assert_called_once_with(
+                agent="llm_prompt",
+                input_state={
+                    "system_prompt": "You are helpful.",
+                    "user_message": "What is 2+2?",
+                },
+            )
+
+    def test_agent_not_found(self, client, auth_headers):
+        """T35: POST /run-prompt with non-existent agent returns error."""
+        with patch("app._load_and_run_prompt") as mock_run:
+            mock_run.return_value = {
+                "success": False,
+                "error": "Agent not found: nonexistent",
+            }
+            response = client.post(
+                "/run-prompt",
+                json={
+                    "agent": "nonexistent",
+                    "input_state": {"user_message": "hello"},
+                },
+                headers=auth_headers,
+            )
+            assert response.status_code == 200
+            data = response.json()
+            assert data["success"] is False
+            assert "Agent not found" in data["error"]
+
+    def test_no_context_node_type_in_response(self, client, auth_headers):
+        """T36: /run-prompt response does not include context_node_type."""
+        with patch("app._load_and_run_prompt") as mock_run:
+            mock_run.return_value = {
+                "success": True,
+                "status": "success",
+            }
+            response = client.post(
+                "/run-prompt",
+                json={
+                    "agent": "llm_prompt",
+                    "input_state": {"user_message": "hello"},
+                },
+                headers=auth_headers,
+            )
+            data = response.json()
+            assert "context_node_type" not in data
+
+
+class TestLoadAndRunPrompt:
+    """Unit tests for _load_and_run_prompt helper."""
+
+    def test_agent_file_not_found(self, set_env):
+        """T37: Returns error when agent YAML doesn't exist."""
+        from app import _load_and_run_prompt
+        result = _load_and_run_prompt(
+            agent="nonexistent",
+            input_state={"user_message": "hello"},
+            agents_dir="/tmp/no-such-dir",
+        )
+        assert result["success"] is False
+        assert "Agent not found" in result["error"]
+
+    def test_input_state_passed_to_engine(self, set_env):
+        """T38: input_state is passed directly to TEA engine (no graphology fetch)."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            agent_path = os.path.join(tmpdir, "test_agent.yaml")
+            with open(agent_path, "w") as f:
+                f.write("name: test\nnodes: []\nedges: []")
+
+            mock_engine = MagicMock()
+            mock_graph = MagicMock()
+            mock_engine.load_from_file.return_value = mock_graph
+            mock_graph.invoke.return_value = iter([{
+                "state": {"status": "success", "payload_json": '{"answer": "42"}'},
+            }])
+
+            with patch("app.register_actions"), \
+                 patch("app.register_agent_actions"):
+                with patch("the_edge_agent.YAMLEngine", return_value=mock_engine):
+                    from app import _load_and_run_prompt
+                    result = _load_and_run_prompt(
+                        agent="test_agent",
+                        input_state={"system_prompt": "Be helpful", "user_message": "hi"},
+                        agents_dir=tmpdir,
+                    )
+
+            # Verify input_state was passed directly (no matter_context wrapping)
+            mock_graph.invoke.assert_called_once_with(
+                {"system_prompt": "Be helpful", "user_message": "hi"}
+            )
+            assert result["success"] is True
+            assert result["payload"]["answer"] == "42"
+            assert "context_node_type" not in result

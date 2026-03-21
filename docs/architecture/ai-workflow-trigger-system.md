@@ -35,15 +35,25 @@ Workflow → HAS_STEP → Step → HAS_PROMPT → Prompt → HAS_VERSION → Pro
                                                             └─ (content, status, versionNumber)
 ```
 
-### Current Execution Path
+### Current Execution Paths
 
+**Context mode** — agents that need a graphology node:
 ```
 User/API → POST /run-agent { agent, workflow_id, context_node_id }
-    → FastAPI loads TEA YAMLEngine
-    → TEA fetches PromptVersions via graphology.get_workflow_questions
+    → FastAPI fetches context node from graphology
+    → Loads TEA YAMLEngine, injects node as matter_context
     → TEA executes prompts (parallel or sequential)
     → TEA persists results via graphology.save_workflow_responses
     → Creates: PromptExecution + ContextNode + PromptResponse nodes
+```
+
+**Direct mode** — generic agents (e.g., `llm_prompt`) that don't need graphology context:
+```
+User/API → POST /run-prompt { agent, input_state }
+    → FastAPI loads TEA YAMLEngine
+    → Passes input_state directly to agent (no graphology fetch)
+    → TEA executes agent graph
+    → Returns result/payload
 ```
 
 ### Validation Middleware Pattern (reference)
