@@ -1,0 +1,412 @@
+# TEA YAML Agent - File Classification Agent (TIER 3) — No Cache
+#
+# Purpose: LLM-based classification of legal directory documents when
+# TIER 1 (filename) and TIER 2 (content keywords) fail to identify
+# the directory and/or year.
+#
+# Two modes:
+#   1. Unknown directory: Full classification across all 5 directories
+#   2. Known directory: Category/region/year extraction only (when directory
+#      was detected by TIER 1/2 but year was not)
+#
+# Input: PDF file (vision) preferred, falls back to document_text (plain text).
+# PDF provides logos, headers, and layout as additional classification signals.
+#
+# Note: No cache layer. For persistent cross-process cache, use
+# file_classification_neo4j.yaml (Neo4j-backed via cache.wrap + LTM).
+#
+# Story: 16.2 - TIER 3 LLM Classification Agent
+
+name: file_classification
+description: |
+  LLM-based classification of legal directory documents.
+  Identifies directory, category, region, year, and form status
+  when pattern-based detection (TIER 1+2) fails.
+  Uses PDF vision input when available for logo/layout signals.
+
+settings:
+  llm:
+    model: gpt-5.3-chat
+    temperature: 1
+    max_completion_tokens: 200
+
+state_schema:
+  # Input
+  document_text:
+    type: str
+    description: "Full document text for classification"
+  detected_directory:
+    type: str
+    description: "Pre-detected directory from TIER 1/2, or null"
+  pdf_path:
+    type: str
+    description: "Local path to PDF file for vision-based classification"
+
+  # Intermediate
+  llm_messages:
+    type: list
+    description: "Constructed messages array for LLM call (with PDF vision or text fallback)"
+
+  # Output
+  directory:
+    type: str
+    description: "Classified directory slug"
+  category:
+    type: str
+    description: "Practice area category"
+  region_country:
+    type: str
+    description: "ISO 3166-1 alpha-3 country code"
+  region_state:
+    type: str
+    description: "ISO 3166-2 state code"
+  region_country_display:
+    type: str
+    description: "Country display name"
+  region_state_display:
+    type: str
+    description: "State display name"
+  confidence:
+    type: float
+    description: "Classification confidence 0.0-1.0"
+  year:
+    type: str
+    description: "Detected year"
+  is_empty_form:
+    type: bool
+    description: "Whether document is an empty/blank form"
+  status:
+    type: str
+    description: "success or error"
+  error:
+    type: str
+    description: "Error message if classification failed"
+
+nodes:
+  # Step 1: Build LLM messages — PDF pages as images (preferred) or text fallback
+  # Converts PDF pages to PNG via pymupdf for vision-based classification.
+  # Sends first 3 pages to keep token usage reasonable while capturing logos/headers.
+  - name: build_messages
+    run: |
+      import base64
+      import os
+      import logging
+
+      _logger = logging.getLogger(__name__)
+
+      detected_directory = state.get("detected_directory") or ""
+      pdf_path = state.get("pdf_path", "")
+      document_text = state.get("document_text", "")
+
+      MAX_PAGES = 3  # First 3 pages capture logos, headers, branding
+
+      # System prompt — XML-structured following Anthropic prompt engineering principles
+      if detected_directory:
+          system_content = (
+              "<general_context>\n"
+              "<persona>You are an expert legal document metadata extractor. You specialize in analyzing award submission forms "
+              f"from the {detected_directory} legal directory.</persona>\n"
+              "<main_objective>Extract the practice area category, geographic region, submission year, and form status from the document. "
+              "The directory is already known — focus only on metadata extraction.</main_objective>\n"
+              "<key_information>\n"
+              "  - The document is a legal directory award submission form.\n"
+              "  - If the document contains images, pay attention to logos, headers, and visual branding for context.\n"
+              "  - Forms may be in English or Brazilian Portuguese.\n"
+              "  - Region codes follow ISO 3166 standards.\n"
+              "</key_information>\n"
+              "</general_context>\n\n"
+              "<decision_policy>\n"
+              "<general_constraints>\n"
+              "  - DO NOT invent or guess a year if no year is clearly stated in the document. Return null.\n"
+              "  - DO NOT return any text outside the JSON object. No explanations, no markdown.\n"
+              "  - If the form is blank/empty (no firm name, no matters filled in), set is_empty_form to true.\n"
+              "  - Confidence must reflect your actual certainty: 0.9+ only when strong evidence is present.\n"
+              "</general_constraints>\n"
+              "<conditional_logic>\n"
+              "  - If the document mentions a specific year (e.g. '2025 submission', 'Year of Establishment: 2024'), extract that year.\n"
+              "  - If no year is found anywhere in the document, return year as null.\n"
+              "  - If the form has section headers but no content filled in, set is_empty_form to true.\n"
+              "  - If the document is in Portuguese and mentions Brazilian states, use BR- prefix for region_state (e.g. BR-MG, BR-SP).\n"
+              "</conditional_logic>\n"
+              "</decision_policy>\n\n"
+              "<output_format>\n"
+              "Return ONLY this JSON structure, nothing else:\n"
+              '{"category": "<practice area>", "region_country": "<ISO 3166-1 alpha-3>", '
+              '"region_state": "<ISO 3166-2 or empty string>", "confidence": <0.0-1.0>, "year": <int or null>, "is_empty_form": <bool>}\n'
+              "</output_format>\n\n"
+              "<practical_examples>\n"
+              "<positive_example>\n"
+              '{"category": "Arbitration", "region_country": "BRA", "region_state": "BR-MG", "confidence": 0.95, "year": 2025, "is_empty_form": false}\n'
+              "</positive_example>\n"
+              "<negative_example>\n"
+              '{"category": "Arbitration", "region_country": "Brazil", "region_state": "Minas Gerais", "confidence": 1.0, "year": 2025, "is_empty_form": false}\n'
+              "Error: region_country must be ISO 3166-1 alpha-3 (BRA not Brazil), region_state must be ISO 3166-2 (BR-MG not Minas Gerais), "
+              "confidence of 1.0 is never appropriate.\n"
+              "</negative_example>\n"
+              "</practical_examples>"
+          )
+      else:
+          system_content = (
+              "<general_context>\n"
+              "<persona>You are an expert legal document classifier specialized in identifying which legal directory "
+              "a submission form belongs to. You have deep knowledge of the 5 major legal directories that rank law firms "
+              "in Latin America and globally.</persona>\n"
+              "<main_objective>Classify the document into exactly one of 5 supported legal directories, extract the practice area, "
+              "geographic region, submission year, and whether it is an empty form. Pay close attention to logos, headers, "
+              "formatting, URLs, email addresses, and visual branding — these are the strongest classification signals.</main_objective>\n"
+              "<key_information>\n"
+              "  - Documents are award submission forms from law firms in Latin America (primarily Brazil).\n"
+              "  - Forms may be in English or Brazilian Portuguese.\n"
+              "  - Each directory has unique visual branding, form structure, and terminology.\n"
+              "  - Some keywords like 'rising star' appear across multiple directories — do NOT rely on a single keyword.\n"
+              "  - The strongest signals are: URLs/domains, logos, email addresses, and directory-specific ranking terminology.\n"
+              "</key_information>\n"
+              "</general_context>\n\n"
+              "<directories>\n"
+              "<directory slug=\"chambers\">\n"
+              "  <name>Chambers and Partners</name>\n"
+              "  <strong_signals>chambers.com, myaccount.chambers.com, Chambers logo</strong_signals>\n"
+              "  <terminology>Band 1/2/3/4, Ranked Individual, Recognised Practitioner, Star Individual, Associate to Watch, "
+              "Up and Coming, PAB006, PAM006</terminology>\n"
+              "  <editions>Chambers Global, Chambers Latin America, Chambers Asia, Chambers Europe, Chambers USA</editions>\n"
+              "</directory>\n"
+              "<directory slug=\"iflr1000\">\n"
+              "  <name>IFLR1000</name>\n"
+              "  <strong_signals>iflr1000.com, iflr.com, accreditation.euromoney.com, IFLR logo</strong_signals>\n"
+              "  <terminology>Market Leader, Highly Regarded, Notable Practitioner, Rising Star (also used by Leaders League)</terminology>\n"
+              "</directory>\n"
+              "<directory slug=\"legal500\">\n"
+              "  <name>The Legal 500</name>\n"
+              "  <strong_signals>legal500.com, thelegal500.com, Legal 500 logo</strong_signals>\n"
+              "  <terminology>Tier 1/2/3, Hall of Fame, Next Generation Partner, Recommended Lawyer, Leading Individual</terminology>\n"
+              "</directory>\n"
+              "<directory slug=\"itr\">\n"
+              "  <name>International Tax Review (ITR World Tax)</name>\n"
+              "  <strong_signals>itrworldtax.com, ITR logo</strong_signals>\n"
+              "  <terminology>World Tax, World Transfer Pricing, Tax Controversy Leaders, Indirect Tax Leaders, Women in Tax Leaders</terminology>\n"
+              "</directory>\n"
+              "<directory slug=\"leadersleague\">\n"
+              "  <name>Leaders League</name>\n"
+              "  <strong_signals>leadersleague.com, @leadersleague.com email addresses, Leaders League logo</strong_signals>\n"
+              "  <terminology>Décideurs, Classement, Peer Feedback, Highly Recommended, Strong Reputation, Rising Star (also used by IFLR1000)</terminology>\n"
+              "  <form_characteristics>Questions about 'rising stars', 'peer feedback' sections, matter submissions with French-influenced structure</form_characteristics>\n"
+              "</directory>\n"
+              "</directories>\n\n"
+              "<decision_policy>\n"
+              "<general_constraints>\n"
+              "  - DO NOT classify based on a single ambiguous keyword. 'Rising star' alone is NOT enough to choose IFLR1000 or Leaders League.\n"
+              "  - DO NOT return any text outside the JSON object. No explanations, no markdown, no commentary.\n"
+              "  - DO NOT invent or guess a year if no year is clearly stated. Return null.\n"
+              "  - DO NOT set confidence above 0.95 unless you found a URL, logo, or email domain that uniquely identifies the directory.\n"
+              "  - The directory slug MUST be exactly one of: chambers, iflr1000, legal500, itr, leadersleague.\n"
+              "</general_constraints>\n"
+              "<conditional_logic>\n"
+              "  - If you see a URL or email domain (e.g. leadersleague.com, chambers.com), that is the strongest signal — classify accordingly with high confidence.\n"
+              "  - If you see a logo matching a known directory, classify accordingly with confidence >= 0.9.\n"
+              "  - If you see only ambiguous keywords (e.g. 'rising star' without any URL/logo), classify based on the overall form structure but set confidence <= 0.7.\n"
+              "  - If you cannot confidently identify the directory, still make your best guess but set confidence < 0.5.\n"
+              "  - If the form is blank/empty (section headers but no content filled in), set is_empty_form to true.\n"
+              "  - If the document is in Portuguese and mentions Brazilian states, use BR- prefix for region_state (e.g. BR-MG, BR-SP).\n"
+              "</conditional_logic>\n"
+              "</decision_policy>\n\n"
+              "<output_format>\n"
+              "Return ONLY this JSON structure, nothing else:\n"
+              '{"directory": "<slug>", "category": "<practice area>", "region_country": "<ISO 3166-1 alpha-3>", '
+              '"region_state": "<ISO 3166-2 or empty string>", "confidence": <0.0-1.0>, "year": <int or null>, "is_empty_form": <bool>}\n'
+              "</output_format>\n\n"
+              "<practical_examples>\n"
+              "<positive_example>\n"
+              "Document with leadersleague.com URL in footer and 'Peer Feedback' section:\n"
+              '{"directory": "leadersleague", "category": "Arbitration", "region_country": "BRA", "region_state": "", "confidence": 0.99, "year": 2025, "is_empty_form": false}\n'
+              "</positive_example>\n"
+              "<positive_example>\n"
+              "Document with 'Band 1' rankings and myaccount.chambers.com link:\n"
+              '{"directory": "chambers", "category": "Corporate/M&A", "region_country": "BRA", "region_state": "BR-MG", "confidence": 0.98, "year": 2026, "is_empty_form": false}\n'
+              "</positive_example>\n"
+              "<negative_example>\n"
+              "Document only mentions 'rising star' with no URL/logo — classified as IFLR1000 with high confidence:\n"
+              '{"directory": "iflr1000", "category": "Dispute Resolution", "region_country": "BRA", "region_state": "", "confidence": 0.95, "year": null, "is_empty_form": false}\n'
+              "Error: 'rising star' is ambiguous (used by both IFLR1000 and Leaders League). Without a URL or logo, confidence should be <= 0.7, "
+              "and the form structure should be analyzed to determine the correct directory.\n"
+              "</negative_example>\n"
+              "</practical_examples>\n\n"
+              "<final_reinforcement>\n"
+              "Remember: URLs, email domains, and logos are the strongest signals. A single ambiguous keyword is never sufficient for high-confidence classification. "
+              "The directory slug must be exactly one of: chambers, iflr1000, legal500, itr, leadersleague.\n"
+              "</final_reinforcement>"
+          )
+
+      # User message — PDF page images or text fallback
+      use_pdf = pdf_path and os.path.exists(pdf_path)
+      if use_pdf:
+          try:
+              import fitz  # pymupdf
+              doc = fitz.open(pdf_path)
+              page_count = min(len(doc), MAX_PAGES)
+
+              content_parts = [
+                  {"type": "text", "text": f"Classify this legal directory document ({len(doc)} pages, showing first {page_count}):"},
+              ]
+
+              for i in range(page_count):
+                  page = doc[i]
+                  # Render at 150 DPI (good balance of quality vs token cost)
+                  pix = page.get_pixmap(dpi=150)
+                  png_bytes = pix.tobytes("png")
+                  b64 = base64.b64encode(png_bytes).decode("utf-8")
+                  content_parts.append({
+                      "type": "image_url",
+                      "image_url": {"url": f"data:image/png;base64,{b64}"},
+                  })
+
+              doc.close()
+              user_content = content_parts
+              _logger.info(f"TIER 3: Using PDF vision input ({page_count} pages as PNG from {pdf_path})")
+          except Exception as e:
+              _logger.warning(f"TIER 3: Failed to render PDF {pdf_path}: {e}, falling back to text")
+              user_content = document_text
+      else:
+          user_content = document_text
+
+      messages = [
+          {"role": "system", "content": system_content},
+          {"role": "user", "content": user_content},
+      ]
+
+      return {"llm_messages": messages}
+
+  # Step 2: Classify document using LLM
+  - name: classify_document
+    uses: ratelimit.wrap
+    with:
+      action: llm.call
+      limiter: llm_classify
+      rpm: 60
+      args:
+        model: "{{ settings.llm.model }}"
+        temperature: "{{ settings.llm.temperature }}"
+        max_completion_tokens: "{{ settings.llm.max_completion_tokens }}"
+        messages: "{{ state.llm_messages }}"
+    output: llm_result
+
+  # Step 3: Parse LLM response and resolve ISO codes
+  - name: parse_result
+    run: |
+      import json
+      import re
+
+      llm_result = state.get("llm_result", {})
+      detected_directory = state.get("detected_directory") or ""
+
+      # Unwrap ratelimit.wrap envelope
+      if isinstance(llm_result, dict):
+          llm_success = llm_result.get("success", True)
+          if not llm_success:
+              return {
+                  "status": "error",
+                  "error": llm_result.get("error", "LLM call failed"),
+              }
+          inner = llm_result.get("result", llm_result)
+          if isinstance(inner, dict):
+              raw_text = inner.get("content", inner.get("text", ""))
+          elif isinstance(inner, str):
+              raw_text = inner
+          else:
+              raw_text = str(inner)
+      elif isinstance(llm_result, str):
+          raw_text = llm_result
+      else:
+          return {"status": "error", "error": "Unexpected LLM result type"}
+
+      # Extract JSON from response (may be wrapped in markdown code block)
+      brace_idx = raw_text.find('{')
+      if brace_idx == -1:
+          return {"status": "error", "error": f"No JSON found in LLM response: {raw_text[:200]}"}
+
+      try:
+          decoder = json.JSONDecoder()
+          parsed, _ = decoder.raw_decode(raw_text, brace_idx)
+      except json.JSONDecodeError as e:
+          return {"status": "error", "error": f"Invalid JSON in LLM response: {e}"}
+
+      # Extract fields
+      directory = parsed.get("directory", detected_directory) if not detected_directory else detected_directory
+      category = parsed.get("category", "")
+      region_country = parsed.get("region_country", "")
+      region_state = parsed.get("region_state", "")
+      confidence = float(parsed.get("confidence", 0.0))
+      year_val = parsed.get("year")
+      is_empty_form = bool(parsed.get("is_empty_form", False))
+
+      year = str(year_val) if year_val is not None else ""
+
+      # Resolve ISO codes to display names
+      region_country_display = region_country
+      region_state_display = region_state
+
+      try:
+          import pycountry
+          if region_country:
+              country = pycountry.countries.get(alpha_3=region_country.upper())
+              if country:
+                  region_country_display = country.name
+          if region_state:
+              subdivision = pycountry.subdivisions.get(code=region_state.upper())
+              if subdivision:
+                  region_state_display = subdivision.name
+      except Exception:
+          pass  # Fallback: use raw codes as display names
+
+      return {
+          "directory": (directory or "").lower().strip(),
+          "category": category,
+          "region_country": region_country,
+          "region_state": region_state,
+          "region_country_display": region_country_display,
+          "region_state_display": region_state_display,
+          "confidence": confidence,
+          "year": year,
+          "is_empty_form": is_empty_form,
+      }
+
+  # Step 4: Validate classification result
+  - name: validate_result
+    run: |
+      directory = state.get("directory", "")
+      confidence = state.get("confidence", 0.0)
+      status = state.get("status", "")
+
+      # If parse_result already set error status, propagate
+      if status == "error":
+          return {}
+
+      supported = ["chambers", "iflr1000", "legal500", "itr", "leadersleague"]
+
+      if confidence < 0.5 or not directory:
+          return {
+              "status": "error",
+              "error": "LLM classification inconclusive. Supported: chambers, iflr1000, legal500, itr, leadersleague",
+          }
+
+      if directory not in supported:
+          return {
+              "status": "error",
+              "error": f"LLM returned unsupported directory '{directory}'. Supported: chambers, iflr1000, legal500, itr, leadersleague",
+          }
+
+      return {"status": "success"}
+
+edges:
+  - from: __start__
+    to: build_messages
+  - from: build_messages
+    to: classify_document
+  - from: classify_document
+    to: parse_result
+  - from: parse_result
+    to: validate_result
+  - from: validate_result
+    to: __end__
+
+config:
+  raise_exceptions: false
