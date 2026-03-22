@@ -52,12 +52,17 @@ def _expand_searchable_list(master_list: list[dict]) -> list[dict]:
     return searchable
 
 
-def _ca1_substring_match(input_str: str, searchable: list[dict]) -> dict | None:
+def _ca1_substring_match(input_str: str, searchable: list[dict], prefer_canonical: bool = False) -> dict | None:
     """CA-1: 3-step substring matching (highest confidence).
 
     Step 1: Exact case-insensitive match → score 1.0
     Step 2: Word intersection scoring → score by intersection size then char length
     Step 3: Substring containment → min 3 chars for canonical names, no min for hints (FR18)
+
+    Args:
+        prefer_canonical: When True, prefer canonical name matches over hint matches
+            at equal scores (inverts FR19). Used for region matching where hints on
+            parent nodes contain child names (e.g. Southeast hints contain "Minas Gerais").
 
     Returns best match dict or None if no match found.
     """
@@ -71,9 +76,13 @@ def _ca1_substring_match(input_str: str, searchable: list[dict]) -> dict | None:
             exact_matches.append(item)
 
     if exact_matches:
-        # FR19: hint-based matches take priority
-        hint_matches = [m for m in exact_matches if m["via_hint"]]
-        best = hint_matches[0] if hint_matches else exact_matches[0]
+        # FR19: hint-based matches take priority (unless prefer_canonical)
+        if prefer_canonical:
+            canonical_matches = [m for m in exact_matches if not m["via_hint"]]
+            best = canonical_matches[0] if canonical_matches else exact_matches[0]
+        else:
+            hint_matches = [m for m in exact_matches if m["via_hint"]]
+            best = hint_matches[0] if hint_matches else exact_matches[0]
         return {
             "matched_name": best["original_name"],
             "matched_id": best["id"],
@@ -103,9 +112,13 @@ def _ca1_substring_match(input_str: str, searchable: list[dict]) -> dict | None:
         tied = [c for c in intersection_candidates
                 if c[0] == best_word_count and c[1] == best_char_length]
 
-        # FR19: hint priority among tied candidates
-        hint_tied = [c for c in tied if c[2]["via_hint"]]
-        best_item = hint_tied[0][2] if hint_tied else tied[0][2]
+        # FR19: hint priority among tied candidates (unless prefer_canonical)
+        if prefer_canonical:
+            canonical_tied = [c for c in tied if not c[2]["via_hint"]]
+            best_item = canonical_tied[0][2] if canonical_tied else tied[0][2]
+        else:
+            hint_tied = [c for c in tied if c[2]["via_hint"]]
+            best_item = hint_tied[0][2] if hint_tied else tied[0][2]
 
         total_words = max(len(input_words), len(set(best_item["term"].lower().split())))
         score = best_word_count / total_words if total_words > 0 else 0.0
@@ -139,8 +152,12 @@ def _ca1_substring_match(input_str: str, searchable: list[dict]) -> dict | None:
         best_score = containment_candidates[0][0]
 
         tied = [c for c in containment_candidates if c[0] == best_score]
-        hint_tied = [c for c in tied if c[1]["via_hint"]]
-        best_item = hint_tied[0][1] if hint_tied else tied[0][1]
+        if prefer_canonical:
+            canonical_tied = [c for c in tied if not c[1]["via_hint"]]
+            best_item = canonical_tied[0][1] if canonical_tied else tied[0][1]
+        else:
+            hint_tied = [c for c in tied if c[1]["via_hint"]]
+            best_item = hint_tied[0][1] if hint_tied else tied[0][1]
 
         return {
             "matched_name": best_item["original_name"],
@@ -153,7 +170,7 @@ def _ca1_substring_match(input_str: str, searchable: list[dict]) -> dict | None:
     return None
 
 
-def _ca2_jaro_winkler(input_str: str, searchable: list[dict]) -> dict | None:
+def _ca2_jaro_winkler(input_str: str, searchable: list[dict], prefer_canonical: bool = False) -> dict | None:
     """CA-2: Jaro-Winkler similarity matching (fallback).
 
     Threshold >= 0.85 required for valid match.
@@ -181,9 +198,13 @@ def _ca2_jaro_winkler(input_str: str, searchable: list[dict]) -> dict | None:
             best_score = score
             best_item = item
         elif score == best_score and best_item is not None:
-            # FR19: hint priority at equal score
-            if item["via_hint"] and not best_item["via_hint"]:
-                best_item = item
+            # FR19: hint priority at equal score (unless prefer_canonical)
+            if prefer_canonical:
+                if not item["via_hint"] and best_item["via_hint"]:
+                    best_item = item
+            else:
+                if item["via_hint"] and not best_item["via_hint"]:
+                    best_item = item
 
     if tracked_scores:
         logger.debug("JW tracked scores (>=0.5): %s", tracked_scores)
@@ -211,7 +232,7 @@ def _ca3_fallback() -> dict:
     }
 
 
-def fuzzy_match(input_str: str, master_list: list[dict]) -> dict:
+def fuzzy_match(input_str: str, master_list: list[dict], prefer_canonical: bool = False) -> dict:
     """Match input_str against master_list using 3-tier algorithm.
 
     Args:
@@ -220,6 +241,9 @@ def fuzzy_match(input_str: str, master_list: list[dict]) -> dict:
             - name (str): Canonical name
             - id (str): Unique identifier
             - hints (str, optional): Pipe-delimited alternative names/abbreviations
+        prefer_canonical: When True, prefer canonical name matches over hint matches
+            at equal scores (inverts FR19). Use for region matching where parent hints
+            contain child names.
 
     Returns:
         dict with keys:
@@ -235,14 +259,14 @@ def fuzzy_match(input_str: str, master_list: list[dict]) -> dict:
     searchable = _expand_searchable_list(master_list)
 
     # CA-1: Substring matching (highest confidence)
-    result = _ca1_substring_match(input_str, searchable)
+    result = _ca1_substring_match(input_str, searchable, prefer_canonical)
     if result is not None:
         logger.info("CA-1 match: '%s' → '%s' (score=%.4f, via_hint=%s)",
                      input_str, result["matched_name"], result["score"], result["via_hint"])
         return result
 
     # CA-2: Jaro-Winkler (fallback)
-    result = _ca2_jaro_winkler(input_str, searchable)
+    result = _ca2_jaro_winkler(input_str, searchable, prefer_canonical)
     if result is not None:
         logger.info("CA-2 match: '%s' → '%s' (score=%.4f, via_hint=%s)",
                      input_str, result["matched_name"], result["score"], result["via_hint"])

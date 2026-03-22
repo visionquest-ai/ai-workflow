@@ -1236,12 +1236,21 @@ nodes:
               if gql_api_key:
                   headers["x-api-key"] = gql_api_key
 
-              # Query all Region nodes (no directory filter — regions are global)
+              # Query only Region nodes that participate in REGION_HAS_CHILD
+              # (either as parent or child) — these are the valid hierarchy nodes.
+              # Two aliased queries: parents (have children) and children (have parents).
               query = '''
-              query GetAllRegions {
-                region {
+              query GetHierarchyRegions {
+                parents: region(where: { regionHasChild_SOME: {} }) {
                   id
-                  name
+                  regionName
+                  regionType
+                  hints
+                }
+                children: region(where: { regionHasChildFrom_SOME: {} }) {
+                  id
+                  regionName
+                  regionType
                   hints
                 }
               }
@@ -1256,27 +1265,61 @@ nodes:
               )
               resp.raise_for_status()
               data = resp.json().get("data", {})
-              regions = data.get("region", [])
+
+              # Merge parents + children by id (union of both sets)
+              seen = {}
+              for r in (data.get("parents") or []) + (data.get("children") or []):
+                  if r["id"] not in seen:
+                      seen[r["id"]] = r
+
+              regions = list(seen.values())
 
               if not regions:
                   logger.warning(
-                      "resolve_region: No Region nodes returned from graph (url=%s)", gql_url
+                      "resolve_region: No Region nodes in hierarchy (url=%s)", gql_url
                   )
                   return {"region_match": {}}
+
+              # Deduplicate by regionName: if the same name appears at multiple
+              # hierarchy levels (e.g. "São Paulo" state and city), keep the
+              # higher level. Lower index = higher in hierarchy.
+              LEVEL_PRIORITY = {
+                  "country": 0,
+                  "country region": 1,
+                  "state": 2,
+                  "country city": 3,
+              }
+
+              best_by_name = {}
+              for r in regions:
+                  rname = (r.get("regionName") or "").strip().lower()
+                  rprio = LEVEL_PRIORITY.get(r.get("regionType", ""), 99)
+                  if rname not in best_by_name or rprio < best_by_name[rname][1]:
+                      best_by_name[rname] = (r, rprio)
+
+              deduped_regions = [entry[0] for entry in best_by_name.values()]
+
+              logger.info(
+                  "resolve_region: %d hierarchy nodes, %d after name dedup",
+                  len(regions), len(deduped_regions),
+              )
 
               # Build master list for fuzzy matching
               master_list = [
                   {
-                      "name": r["name"],
+                      "name": r["regionName"],
                       "id": r["id"],
                       "hints": r.get("hints") or "",
                   }
-                  for r in regions
+                  for r in deduped_regions
               ]
 
               # Import and run fuzzy matcher (from Story 2.1)
+              # prefer_canonical=True: when "Minas Gerais" matches both the
+              # canonical state name and a hint on Southeast (country region),
+              # prefer the canonical (state) match.
               from actions.fuzzy_match import fuzzy_match
-              result = fuzzy_match(extracted_region, master_list)
+              result = fuzzy_match(extracted_region, master_list, prefer_canonical=True)
 
               # Save to ApplicationFormFile if match found
               if result.get("matched_name"):
@@ -1285,7 +1328,7 @@ nodes:
                   # e.g. "Brazil, Southeast" (not raw "Brazil - Regional, Minas Gerais")
                   region_context_raw = state.get("extracted_region_context", "")
                   if region_context_raw:
-                      ctx_result = fuzzy_match(region_context_raw, master_list)
+                      ctx_result = fuzzy_match(region_context_raw, master_list, prefer_canonical=True)
                       ctx_name = ctx_result.get("matched_name", "")
                       if ctx_name and ctx_name != result["matched_name"]:
                           region_display = f"{ctx_name}, {result['matched_name']}"
