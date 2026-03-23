@@ -104,20 +104,22 @@ def agent_def():
 @pytest.fixture
 def default_settings():
     """Default agent settings — mirrors settings section in file_extraction.yaml."""
-    return {
-        "llamaextract": {"timeout": 300, "max_retries": 3},
-        "directories": {
-            "chambers":      {"extraction_mode": "balanced", "agent_base_name": "chambers-partners"},
-            "iflr1000":      {"extraction_mode": "balanced", "agent_base_name": "iflr-1000"},
-            "legal500":      {"extraction_mode": "premium",  "agent_base_name": "the-legal-500"},
-            "itr":           {"extraction_mode": "balanced", "agent_base_name": "itr-world-tax"},
-            "leadersleague": {"extraction_mode": "balanced", "agent_base_name": "leaders-league"},
-        },
-        "directory_aliases": {
-            "legal 500": "legal500",
-            "leaders league": "leadersleague",
-        },
-    }
+    return {"llamaextract": {"timeout": 300, "max_retries": 3}}
+
+
+DIR_VARIABLES = {
+    "directories": {
+        "chambers":      {"extraction_mode": "balanced", "agent_base_name": "chambers-partners"},
+        "iflr1000":      {"extraction_mode": "balanced", "agent_base_name": "iflr-1000"},
+        "legal500":      {"extraction_mode": "premium",  "agent_base_name": "the-legal-500"},
+        "itr":           {"extraction_mode": "balanced", "agent_base_name": "itr-world-tax"},
+        "leadersleague": {"extraction_mode": "balanced", "agent_base_name": "leaders-league"},
+    },
+    "directory_aliases": {
+        "legal 500": "legal500",
+        "leaders league": "leadersleague",
+    },
+}
 
 
 # =============================================================================
@@ -325,7 +327,7 @@ class TestResolveAgentNode:
 
     def test_unsupported_directory_returns_error_with_list(self, agent_def, default_settings):
         """AC5: Unknown directoryName returns error listing supported directories."""
-        state = {"directory_name": "unknown_dir"}
+        state = {"directory_name": "unknown_dir", "variables": DIR_VARIABLES}
         result = _exec_node(agent_def, "resolve_agent", state, settings=default_settings)
         assert result["status"] == "error"
         assert "Unknown directory" in result["error"]
@@ -336,62 +338,62 @@ class TestResolveAgentNode:
 
     def test_chambers_resolves_correctly(self, agent_def, default_settings):
         """AC1/AC11: chambers resolves to rankellix-chambers-partners-balanced."""
-        state = {"directory_name": "chambers"}
+        state = {"directory_name": "chambers", "variables": DIR_VARIABLES}
         result = _exec_node(agent_def, "resolve_agent", state, settings=default_settings)
         assert result["agent_name_used"] == "rankellix-chambers-partners-balanced"
         assert result["status"] == "agent_selected"
 
     def test_iflr1000_resolves_correctly(self, agent_def, default_settings):
         """AC1: iflr1000 resolves correctly."""
-        state = {"directory_name": "iflr1000"}
+        state = {"directory_name": "iflr1000", "variables": DIR_VARIABLES}
         result = _exec_node(agent_def, "resolve_agent", state, settings=default_settings)
         assert result["agent_name_used"] == "rankellix-iflr-1000-balanced"
 
     def test_legal500_resolves_correctly(self, agent_def, default_settings):
         """AC1: legal500 resolves correctly."""
-        state = {"directory_name": "legal500"}
+        state = {"directory_name": "legal500", "variables": DIR_VARIABLES}
         result = _exec_node(agent_def, "resolve_agent", state, settings=default_settings)
         assert result["agent_name_used"] == "rankellix-the-legal-500-balanced"
 
     def test_legal500_with_space_resolves(self, agent_def, default_settings):
         """AC1: 'legal 500' (with space) also resolves."""
-        state = {"directory_name": "legal 500"}
+        state = {"directory_name": "legal 500", "variables": DIR_VARIABLES}
         result = _exec_node(agent_def, "resolve_agent", state, settings=default_settings)
         assert result["agent_name_used"] == "rankellix-the-legal-500-balanced"
 
     def test_itr_resolves_correctly(self, agent_def, default_settings):
         """AC1: itr resolves correctly."""
-        state = {"directory_name": "itr"}
+        state = {"directory_name": "itr", "variables": DIR_VARIABLES}
         result = _exec_node(agent_def, "resolve_agent", state, settings=default_settings)
         assert result["agent_name_used"] == "rankellix-itr-world-tax-balanced"
 
     def test_leadersleague_resolves_correctly(self, agent_def, default_settings):
         """AC1: leadersleague resolves correctly."""
-        state = {"directory_name": "leadersleague"}
+        state = {"directory_name": "leadersleague", "variables": DIR_VARIABLES}
         result = _exec_node(agent_def, "resolve_agent", state, settings=default_settings)
         assert result["agent_name_used"] == "rankellix-leaders-league-balanced"
 
     def test_mode_from_state_fast(self, agent_def, default_settings):
         """AC11: Mode from state._extraction_mode='fast' produces correct agent name."""
-        state = {"directory_name": "chambers", "_extraction_mode": "fast"}
+        state = {"directory_name": "chambers", "_extraction_mode": "fast", "variables": DIR_VARIABLES}
         result = _exec_node(agent_def, "resolve_agent", state, settings=default_settings)
         assert result["agent_name_used"] == "rankellix-chambers-partners-fast"
 
     def test_mode_from_state_accurate(self, agent_def, default_settings):
         """AC11: Mode from state._extraction_mode='accurate' produces correct agent name."""
-        state = {"directory_name": "itr", "_extraction_mode": "accurate"}
+        state = {"directory_name": "itr", "_extraction_mode": "accurate", "variables": DIR_VARIABLES}
         result = _exec_node(agent_def, "resolve_agent", state, settings=default_settings)
         assert result["agent_name_used"] == "rankellix-itr-world-tax-accurate"
 
     def test_case_insensitive_directory_name(self, agent_def, default_settings):
         """AC1: directoryName is case-insensitive."""
-        state = {"directory_name": "CHAMBERS"}
+        state = {"directory_name": "CHAMBERS", "variables": DIR_VARIABLES}
         result = _exec_node(agent_def, "resolve_agent", state, settings=default_settings)
         assert result["agent_name_used"] == "rankellix-chambers-partners-balanced"
 
     def test_agent_name_prefix_env(self, agent_def, default_settings):
         """Agent name includes AGENT_NAME_PREFIX when set."""
-        state = {"directory_name": "chambers"}
+        state = {"directory_name": "chambers", "variables": DIR_VARIABLES}
         original = os.environ.get("AGENT_NAME_PREFIX")
         try:
             os.environ["AGENT_NAME_PREFIX"] = "dev"
@@ -409,55 +411,54 @@ class TestResolveAgentNode:
 # =============================================================================
 
 class TestSettingsDrivenDirectoryConfig:
-    """Tests that extraction_mode and agent_base_name come from settings.directories."""
+    """Tests that extraction_mode and agent_base_name come from variables.directories."""
 
     def test_legal500_configured_as_premium(self, agent_def):
-        """settings.directories has legal500 extraction_mode=premium."""
-        dirs = agent_def["settings"]["directories"]
+        """variables.directories has legal500 extraction_mode=premium."""
+        dirs = agent_def["variables"]["directories"]
         assert dirs["legal500"]["extraction_mode"] == "premium"
 
     def test_all_directories_have_required_keys(self, agent_def):
-        """Every entry in settings.directories has extraction_mode and agent_base_name."""
-        dirs = agent_def["settings"]["directories"]
+        """Every entry in variables.directories has extraction_mode and agent_base_name."""
+        dirs = agent_def["variables"]["directories"]
         for key, entry in dirs.items():
             assert "extraction_mode" in entry, f"{key} missing extraction_mode"
             assert "agent_base_name" in entry, f"{key} missing agent_base_name"
 
     def test_legal500_resolves_with_premium_mode(self, agent_def, default_settings):
         """legal500 uses premium mode end-to-end in resolve_agent."""
-        state = {"directory_name": "legal500", "_extraction_mode": "premium"}
+        state = {"directory_name": "legal500", "_extraction_mode": "premium", "variables": DIR_VARIABLES}
         result = _exec_node(agent_def, "resolve_agent", state, settings=default_settings)
         assert result["agent_name_used"] == "rankellix-the-legal-500-premium"
 
     def test_alias_legal_500_with_space_resolves_agent(self, agent_def, default_settings):
         """'legal 500' alias resolves to legal500 config in resolve_agent."""
-        state = {"directory_name": "legal 500", "_extraction_mode": "premium"}
+        state = {"directory_name": "legal 500", "_extraction_mode": "premium", "variables": DIR_VARIABLES}
         result = _exec_node(agent_def, "resolve_agent", state, settings=default_settings)
         assert result["agent_name_used"] == "rankellix-the-legal-500-premium"
 
     def test_alias_leaders_league_with_space_resolves_agent(self, agent_def, default_settings):
         """'leaders league' alias resolves to leadersleague config in resolve_agent."""
-        state = {"directory_name": "leaders league"}
+        state = {"directory_name": "leaders league", "variables": DIR_VARIABLES}
         result = _exec_node(agent_def, "resolve_agent", state, settings=default_settings)
         assert result["agent_name_used"] == "rankellix-leaders-league-balanced"
 
     def test_unknown_directory_lists_configured_keys(self, agent_def, default_settings):
-        """Unknown directory error lists keys from settings.directories."""
-        state = {"directory_name": "unknown"}
+        """Unknown directory error lists keys from variables.directories."""
+        state = {"directory_name": "unknown", "variables": DIR_VARIABLES}
         result = _exec_node(agent_def, "resolve_agent", state, settings=default_settings)
         assert result["status"] == "error"
-        # Should list the canonical directory keys, not hardcoded aliases
         assert "chambers" in result["error"]
         assert "legal500" in result["error"]
 
     def test_missing_extraction_mode_defaults_to_balanced(self, agent_def):
         """If a directory entry has no extraction_mode, default is 'balanced'."""
-        settings = {
+        custom_vars = {
             "directories": {"testdir": {"agent_base_name": "test-dir"}},
             "directory_aliases": {},
         }
-        state = {"directory_name": "testdir"}
-        result = _exec_node(agent_def, "resolve_agent", state, settings=settings)
+        state = {"directory_name": "testdir", "variables": custom_vars}
+        result = _exec_node(agent_def, "resolve_agent", state)
         assert result["agent_name_used"] == "rankellix-test-dir-balanced"
 
 
@@ -836,7 +837,7 @@ class TestDetectDirectoryTextExtraction:
 
     def test_existing_resolve_agent_works_with_detected_directory(self, agent_def, default_settings):
         """AC12: resolve_agent still works when directory_name comes from detect_directory."""
-        state = {"directory_name": "chambers", "_extraction_mode": "balanced"}
+        state = {"directory_name": "chambers", "_extraction_mode": "balanced", "variables": DIR_VARIABLES}
         result = _exec_node(agent_def, "resolve_agent", state, settings=default_settings)
         assert result["agent_name_used"] == "rankellix-chambers-partners-balanced"
         assert result["status"] == "agent_selected"

@@ -27,6 +27,7 @@ settings:
     timeout: 300
     max_retries: 3
 
+variables:
   # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   #  DIRECTORY CONFIGURATION
   #  Edit these values to change extraction behavior per directory.
@@ -56,8 +57,6 @@ settings:
   directory_aliases:
     "legal 500": legal500
     "leaders league": leadersleague
-
-variables:
 
 state_schema:
   # Input (required)
@@ -291,8 +290,8 @@ nodes:
           "document_text": document_text,
           "file_name": file_name,
           "year": year,
-          "_extraction_mode": settings.get("directories", {}).get(
-              settings.get("directory_aliases", {}).get(directory_name, directory_name),
+          "_extraction_mode": state.get("variables", {}).get("directories", {}).get(
+              state.get("variables", {}).get("directory_aliases", {}).get(directory_name, directory_name),
               {},
           ).get("extraction_mode", "balanced"),
       }
@@ -691,9 +690,10 @@ nodes:
       directory_name = (state.get("directory_name") or "").lower().strip()
       extraction_mode = (state.get("_extraction_mode") or "balanced")
 
-      # Resolve directory config from settings (top of this YAML file)
-      dirs_cfg = settings.get("directories", {})
-      aliases = settings.get("directory_aliases", {})
+      # Resolve directory config from variables (top of this YAML file)
+      _vars = state.get("variables", {})
+      dirs_cfg = _vars.get("directories", {})
+      aliases = _vars.get("directory_aliases", {})
       canonical = aliases.get(directory_name, directory_name)
       dir_entry = dirs_cfg.get(canonical, {})
 
