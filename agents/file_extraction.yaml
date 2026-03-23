@@ -273,7 +273,7 @@ nodes:
           "document_text": document_text,
           "file_name": file_name,
           "year": year,
-          "_extraction_mode": "balanced",
+          "_extraction_mode": "premium" if directory_name == "legal500" else "balanced",
       }
 
   # Step 2b: Set status "reading" after successful download (AC1, AC6)
