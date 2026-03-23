@@ -1117,8 +1117,13 @@ nodes:
       query GetLegalField($paId: ID!) {
         practiceArea(where: { id_EQ: $paId }) {
           practiceAreaHasLegalField {
-            id
-            name
+            ... on LegalField {
+              id
+              lfName
+            }
+            ... on MultipleLegalField {
+              id
+            }
           }
         }
       }
@@ -1149,7 +1154,7 @@ nodes:
                   if not isinstance(lf_list, list):
                       lf_list = [lf_list]
                   if lf_list:
-                      lf_names = [lf.get("name", "") for lf in lf_list if lf.get("name")]
+                      lf_names = [lf.get("lfName", "") for lf in lf_list if lf.get("lfName")]
                       lf_ids = [lf.get("id", "") for lf in lf_list if lf.get("id")]
 
                       # Persist to ApplicationFormFile (now [String] arrays)
