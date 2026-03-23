@@ -1101,7 +1101,7 @@ nodes:
   # Step 5d: Derive LegalField from matched PracticeArea via graph traversal (Story 2.4)
   - name: derive_legal_field
     goto:
-      - to: resolve_region
+      - to: derive_category
     run: |
       import os
       import time
@@ -1218,6 +1218,123 @@ nodes:
                       MAX_RETRIES, gql_url, e,
                   )
                   return {"legal_field_name": [], "legal_field_id": []}
+
+  # Step 5d2: Derive Category from matched PracticeArea via graph traversal
+  - name: derive_category
+    goto:
+      - to: resolve_region
+    run: |
+      import os
+      import time
+      import logging
+
+      logger = logging.getLogger(__name__)
+
+      pa_match = state.get("practice_area_match", {})
+      pa_id = pa_match.get("matched_id", "")
+
+      if not pa_id:
+          logger.debug("derive_category: no practiceAreaId, skipping")
+          return {"category_name": None, "category_id": None}
+
+      # Resolve GraphQL connection (consistent pattern across all steps)
+      gql_url = (
+          state.get("variables", {}).get("GRAPHOLOGY_URL")
+          or os.environ.get("GRAPHOLOGY_URL")
+          or os.environ.get("GRAPHQL_ENDPOINT")
+          or "http://localhost:4000"
+      )
+      gql_api_key = (
+          state.get("variables", {}).get("GRAPHOLOGY_API_KEY")
+          or os.environ.get("GRAPHOLOGY_API_KEY")
+          or os.environ.get("GRAPHQL_API_KEY")
+      )
+
+      query = '''
+      query GetCategory($paId: ID!) {
+        practiceArea(where: { id_EQ: $paId }) {
+          practiceAreaHasCategory {
+            id
+            categoryName
+          }
+        }
+      }
+      '''
+
+      MAX_RETRIES = 2
+      RETRY_DELAY = 2
+
+      import requests as req
+      for attempt in range(1, MAX_RETRIES + 1):
+          try:
+              headers = {"Content-Type": "application/json"}
+              if gql_api_key:
+                  headers["x-api-key"] = gql_api_key
+
+              resp = req.post(
+                  gql_url,
+                  json={"query": query, "variables": {"paId": pa_id}},
+                  timeout=30,
+                  headers=headers,
+              )
+              resp.raise_for_status()
+              data = resp.json().get("data", {})
+              pas = data.get("practiceArea", [])
+
+              if pas and pas[0].get("practiceAreaHasCategory"):
+                  cat_list = pas[0]["practiceAreaHasCategory"]
+                  if not isinstance(cat_list, list):
+                      cat_list = [cat_list]
+                  if cat_list:
+                      # String fields — take first match
+                      cat_name = cat_list[0].get("categoryName", "")
+                      cat_id = cat_list[0].get("id", "")
+
+                      # Persist to ApplicationFormFile (String, not array)
+                      context_node_id = state.get("context_node_id", "")
+                      if context_node_id and cat_name:
+                          try:
+                              update_result = actions["graphology.update_node"](
+                                  state=state,
+                                  node_id=context_node_id,
+                                  node_type="ApplicationFormFile",
+                                  updates={
+                                      "category": cat_name,
+                                      "categoryId": cat_id,
+                                  },
+                                  graphql_url=gql_url,
+                                  graphql_api_key=gql_api_key,
+                              )
+                              if not update_result.get("success"):
+                                  logger.warning(
+                                      "derive_category: update_node failed (url=%s): %s",
+                                      gql_url, update_result.get("error", "unknown"),
+                                  )
+                          except Exception as ue:
+                              logger.warning("derive_category: update_node exception (url=%s): %s", gql_url, ue)
+
+                      logger.info(
+                          "derive_category: Found Category: %s (id=%s)",
+                          cat_name, cat_id,
+                      )
+                      return {"category_name": cat_name, "category_id": cat_id}
+
+              logger.warning("derive_category: No Category found for PracticeArea %s", pa_id)
+              return {"category_name": None, "category_id": None}
+
+          except Exception as e:
+              if attempt < MAX_RETRIES:
+                  logger.warning(
+                      "derive_category: attempt %d/%d failed (url=%s): %s — retrying in %ds",
+                      attempt, MAX_RETRIES, gql_url, e, RETRY_DELAY,
+                  )
+                  time.sleep(RETRY_DELAY)
+              else:
+                  logger.warning(
+                      "derive_category: all %d attempts failed (url=%s): %s",
+                      MAX_RETRIES, gql_url, e,
+                  )
+                  return {"category_name": None, "category_id": None}
 
   # Step 5e: Resolve Region via fuzzy matching against graph Region nodes (Story 3.2)
   - name: resolve_region
