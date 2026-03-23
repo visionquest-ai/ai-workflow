@@ -24,22 +24,40 @@ description: |
 
 settings:
   llamaextract:
-    mode: BALANCED
     timeout: 300
     max_retries: 3
 
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  #  DIRECTORY CONFIGURATION
+  #  Edit these values to change extraction behavior per directory.
+  #
+  #  extraction_mode : balanced | premium | multimodal | fast
+  #  agent_base_name : slug used to build the LlamaExtract agent
+  #      → Final agent name = rankellix-{agent_base_name}-{extraction_mode}
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  directories:
+    chambers:
+      extraction_mode: balanced
+      agent_base_name: chambers-partners
+    iflr1000:
+      extraction_mode: balanced
+      agent_base_name: iflr-1000
+    legal500:
+      extraction_mode: premium
+      agent_base_name: the-legal-500
+    itr:
+      extraction_mode: balanced
+      agent_base_name: itr-world-tax
+    leadersleague:
+      extraction_mode: balanced
+      agent_base_name: leaders-league
+
+  # Aliases — map alternate directory names to a key above
+  directory_aliases:
+    "legal 500": legal500
+    "leaders league": leadersleague
+
 variables:
-  # Mapping from directoryName to LlamaExtract agent base name
-  # Agent name format: rankellix-{base_name}-{mode}
-  # Agents created via: spa-base/scripts/rankellix/upload_to_llamaextract.py
-  agent_base_names:
-    chambers: chambers-partners
-    iflr1000: iflr-1000
-    legal500: the-legal-500
-    "legal 500": the-legal-500
-    itr: itr-world-tax
-    leadersleague: leaders-league
-    "leaders league": leaders-league
 
 state_schema:
   # Input (required)
@@ -273,7 +291,10 @@ nodes:
           "document_text": document_text,
           "file_name": file_name,
           "year": year,
-          "_extraction_mode": "premium" if directory_name == "legal500" else "balanced",
+          "_extraction_mode": settings.get("directories", {}).get(
+              settings.get("directory_aliases", {}).get(directory_name, directory_name),
+              {},
+          ).get("extraction_mode", "balanced"),
       }
 
   # Step 2b: Set status "reading" after successful download (AC1, AC6)
@@ -670,20 +691,15 @@ nodes:
       directory_name = (state.get("directory_name") or "").lower().strip()
       extraction_mode = (state.get("_extraction_mode") or "balanced")
 
-      # Map directoryName to agent base name (same as spa-base)
-      base_name_map = {
-          "chambers": "chambers-partners",
-          "iflr1000": "iflr-1000",
-          "legal500": "the-legal-500",
-          "legal 500": "the-legal-500",
-          "itr": "itr-world-tax",
-          "leadersleague": "leaders-league",
-          "leaders league": "leaders-league",
-      }
+      # Resolve directory config from settings (top of this YAML file)
+      dirs_cfg = settings.get("directories", {})
+      aliases = settings.get("directory_aliases", {})
+      canonical = aliases.get(directory_name, directory_name)
+      dir_entry = dirs_cfg.get(canonical, {})
 
-      base_name = base_name_map.get(directory_name)
+      base_name = dir_entry.get("agent_base_name")
       if not base_name:
-          supported = list(base_name_map.keys())
+          supported = list(dirs_cfg.keys())
           _set_failed()
           return {
               "status": "error",

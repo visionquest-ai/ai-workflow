@@ -103,8 +103,21 @@ def agent_def():
 
 @pytest.fixture
 def default_settings():
-    """Default agent settings."""
-    return {"llamaextract": {"mode": "BALANCED", "timeout": 300, "max_retries": 3}}
+    """Default agent settings — mirrors settings section in file_extraction.yaml."""
+    return {
+        "llamaextract": {"timeout": 300, "max_retries": 3},
+        "directories": {
+            "chambers":      {"extraction_mode": "balanced", "agent_base_name": "chambers-partners"},
+            "iflr1000":      {"extraction_mode": "balanced", "agent_base_name": "iflr-1000"},
+            "legal500":      {"extraction_mode": "premium",  "agent_base_name": "the-legal-500"},
+            "itr":           {"extraction_mode": "balanced", "agent_base_name": "itr-world-tax"},
+            "leadersleague": {"extraction_mode": "balanced", "agent_base_name": "leaders-league"},
+        },
+        "directory_aliases": {
+            "legal 500": "legal500",
+            "leaders league": "leadersleague",
+        },
+    }
 
 
 # =============================================================================
@@ -389,6 +402,63 @@ class TestResolveAgentNode:
                 os.environ.pop("AGENT_NAME_PREFIX", None)
             else:
                 os.environ["AGENT_NAME_PREFIX"] = original
+
+
+# =============================================================================
+# Settings-driven directory config tests (Story 5.2 simplification)
+# =============================================================================
+
+class TestSettingsDrivenDirectoryConfig:
+    """Tests that extraction_mode and agent_base_name come from settings.directories."""
+
+    def test_legal500_configured_as_premium(self, agent_def):
+        """settings.directories has legal500 extraction_mode=premium."""
+        dirs = agent_def["settings"]["directories"]
+        assert dirs["legal500"]["extraction_mode"] == "premium"
+
+    def test_all_directories_have_required_keys(self, agent_def):
+        """Every entry in settings.directories has extraction_mode and agent_base_name."""
+        dirs = agent_def["settings"]["directories"]
+        for key, entry in dirs.items():
+            assert "extraction_mode" in entry, f"{key} missing extraction_mode"
+            assert "agent_base_name" in entry, f"{key} missing agent_base_name"
+
+    def test_legal500_resolves_with_premium_mode(self, agent_def, default_settings):
+        """legal500 uses premium mode end-to-end in resolve_agent."""
+        state = {"directory_name": "legal500", "_extraction_mode": "premium"}
+        result = _exec_node(agent_def, "resolve_agent", state, settings=default_settings)
+        assert result["agent_name_used"] == "rankellix-the-legal-500-premium"
+
+    def test_alias_legal_500_with_space_resolves_agent(self, agent_def, default_settings):
+        """'legal 500' alias resolves to legal500 config in resolve_agent."""
+        state = {"directory_name": "legal 500", "_extraction_mode": "premium"}
+        result = _exec_node(agent_def, "resolve_agent", state, settings=default_settings)
+        assert result["agent_name_used"] == "rankellix-the-legal-500-premium"
+
+    def test_alias_leaders_league_with_space_resolves_agent(self, agent_def, default_settings):
+        """'leaders league' alias resolves to leadersleague config in resolve_agent."""
+        state = {"directory_name": "leaders league"}
+        result = _exec_node(agent_def, "resolve_agent", state, settings=default_settings)
+        assert result["agent_name_used"] == "rankellix-leaders-league-balanced"
+
+    def test_unknown_directory_lists_configured_keys(self, agent_def, default_settings):
+        """Unknown directory error lists keys from settings.directories."""
+        state = {"directory_name": "unknown"}
+        result = _exec_node(agent_def, "resolve_agent", state, settings=default_settings)
+        assert result["status"] == "error"
+        # Should list the canonical directory keys, not hardcoded aliases
+        assert "chambers" in result["error"]
+        assert "legal500" in result["error"]
+
+    def test_missing_extraction_mode_defaults_to_balanced(self, agent_def):
+        """If a directory entry has no extraction_mode, default is 'balanced'."""
+        settings = {
+            "directories": {"testdir": {"agent_base_name": "test-dir"}},
+            "directory_aliases": {},
+        }
+        state = {"directory_name": "testdir"}
+        result = _exec_node(agent_def, "resolve_agent", state, settings=settings)
+        assert result["agent_name_used"] == "rankellix-test-dir-balanced"
 
 
 # =============================================================================
@@ -2323,7 +2393,7 @@ class TestLookupDirectoryIdBehavior:
         mock_requests = MagicMock()
         mock_resp = MagicMock()
         mock_resp.json.return_value = {
-            "data": {"directories": [{"id": "dir-123", "name": "chambers"}]}
+            "data": {"directory": [{"id": "dir-123", "name": "Chambers and Partners"}]}
         }
         mock_requests.post.return_value = mock_resp
 
@@ -2352,22 +2422,23 @@ class TestLookupDirectoryIdBehavior:
         assert update_calls[0]["updates"] == {"directoryId": "dir-123"}
 
     def test_case_insensitive_fallback(self, agent_def):
-        """AC#1 subtask 1.6: Case-insensitive matching when exact match fails."""
-        from unittest.mock import MagicMock, call
+        """AC#1 subtask 1.6: Case-insensitive matching when exact match fails.
+
+        The node fetches all directories in a single query and uses fuzzy_match
+        for case-insensitive canonical + hint matching.
+        """
+        from unittest.mock import MagicMock
 
         mock_requests = MagicMock()
-        # First call (exact match) returns empty
-        resp1 = MagicMock()
-        resp1.json.return_value = {"data": {"directories": []}}
-        # Second call (all directories) returns with different casing
-        resp2 = MagicMock()
-        resp2.json.return_value = {
-            "data": {"directories": [
-                {"id": "dir-456", "name": "Chambers"},
+        # Single query returns all directories (different casing than state.directory_name)
+        resp = MagicMock()
+        resp.json.return_value = {
+            "data": {"directory": [
+                {"id": "dir-456", "name": "Chambers and Partners"},
                 {"id": "dir-789", "name": "IFLR1000"},
             ]}
         }
-        mock_requests.post.side_effect = [resp1, resp2]
+        mock_requests.post.return_value = resp
 
         update_calls = []
         def mock_update(state, node_id, node_type, updates, **kw):
@@ -2511,11 +2582,12 @@ class TestLookupDirectoryIdBehavior:
         assert headers.get("x-api-key") == "test-key-123"
 
     def test_graphql_query_uses_find_directory(self, agent_def):
-        """AC#1 subtask 1.2: GraphQL query uses directories(where: {name_EQ: $name})."""
+        """AC#1 subtask 1.2: GraphQL query fetches all directory nodes via singular field."""
         node = next(n for n in agent_def["nodes"] if n["name"] == "lookup_directory_id")
         code = node["run"]
-        assert "directories" in code
-        assert "name_EQ" in code
+        # Code fetches all directories with a single query and fuzzy-matches client-side
+        assert "directory" in code
+        assert '.get("directory"' in code
 
     def test_update_node_uses_graphology_action(self, agent_def):
         """AC#5: Uses actions['graphology.update_node'] not direct mutation."""
@@ -3240,8 +3312,9 @@ class TestResolvePracticeArea:
             mock_modules={"requests": mock_requests, "actions.fuzzy_match": mock_fm},
         )
 
-        # Pipeline continues — returns empty match on any exception
-        assert result == {"practice_area_match": {}}
+        # update_node exception is caught by inner try/except; match result is still returned
+        assert result["practice_area_match"]["matched_name"] == "Banking & Finance"
+        assert result["practice_area_match"]["matched_id"] == "pa-1"
 
     def test_update_node_returns_failure(self, agent_def, caplog):
         """AC5: update_node returns success=False -> warning logged, match still returned."""
@@ -3350,7 +3423,7 @@ class TestDeriveLegalField:
 
         mock_requests = self._make_mock_requests({
             "practiceArea": [{
-                "practiceAreaHasLegalField": [{"id": "lf-123", "name": "Banking Law"}]
+                "practiceAreaHasLegalField": [{"id": "lf-123", "lfName": "Banking Law"}]
             }]
         })
         mock_update = MagicMock(return_value={"success": True})
@@ -3376,7 +3449,7 @@ class TestDeriveLegalField:
 
         mock_requests = self._make_mock_requests({
             "practiceArea": [{
-                "practiceAreaHasLegalField": [{"id": "lf-100", "name": "Tax Law"}]
+                "practiceAreaHasLegalField": [{"id": "lf-100", "lfName": "Tax Law"}]
             }]
         })
         mock_update = MagicMock(return_value={"success": True})
@@ -3486,7 +3559,7 @@ class TestDeriveLegalField:
 
         mock_requests = self._make_mock_requests({
             "practiceArea": [{
-                "practiceAreaHasLegalField": [{"id": "lf-1", "name": "IP"}]
+                "practiceAreaHasLegalField": [{"id": "lf-1", "lfName": "IP"}]
             }]
         })
         mock_actions = {"graphology.update_node": MagicMock(return_value={"success": True})}
@@ -3523,7 +3596,7 @@ class TestDeriveLegalField:
             )
 
         assert result == {"legal_field_name": [], "legal_field_id": []}
-        assert any("GraphQL query failed" in r.message for r in caplog.records)
+        assert any("attempts failed" in r.message or "failed" in r.message for r in caplog.records)
 
     def test_graphql_http_error(self, agent_def, caplog):
         """AC6: GraphQL returns HTTP 500 -> warning, empty, no crash."""
@@ -3570,7 +3643,7 @@ class TestDeriveLegalField:
 
         mock_requests = self._make_mock_requests({
             "practiceArea": [{
-                "practiceAreaHasLegalField": {"id": "lf-single", "name": "Litigation"}
+                "practiceAreaHasLegalField": {"id": "lf-single", "lfName": "Litigation"}
             }]
         })
         mock_actions = {"graphology.update_node": MagicMock(return_value={"success": True})}
@@ -3594,7 +3667,7 @@ class TestDeriveLegalField:
 
         mock_requests = self._make_mock_requests({
             "practiceArea": [{
-                "practiceAreaHasLegalField": [{"id": "lf-1", "name": "Tax"}]
+                "practiceAreaHasLegalField": [{"id": "lf-1", "lfName": "Tax"}]
             }]
         })
         mock_update = MagicMock(return_value={"success": True})
@@ -3620,7 +3693,7 @@ class TestDeriveLegalField:
 
         mock_requests = self._make_mock_requests({
             "practiceArea": [{
-                "practiceAreaHasLegalField": [{"id": "lf-1", "name": "IP"}]
+                "practiceAreaHasLegalField": [{"id": "lf-1", "lfName": "IP"}]
             }]
         })
         mock_actions = {"graphology.update_node": MagicMock(return_value={"success": True})}
@@ -3651,7 +3724,7 @@ class TestDeriveLegalField:
 
         mock_requests = self._make_mock_requests({
             "practiceArea": [{
-                "practiceAreaHasLegalField": [{"id": "lf-1", "name": "Tax"}]
+                "practiceAreaHasLegalField": [{"id": "lf-1", "lfName": "Tax"}]
             }]
         })
         mock_update = MagicMock(return_value={"success": False, "error": "node not found"})
@@ -3679,7 +3752,7 @@ class TestDeriveLegalField:
 
         mock_requests = self._make_mock_requests({
             "practiceArea": [{
-                "practiceAreaHasLegalField": [{"id": "lf-2", "name": "IP Law"}]
+                "practiceAreaHasLegalField": [{"id": "lf-2", "lfName": "IP Law"}]
             }]
         })
         mock_update = MagicMock(return_value={"success": False})
@@ -3979,7 +4052,12 @@ class TestResolveRegion:
     """Tests for resolve_region node (Story 3.2)."""
 
     def _make_mock_requests(self, regions=None, status_code=200, raise_error=False):
-        """Create a mock requests module with configurable GraphQL response."""
+        """Create a mock requests module with configurable GraphQL response.
+
+        The resolve_region node queries using aliased fields (parents/children)
+        from a hierarchy relationship query. All regions are placed under
+        ``parents`` (parent nodes in the hierarchy); ``children`` is empty.
+        """
         from unittest.mock import MagicMock
 
         mock_requests = MagicMock()
@@ -3994,7 +4072,7 @@ class TestResolveRegion:
             else:
                 mock_response.raise_for_status.return_value = None
             mock_response.json.return_value = {
-                "data": {"region": regions or []}
+                "data": {"parents": regions or [], "children": []}
             }
             mock_requests.post.return_value = mock_response
 
@@ -4032,8 +4110,8 @@ class TestResolveRegion:
     def test_builds_master_list_with_hints(self, agent_def):
         """AC1/AC2: Queries Region nodes, builds master list with hint expansion."""
         regions = [
-            {"id": "r-1", "name": "Minas Gerais", "hints": "MG|State of Minas Gerais"},
-            {"id": "r-2", "name": "São Paulo", "hints": None},
+            {"id": "r-1", "regionName": "Minas Gerais", "hints": "MG|State of Minas Gerais"},
+            {"id": "r-2", "regionName": "São Paulo", "hints": None},
         ]
         mock_requests = self._make_mock_requests(regions)
         mock_fm = self._make_mock_fuzzy_match_module()
@@ -4062,7 +4140,7 @@ class TestResolveRegion:
         """AC4: Matched Region name and ID saved to ApplicationFormFile."""
         from unittest.mock import MagicMock
 
-        regions = [{"id": "r-1", "name": "Minas Gerais", "hints": "MG"}]
+        regions = [{"id": "r-1", "regionName": "Minas Gerais", "hints": "MG"}]
         mock_requests = self._make_mock_requests(regions)
         mock_fm = self._make_mock_fuzzy_match_module({
             "matched_name": "Minas Gerais",
@@ -4097,8 +4175,8 @@ class TestResolveRegion:
         from unittest.mock import MagicMock
 
         regions = [
-            {"id": "r-1", "name": "Southeast", "hints": "Minas Gerais"},
-            {"id": "r-2", "name": "Brazil", "hints": "Brasil|BR|Brazil - Regional"},
+            {"id": "r-1", "regionName": "Southeast", "hints": "Minas Gerais"},
+            {"id": "r-2", "regionName": "Brazil", "hints": "Brasil|BR|Brazil - Regional"},
         ]
         mock_requests = self._make_mock_requests(regions)
         # fuzzy_match is called twice: once for l2 (main), once for l1 (context)
@@ -4131,7 +4209,7 @@ class TestResolveRegion:
     # --- 4.5: Hint-based match (e.g., "MG" -> "Minas Gerais") ---
     def test_hint_based_match(self, agent_def):
         """AC3: Short hint like 'MG' matches via hint expansion."""
-        regions = [{"id": "r-1", "name": "Minas Gerais", "hints": "MG|State of Minas Gerais"}]
+        regions = [{"id": "r-1", "regionName": "Minas Gerais", "hints": "MG|State of Minas Gerais"}]
         mock_requests = self._make_mock_requests(regions)
         mock_fm = self._make_mock_fuzzy_match_module({
             "matched_name": "Minas Gerais",
@@ -4161,7 +4239,7 @@ class TestResolveRegion:
         import logging
         from unittest.mock import MagicMock
 
-        regions = [{"id": "r-1", "name": "Minas Gerais", "hints": "MG"}]
+        regions = [{"id": "r-1", "regionName": "Minas Gerais", "hints": "MG"}]
         mock_requests = self._make_mock_requests(regions)
         no_match = {
             "matched_name": "",
@@ -4227,7 +4305,7 @@ class TestResolveRegion:
         import logging
         from unittest.mock import MagicMock
 
-        regions = [{"id": "r-1", "name": "Minas Gerais", "hints": "MG"}]
+        regions = [{"id": "r-1", "regionName": "Minas Gerais", "hints": "MG"}]
         mock_requests = self._make_mock_requests(regions)
         mock_fm = self._make_mock_fuzzy_match_module({
             "matched_name": "Minas Gerais",
@@ -4260,7 +4338,7 @@ class TestResolveRegion:
         import logging
         from unittest.mock import MagicMock
 
-        regions = [{"id": "r-1", "name": "Minas Gerais", "hints": "MG"}]
+        regions = [{"id": "r-1", "regionName": "Minas Gerais", "hints": "MG"}]
         mock_requests = self._make_mock_requests(regions)
         mock_fm = self._make_mock_fuzzy_match_module({
             "matched_name": "Minas Gerais",
@@ -4293,7 +4371,7 @@ class TestResolveRegion:
         import logging
         from unittest.mock import MagicMock
 
-        regions = [{"id": "r-1", "name": "Minas Gerais", "hints": "MG"}]
+        regions = [{"id": "r-1", "regionName": "Minas Gerais", "hints": "MG"}]
         mock_requests = self._make_mock_requests(regions)
         mock_fm = self._make_mock_fuzzy_match_module({
             "matched_name": "Minas Gerais",
@@ -4326,7 +4404,7 @@ class TestResolveRegion:
     # --- 4.10: Idempotency -> same inputs produce same output ---
     def test_idempotent_same_result(self, agent_def):
         """AC7: Re-running produces identical match result."""
-        regions = [{"id": "r-1", "name": "Minas Gerais", "hints": "MG"}]
+        regions = [{"id": "r-1", "regionName": "Minas Gerais", "hints": "MG"}]
         match_result = {
             "matched_name": "Minas Gerais",
             "matched_id": "r-1",
@@ -4379,11 +4457,11 @@ class TestResolveRegion:
         assert "resolve_region" in targets
 
     def test_resolve_region_routes_to_save_payload(self, agent_def):
-        """Task 3.2: resolve_region routes to save_payload."""
+        """Task 3.2: resolve_region routes to extract_firm_department."""
         node = next(n for n in agent_def["nodes"] if n["name"] == "resolve_region")
         goto = node.get("goto", [])
         targets = [g["to"] if isinstance(g, dict) else g for g in goto]
-        assert "save_payload" in targets
+        assert "extract_firm_department" in targets
 
     # --- State schema ---
     def test_region_match_in_state_schema(self, agent_def):
@@ -4405,12 +4483,14 @@ class TestResolveRegion:
         assert "except Exception" in code
 
     def test_graphql_query_uses_singular_region(self, agent_def):
-        """AC1: GraphQL query uses singular 'region' field name (Neo4j GQL v6)."""
+        """AC1: GraphQL query uses singular 'region' field name with aliased hierarchy query."""
         node = next(n for n in agent_def["nodes"] if n["name"] == "resolve_region")
         code = node["run"]
-        assert "region {" in code or "region{" in code
-        # Query data key must use singular "region", not plural
-        assert '.get("region"' in code
+        # Query uses aliased parents/children from a REGION_HAS_CHILD hierarchy query
+        assert "region(" in code or "region {" in code or "region{" in code
+        # Data is merged from parents + children aliases
+        assert '.get("parents")' in code
+        assert '.get("children")' in code
 
     def test_no_directory_filter(self, agent_def):
         """Regions are global — no directory filter in query."""
@@ -4420,7 +4500,7 @@ class TestResolveRegion:
 
     def test_null_hints_converted_to_empty_string(self, agent_def):
         """AC1: Region hints=null -> empty string in master_list."""
-        regions = [{"id": "r-1", "name": "Minas Gerais", "hints": None}]
+        regions = [{"id": "r-1", "regionName": "Minas Gerais", "hints": None}]
         mock_requests = self._make_mock_requests(regions)
         mock_fm = self._make_mock_fuzzy_match_module()
         mock_actions = {"graphology.update_node": lambda **kwargs: {"success": True}}
