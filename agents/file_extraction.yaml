@@ -1517,6 +1517,7 @@ nodes:
         payload: "{{ state.payload_json }}"
         classificationPayload: "{{ state.classification_json }}"
         detectedYear: "{{ state.detected_year }}"
+        year: "{{ state.detected_year }}"
       graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
     output: update_result
 
