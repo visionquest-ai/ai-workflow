@@ -731,7 +731,7 @@ nodes:
     with:
       file: "{{ state.storage_url }}"
       agent_name: "{{ state.agent_name_used }}"
-      mode: "{{ settings.llamaextract.mode }}"
+      mode: "{{ state._extraction_mode | default('balanced') }}"
       timeout: "{{ settings.llamaextract.timeout }}"
       max_retries: "{{ settings.llamaextract.max_retries }}"
     output: extract_result
