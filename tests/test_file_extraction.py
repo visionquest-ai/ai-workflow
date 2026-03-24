@@ -64,6 +64,12 @@ def _exec_node(agent_def, node_name, state, settings=None, mock_modules=None):
     settings = settings or agent_def.get("settings", {})
     mock_modules = mock_modules or {}
 
+    # Resolve Jinja2 templates ({{ variables.X | tojson }}) before exec
+    import json as _json
+    variables = agent_def.get("variables", {}) or {}
+    code = code.replace("{{ variables.directories | tojson }}", _json.dumps(variables.get("directories", {})))
+    code = code.replace("{{ variables.directory_aliases | tojson }}", _json.dumps(variables.get("directory_aliases", {})))
+
     # Build execution namespace
     namespace = {"state": state, "settings": settings}
 
@@ -453,12 +459,15 @@ class TestSettingsDrivenDirectoryConfig:
 
     def test_missing_extraction_mode_defaults_to_balanced(self, agent_def):
         """If a directory entry has no extraction_mode, default is 'balanced'."""
-        custom_vars = {
+        # Temporarily patch agent_def variables to test default behavior
+        import copy
+        patched = copy.deepcopy(agent_def)
+        patched["variables"] = {
             "directories": {"testdir": {"agent_base_name": "test-dir"}},
             "directory_aliases": {},
         }
-        state = {"directory_name": "testdir", "variables": custom_vars}
-        result = _exec_node(agent_def, "resolve_agent", state)
+        state = {"directory_name": "testdir"}
+        result = _exec_node(patched, "resolve_agent", state)
         assert result["agent_name_used"] == "rankellix-test-dir-balanced"
 
 
@@ -1252,6 +1261,12 @@ def _exec_node_with_actions(agent_def, node_name, state, mock_actions=None, mock
 
     mock_modules = mock_modules or {}
     mock_actions = mock_actions or {}
+
+    # Resolve Jinja2 templates ({{ variables.X | tojson }}) before exec
+    import json as _json
+    variables = agent_def.get("variables", {}) or {}
+    code = code.replace("{{ variables.directories | tojson }}", _json.dumps(variables.get("directories", {})))
+    code = code.replace("{{ variables.directory_aliases | tojson }}", _json.dumps(variables.get("directory_aliases", {})))
 
     namespace = {"state": state, "settings": agent_def.get("settings", {}), "actions": mock_actions}
 
