@@ -1441,7 +1441,7 @@ nodes:
                   len(regions), len(deduped_regions),
               )
 
-              # Build master list for fuzzy matching
+              # Build master list for fuzzy matching (skip nulls — defensive)
               master_list = [
                   {
                       "name": r["regionName"],
@@ -1449,6 +1449,7 @@ nodes:
                       "hints": r.get("hints") or "",
                   }
                   for r in deduped_regions
+                  if r.get("regionName")
               ]
 
               # Import and run fuzzy matcher (from Story 2.1)
