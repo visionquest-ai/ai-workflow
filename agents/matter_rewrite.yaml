@@ -1,0 +1,142 @@
+name: matter_rewrite
+description: |
+  Generates the rewritten matter and integrity audit.
+  Must be called after Stage B completes — consumes strategy_package from state.
+  Never reasons from scratch: executes the strategy as defined.
+
+settings:
+  llm:
+    model: claude-sonnet-4-6
+    temperature: 0.7
+  rate_limiters:
+    rewrite_llm:
+      rpm: 20
+  opik:
+    project_name: "matter-rewrite"
+
+state_schema:
+  # Input (required — passed from matter_strategy via invoke_agent)
+  matter_id: str
+  directory_code: str
+  target_research: str
+  B_strategy_node_id: str
+  stage_a_results: dict
+
+  # Input (optional)
+  metadata: dict
+
+  # Loaded
+  stage_config: dict
+
+  # LLM
+  rendered_prompt: dict
+  rewrite_llm_result: dict
+
+  # Integrity audit
+  integrity_check: dict
+
+  # Output
+  step_result: dict
+
+nodes:
+  - name: fetch_stage_config
+    uses: analysis.get_stage_config
+    with:
+      workflow_name: "MatterAnalysis"
+      directory_code: "{{ state.directory_code }}"
+      stage_key: "C_rewrite"
+      graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
+    output: stage_config
+
+  - name: render_rewrite_prompt
+    uses: analysis.render_prompt
+    with:
+      stage_config: "{{ state.stage_config }}"
+      agent_state: "{{ state }}"
+    output: rendered_prompt
+
+  - name: generate_rewrite
+    uses: ratelimit.wrap
+    with:
+      action: llm.call
+      limiter: rewrite_llm
+      rpm: "{{ settings.rate_limiters.rewrite_llm.rpm | default(20) }}"
+      args:
+        model: "{{ settings.llm.model }}"
+        temperature: "{{ settings.llm.temperature }}"
+        messages:
+          - role: system
+            content: "{{ state.rendered_prompt.system }}"
+          - role: user
+            content: "{{ state.rendered_prompt.user }}"
+    output: rewrite_llm_result
+
+  - name: run_integrity_audit
+    run: |
+      import json
+      import re
+
+      rewrite_result_raw = state.get("rewrite_llm_result", {})
+      # Unwrap ratelimit.wrap envelope
+      inner = rewrite_result_raw.get("result", rewrite_result_raw)
+      content = inner.get("content", inner.get("text", "")) if isinstance(inner, dict) else str(inner)
+
+      # Parse JSON
+      try:
+          content_clean = re.sub(r"```json\s*|\s*```", "", content).strip()
+          rewrite_data = json.loads(content_clean)
+      except Exception:
+          return {"integrity_check": {"passed": False, "error": "Failed to parse LLM response"}}
+
+      integrity = rewrite_data.get("integrity_check", {})
+
+      # Deterministic checks on top of LLM self-report
+      original_matter = state.get("stage_a_results", {}).get("original_matter", "")
+      rewritten = rewrite_data.get("rewritten_matter", "")
+
+      # Check: if rewritten_matter is empty → integrity fail
+      if not rewritten.strip():
+          integrity["object_preserved"] = False
+          integrity["integrity_notes"] = (integrity.get("integrity_notes") or "") + " Empty rewrite."
+
+      # Compute overall integrityPassed
+      integrity_passed = (
+          integrity.get("object_preserved", False)
+          and not integrity.get("invented_facts", True)
+          and not integrity.get("forced_criteria", True)
+          and integrity.get("directory_fit", False)
+      )
+
+      return {
+          "integrity_check": {**integrity, "passed": integrity_passed},
+          # Store parsed rewrite data back for post_process
+          "rewrite_llm_result": {
+              "result": {"content": json.dumps(rewrite_data)}
+          }
+      }
+
+  - name: post_process
+    uses: analysis.post_process
+    with:
+      stage_config: "{{ state.stage_config }}"
+      llm_result: "{{ state.rewrite_llm_result }}"
+      agent_state: "{{ state }}"
+      graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
+    output: step_result
+
+edges:
+  - from: __start__
+    to: fetch_stage_config
+  - from: fetch_stage_config
+    to: render_rewrite_prompt
+  - from: render_rewrite_prompt
+    to: generate_rewrite
+  - from: generate_rewrite
+    to: run_integrity_audit
+  - from: run_integrity_audit
+    to: post_process
+  - from: post_process
+    to: __end__
+
+config:
+  raise_exceptions: false

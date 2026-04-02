@@ -1,0 +1,139 @@
+name: matter_strategy
+description: |
+  Evaluates minimum applicability and produces a strategy package for a matter
+  against a target directory. Loads all config from the graph at runtime.
+  Gate evaluation is deterministic (no LLM). If gate passes, invokes matter_rewrite.
+
+settings:
+  llm:
+    model: claude-sonnet-4-6
+    temperature: 0.3
+  rate_limiters:
+    strategy_llm:
+      rpm: 20
+  opik:
+    project_name: "matter-strategy"
+
+state_schema:
+  # Input (required)
+  matter_id: str
+  directory_code: str        # "CH" | "L500" | "LL" | "ITR" | "IFLR"
+  target_research: str
+
+  # Input (optional)
+  metadata: dict             # matter_type, jurisdiction, client_type, sector, forum,
+                             # cross_border, value_at_stake, outcome, novelty
+
+  # Loaded
+  stage_config: dict         # output of analysis.get_stage_config
+  stage_a_results: dict      # output of analysis.get_stage_a_results
+
+  # Computed
+  gate_result: dict          # output of evaluate_gate run: block
+
+  # LLM
+  rendered_prompt: dict      # output of analysis.render_prompt
+  strategy_llm_result: dict  # output of llm.call
+
+  # Output
+  step_result: dict          # output of analysis.post_process (contains output_node_id)
+
+nodes:
+  - name: fetch_stage_config
+    uses: analysis.get_stage_config
+    with:
+      workflow_name: "MatterAnalysis"
+      directory_code: "{{ state.directory_code }}"
+      stage_key: "B_strategy"
+      graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
+    output: stage_config
+
+  - name: fetch_stage_a_results
+    uses: analysis.get_stage_a_results
+    with:
+      matter_id: "{{ state.matter_id }}"
+      graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
+    output: stage_a_results
+
+  - name: evaluate_gate
+    run: |
+      from matter_config import evaluate_minimum_gate
+      gate_rules = state.get("stage_config", {}).get("directory_profile", {}).get("gate_rules", [])
+      criteria = state.get("stage_a_results", {}).get("criteria", {})
+      return {
+          "gate_result": evaluate_minimum_gate(criteria, gate_rules)
+      }
+
+  - name: render_strategy_prompt
+    uses: analysis.render_prompt
+    with:
+      stage_config: "{{ state.stage_config }}"
+      agent_state: "{{ state }}"
+    output: rendered_prompt
+
+  - name: build_strategy
+    uses: ratelimit.wrap
+    with:
+      action: llm.call
+      limiter: strategy_llm
+      rpm: "{{ settings.rate_limiters.strategy_llm.rpm | default(20) }}"
+      args:
+        model: "{{ settings.llm.model }}"
+        temperature: "{{ settings.llm.temperature }}"
+        messages:
+          - role: system
+            content: "{{ state.rendered_prompt.system }}"
+          - role: user
+            content: "{{ state.rendered_prompt.user }}"
+    output: strategy_llm_result
+
+  - name: post_process
+    uses: analysis.post_process
+    with:
+      stage_config: "{{ state.stage_config }}"
+      llm_result: "{{ state.strategy_llm_result }}"
+      agent_state: "{{ state }}"
+      graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
+    output: step_result
+
+  - name: invoke_rewrite
+    uses: agents.invoke_agent
+    with:
+      agent: matter_rewrite
+      input_state:
+        matter_id: "{{ state.matter_id }}"
+        directory_code: "{{ state.directory_code }}"
+        target_research: "{{ state.target_research }}"
+        metadata: "{{ state.metadata }}"
+        stage_a_results: "{{ state.stage_a_results }}"
+        B_strategy_node_id: "{{ state.step_result.output_node_id }}"
+        strategy_package: "{{ state.step_result.parsed_result }}"
+
+edges:
+  - from: __start__
+    to: fetch_stage_config
+  - from: fetch_stage_config
+    to: fetch_stage_a_results
+  - from: fetch_stage_a_results
+    to: evaluate_gate
+  - from: evaluate_gate
+    to: render_strategy_prompt
+    condition: "{{ state.gate_result.passed }}"
+  - from: evaluate_gate
+    to: post_process
+    condition: "{{ not state.gate_result.passed }}"
+  - from: render_strategy_prompt
+    to: build_strategy
+  - from: build_strategy
+    to: post_process
+  - from: post_process
+    to: invoke_rewrite
+    condition: "{{ state.gate_result.passed and state.step_result.success }}"
+  - from: post_process
+    to: __end__
+    condition: "{{ not state.gate_result.passed or not state.step_result.success }}"
+  - from: invoke_rewrite
+    to: __end__
+
+config:
+  raise_exceptions: false
