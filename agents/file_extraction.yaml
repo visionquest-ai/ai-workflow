@@ -70,7 +70,10 @@ state_schema:
   year: str                  # Year from node data (fast path for year detection)
   file_mime_type: str        # MIME type of the file
   agent_name_used: str       # Resolved LlamaExtract agent name
-  extract_result: dict       # Result from llamaextract.extract
+  extraction_agent_id: str   # Resolved LlamaExtract agent ID (from agent_name_used)
+  extraction_job_id: str     # Async extraction job ID (from submit_job)
+  extraction_status: str     # Async extraction status: SUCCESS, PARTIAL_SUCCESS, ERROR, timeout
+  extract_result: dict       # Result from llamaextract.get_result (same shape as legacy llamaextract.extract)
   payload_json: str          # Serialized extraction result
 
   # Detection
@@ -661,7 +664,7 @@ nodes:
     goto:
       - if: "not state.agent_name_used"
         to: __end__
-      - to: run_extraction
+      - to: resolve_extraction_agent
     run: |
       import os
       import re
@@ -725,16 +728,242 @@ nodes:
 
       return {"agent_name_used": agent_name, "status": "agent_selected"}
 
-  # Step 4: Extract using LlamaExtract SDK with agent_name
-  - name: run_extraction
-    uses: llamaextract.extract
+  # Step 4a: Resolve LlamaExtract agent name → agent ID (required for async submit_job)
+  - name: resolve_extraction_agent
+    uses: llamaextract.get_agent
     with:
-      file: "{{ state.storage_url }}"
       agent_name: "{{ state.agent_name_used }}"
-      mode: "{{ state._extraction_mode | default('balanced') }}"
-      timeout: "{{ settings.llamaextract.timeout }}"
-      max_retries: "{{ settings.llamaextract.max_retries }}"
+    output: _agent_lookup
+
+  # Step 4b: Submit async extraction job (non-blocking — returns job_id immediately)
+  # When EXTRACT_CALLBACK_URL is set, registers Cloud Function webhook and exits —
+  # the Cloud Function handles all post-processing (fuzzy match, graph update).
+  # When not set, falls through to poll_extraction_status (local/fallback mode).
+  - name: submit_extraction_job
+    goto:
+      - if: "not state.extraction_job_id"
+        to: extraction_error
+      - if: "state._webhook_configured"
+        to: submitted_with_webhook
+      - to: poll_extraction_status
+    run: |
+      import logging
+      import os
+      _logger = logging.getLogger(__name__)
+
+      agent_lookup = state.get("_agent_lookup", {})
+      if not agent_lookup.get("success"):
+        error_msg = agent_lookup.get("error", "Failed to resolve LlamaExtract agent")
+        _logger.error("submit_extraction_job: agent lookup failed: %s", error_msg)
+        return {
+            "status": "error",
+            "error": f"Agent lookup failed: {error_msg}",
+            "extraction_agent_id": "",
+            "extraction_job_id": "",
+            "completed": True
+        }
+
+      agent_info = agent_lookup.get("agent", {})
+      agent_id = agent_info.get("id", "")
+      if not agent_id:
+        return {
+            "status": "error",
+            "error": "Agent lookup returned no ID",
+            "extraction_agent_id": "",
+            "extraction_job_id": "",
+            "completed": True
+        }
+
+      # Build webhook URL — prefer EXTRACT_CALLBACK_URL (Cloud Function),
+      # fall back to AI_WORKFLOW_URL/extract-callback (legacy FastAPI endpoint)
+      context_node_id = state.get("context_node_id", "")
+      callback_base = os.environ.get("EXTRACT_CALLBACK_URL", "").rstrip("/")
+      api_key = os.environ.get("RUN_AGENT_API_KEY", "")
+
+      webhook_url = None
+      webhook_headers = None
+      webhook_configured = False
+
+      if callback_base and context_node_id:
+          webhook_url = f"{callback_base}?nodeId={context_node_id}"
+          webhook_headers = {"x-api-key": api_key} if api_key else None
+          webhook_configured = True
+          _logger.info("submit_extraction_job: webhook registered → %s", webhook_url)
+      else:
+          # Legacy fallback
+          ai_workflow_url = os.environ.get("AI_WORKFLOW_URL", "").rstrip("/")
+          if ai_workflow_url:
+              webhook_url = f"{ai_workflow_url}/extract-callback"
+              webhook_headers = {"x-api-key": api_key} if api_key else None
+
+      submit_result = actions["llamaextract.submit_job"](
+          state=state,
+          file=state.get("storage_url", ""),
+          agent_id=agent_id,
+          mode=(state.get("_extraction_mode") or "balanced").upper(),
+          max_retries=3,
+          webhook_url=webhook_url,
+          webhook_headers=webhook_headers,
+      )
+
+      if not submit_result.get("success"):
+        error_msg = submit_result.get("error", "Job submission failed")
+        _logger.error("submit_extraction_job: submit failed: %s", error_msg)
+        return {
+            "status": "error",
+            "error": f"Job submission failed: {error_msg}",
+            "extraction_agent_id": agent_id,
+            "extraction_job_id": "",
+            "completed": True
+        }
+
+      job_id = submit_result.get("job_id", "")
+      _logger.info("submit_extraction_job: submitted job %s for agent %s (webhook=%s)", job_id, agent_id, webhook_configured)
+      return {
+          "extraction_agent_id": agent_id,
+          "extraction_job_id": job_id,
+          "_webhook_configured": webhook_configured,
+          "status": "extracting"
+      }
+
+  # Exit node when Cloud Function webhook is registered.
+  # Post-processing (fuzzy match, graph updates, status) is handled by the Cloud Function.
+  - name: submitted_with_webhook
+    goto:
+      - to: __end__
+    run: |
+      import logging
+      _logger = logging.getLogger(__name__)
+      _logger.info(
+          "submitted_with_webhook: job %s handed off to Cloud Function webhook",
+          state.get("extraction_job_id", ""),
+      )
+      return {"status": "success", "completed": True}
+
+  # Step 4c: Poll until extraction is done (poll_interval: 15s, max_wait: 700s)
+  - name: poll_extraction_status
+    goto:
+      - if: "state.extraction_status in ('SUCCESS', 'PARTIAL_SUCCESS')"
+        to: get_extraction_result
+      - if: "state.extraction_status in ('ERROR', 'timeout')"
+        to: extraction_error
+      - to: poll_extraction_status
+    run: |
+      import time
+      import logging
+      _logger = logging.getLogger(__name__)
+
+      POLL_INTERVAL = 15   # seconds between checks (AC: poll_interval: 15)
+      MAX_WAIT = 700        # total timeout seconds (AC: max_wait: 700)
+
+      job_id = state.get("extraction_job_id", "")
+      if not job_id:
+        return {"extraction_status": "ERROR", "error": "No extraction_job_id in state"}
+
+      elapsed = state.get("_extraction_poll_elapsed", 0)
+
+      if elapsed >= MAX_WAIT:
+        _logger.warning("poll_extraction_status: timeout after %ds for job %s", elapsed, job_id)
+        return {
+            "extraction_status": "timeout",
+            "error": f"Extraction job timed out after {elapsed}s (max_wait={MAX_WAIT})",
+            "status": "error",
+            "completed": True
+        }
+
+      _logger.info("poll_extraction_status: polling job %s (elapsed=%ds)", job_id, elapsed)
+      time.sleep(POLL_INTERVAL)
+      elapsed += POLL_INTERVAL
+
+      poll_result = actions["llamaextract.poll_status"](
+          state=state,
+          job_id=job_id,
+          timeout=10,
+          max_retries=2,
+      )
+
+      if not poll_result.get("success"):
+        # Transient API error — don't abort, continue polling unless we've timed out
+        _logger.warning(
+            "poll_extraction_status: poll API error for job %s: %s (elapsed=%ds)",
+            job_id, poll_result.get("error"), elapsed
+        )
+        return {"_extraction_poll_elapsed": elapsed}
+
+      api_status = poll_result.get("status", "UNKNOWN")
+      _logger.info("poll_extraction_status: job %s status=%s (elapsed=%ds)", job_id, api_status, elapsed)
+
+      # SUCCESS and PARTIAL_SUCCESS both mean result is available
+      if api_status in ("SUCCESS", "PARTIAL_SUCCESS"):
+        return {"extraction_status": api_status, "_extraction_poll_elapsed": elapsed}
+
+      # ERROR means extraction failed
+      if api_status == "ERROR":
+        return {
+            "extraction_status": "ERROR",
+            "error": poll_result.get("error", "Extraction failed"),
+            "_extraction_poll_elapsed": elapsed,
+            "status": "error",
+            "completed": True
+        }
+
+      # Still pending/running — loop
+      return {"extraction_status": api_status, "_extraction_poll_elapsed": elapsed}
+
+  # Step 4d: Retrieve extraction result (only reached when extraction_status is SUCCESS/PARTIAL_SUCCESS)
+  - name: get_extraction_result
+    uses: llamaextract.get_result
+    with:
+      job_id: "{{ state.extraction_job_id }}"
     output: extract_result
+    goto: prepare_payload
+
+  # Error exit for extraction failures
+  - name: extraction_error
+    goto:
+      - to: __end__
+    run: |
+      import json
+      import logging
+      _logger = logging.getLogger(__name__)
+
+      error_msg = state.get("error", "Extraction failed")
+      extraction_status = state.get("extraction_status", "ERROR")
+      _logger.error("extraction_error: job=%s status=%s error=%s",
+                    state.get("extraction_job_id", ""), extraction_status, error_msg)
+
+      # Set extract_result to error shape so prepare_payload handles it gracefully
+      # (downstream prepare_payload checks extract_result.get("success"))
+      extract_result = {
+          "success": False,
+          "error": error_msg,
+          "status": extraction_status,
+      }
+
+      # Best-effort status update to 'failed' on ApplicationFormFile
+      try:
+          import os
+          gql_url = (
+              state.get("variables", {}).get("GRAPHOLOGY_URL")
+              or os.environ.get("GRAPHOLOGY_URL")
+              or "http://localhost:4000"
+          )
+          actions["graphology.update_node"](
+              state=state,
+              node_id=state.get("context_node_id", ""),
+              node_type="ApplicationFormFile",
+              updates={"status": "failed"},
+              graphql_url=gql_url,
+          )
+      except Exception as ex:
+          _logger.warning("extraction_error: failed to update ApplicationFormFile status: %s", ex)
+
+      return {
+          "extract_result": extract_result,
+          "status": "error",
+          "error": error_msg,
+          "completed": True
+      }
 
   # Step 5: Serialize extraction result and clean up temp files
   - name: prepare_payload

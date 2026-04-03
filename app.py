@@ -21,9 +21,12 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, Header, HTTPException
+import requests
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, ConfigDict, model_validator
+
+from batch_accumulator import BatchAccumulator
 
 # Add the actions directory to path so graphology module is importable
 ACTIONS_DIR = os.environ.get("ACTIONS_DIR", str(Path(__file__).parent / "actions"))
@@ -33,6 +36,7 @@ if ACTIONS_DIR not in sys.path:
 # Import get_node from graphology actions
 from graphology import get_node, register_actions
 from agents import register_actions as register_agent_actions
+from analysis import register_actions as register_analysis_actions
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -49,6 +53,10 @@ async def lifespan(app):
 
 app = FastAPI(title="AI Workflow Service", version="0.1.0", lifespan=lifespan)
 
+# Per-process BatchAccumulator singleton — created at startup, shared across all fan-out threads.
+# Collects concurrent LLM calls within a 200ms window and dispatches them as a single batch.
+accumulator = BatchAccumulator()
+
 AGENTS_DIR = os.environ.get("AGENTS_DIR", str(Path(__file__).parent / "agents"))
 
 
@@ -57,19 +65,42 @@ AGENTS_DIR = os.environ.get("AGENTS_DIR", str(Path(__file__).parent / "agents"))
 # =============================================================================
 
 class RunAgentRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     agent: str
     workflow_id: Optional[str] = None
-    context_node_id: Optional[str] = None
+    context_node_id: Optional[str] = Field(None, alias="contextNodeId")
+    context_node_ids: Optional[list[str]] = Field(None, alias="contextNodeIds")
+    batch_id: Optional[str] = Field(None, alias="batchId")
+    job_id: Optional[str] = Field(None, alias="job_id")
+    job_ids: Optional[dict] = Field(None, alias="job_ids")  # context_node_id -> agentJob_id
     application_form_id: Optional[str] = None
-    async_mode: bool = False
+    directory_code: Optional[str] = None    # for matter_strategy + matter_rewrite
+    target_research: Optional[str] = None   # for matter_strategy + matter_rewrite
+    metadata: Optional[dict] = None         # for matter_strategy + matter_rewrite
+    async_mode: bool = Field(False, alias="asyncMode")
 
     @model_validator(mode="after")
     def resolve_node_id(self):
-        """Accept application_form_id as alias for context_node_id."""
+        """Accept application_form_id as alias for context_node_id.
+
+        Validates:
+        - context_node_id and context_node_ids cannot both be present
+        - At least one of context_node_id, application_form_id, or context_node_ids is required
+        """
+        # Reject both singular and plural at the same time
+        if self.context_node_id and self.context_node_ids:
+            raise ValueError(
+                "context_node_id and context_node_ids cannot both be provided — use one or the other"
+            )
+        # Accept application_form_id as alias for context_node_id
         if self.application_form_id and not self.context_node_id:
             self.context_node_id = self.application_form_id
-        if not self.context_node_id:
-            raise ValueError("Either context_node_id or application_form_id is required")
+        # Require at least one context source
+        if not self.context_node_id and not self.context_node_ids:
+            raise ValueError(
+                "Either context_node_id, contextNodeId, application_form_id, or context_node_ids/contextNodeIds is required"
+            )
         return self
 
 
@@ -81,6 +112,7 @@ class RunPromptRequest(BaseModel):
 
 class JobStatus(str, Enum):
     ACCEPTED = "accepted"
+    PENDING = "pending"
     RUNNING = "running"
     SUCCESS = "success"
     ERROR = "error"
@@ -142,6 +174,11 @@ def _load_and_run_agent(
     context_node_id: str,
     agents_dir: Optional[str] = None,
     actions_dir: Optional[str] = None,
+    directory_code: Optional[str] = None,
+    target_research: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    batch_id: Optional[str] = None,
+    agent_accumulator=None,
 ) -> dict:
     """
     Load a YAML agent and run it with context node data.
@@ -187,21 +224,32 @@ def _load_and_run_agent(
         engine = YAMLEngine()
         register_actions(engine.actions_registry, engine)
         register_agent_actions(engine.actions_registry, engine)
+        register_analysis_actions(engine.actions_registry, engine)
 
         engine.variables["GRAPHOLOGY_URL"] = os.environ.get("GRAPHOLOGY_URL", "http://localhost:4000")
         engine.variables["GRAPHOLOGY_API_KEY"] = os.environ.get("GRAPHOLOGY_API_KEY", "")
 
         graph = engine.load_from_file(str(agent_path))
 
-        input_state = {
-            "workflow_id": workflow_id,
-            "context_node_id": context_node_id,
-            "matter_context": matter_context,
-            "context_result": node_result,
-        }
+        if agent == "matter_strategy":
+            input_state = {
+                "matter_id": context_node_id,
+                "directory_code": directory_code,
+                "target_research": target_research or "",
+                "metadata": metadata or {},
+            }
+        else:
+            input_state = {
+                "workflow_id": workflow_id,
+                "context_node_id": context_node_id,
+                "matter_context": matter_context,
+                "context_result": node_result,
+            }
+
+        invoke_config = {"accumulator": agent_accumulator, "batch_id": batch_id}
 
         final_state = None
-        for event in graph.invoke(input_state):
+        for event in graph.invoke(input_state, config=invoke_config):
             logger.info(f"TEA event type: {type(event).__name__}")
             final_state = event
 
@@ -254,8 +302,69 @@ def _load_and_run_agent(
 # ASYNC JOB HELPERS
 # =============================================================================
 
-def _run_agent_job(job_id: str, agent: str, workflow_id: Optional[str], context_node_id: str):
-    """Run agent in background thread, updating job store with result."""
+def _notify_apollo(job_id: str, status: str, result: str = None, error: str = None):
+    """Call updateAgentJob mutation on Apollo. Called once when job reaches final state.
+
+    On exception: logs the error but does NOT re-raise — notification failure
+    must not discard the job result.
+    """
+    mutation = """
+    mutation AgentJobCallback($jobId: ID!, $status: String!, $result: String, $error: String) {
+      agentJobCallback(jobId: $jobId, status: $status, result: $result, error: $error) {
+        jobId
+        status
+      }
+    }
+    """
+    try:
+        response = requests.post(
+            os.environ["GRAPHOLOGY_URL"],
+            json={
+                "query": mutation,
+                "variables": {
+                    "jobId": job_id,
+                    "status": status,
+                    "result": result,
+                    "error": error,
+                },
+            },
+            headers={
+                "X-API-Key": os.environ["GRAPHOLOGY_API_KEY"],
+                "Content-Type": "application/json",
+            },
+            timeout=10.0,
+        )
+        response.raise_for_status()
+    except Exception as e:
+        logger.error(f"Failed to notify Apollo for job {job_id}: {e}")
+        # Do NOT re-raise — notification failure must not discard job result
+
+
+def _run_agent_job(
+    job_id: str,
+    agent: str,
+    workflow_id: Optional[str],
+    context_node_id: str,
+    directory_code: Optional[str] = None,
+    target_research: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    batch_id: Optional[str] = None,
+    accumulator=None,
+    neo4j_job_id: Optional[str] = None,
+):
+    """Run agent in background thread, updating job store with result.
+
+    On completion (success or error), calls _notify_apollo once.
+    Does NOT call _notify_apollo for the pending → running transition.
+
+    neo4j_job_id: the AgentJob ID already created in Neo4j by the Apollo resolver.
+    If provided, it is used as the job identifier when notifying Apollo so that
+    the callback updates the correct pre-existing node. Falls back to the
+    internal job_id (a locally-generated UUID) when not provided.
+    """
+    # Use the Neo4j AgentJob ID for Apollo callbacks when available
+    apollo_job_id = neo4j_job_id if neo4j_job_id else job_id
+
     with _job_lock:
         _job_store[job_id]["status"] = JobStatus.RUNNING
     try:
@@ -263,6 +372,11 @@ def _run_agent_job(job_id: str, agent: str, workflow_id: Optional[str], context_
             agent=agent,
             workflow_id=workflow_id,
             context_node_id=context_node_id,
+            directory_code=directory_code,
+            target_research=target_research,
+            metadata=metadata,
+            batch_id=batch_id,
+            agent_accumulator=accumulator,
         )
         new_status = JobStatus.SUCCESS if result.get("success") else JobStatus.ERROR
     except Exception as e:
@@ -274,6 +388,18 @@ def _run_agent_job(job_id: str, agent: str, workflow_id: Optional[str], context_
         _job_store[job_id]["result"] = result
         _job_store[job_id]["status"] = new_status  # status LAST to avoid race
         _evict_oldest_completed_jobs()
+
+    # Notify Apollo once the job reaches a final state (success or error).
+    # On success: send a compact receipt only — full extraction data lives on the
+    # domain node's payload field and must not be re-sent here (avoids 413).
+    if new_status == JobStatus.SUCCESS:
+        _notify_apollo(
+            apollo_job_id,
+            "success",
+            result=json.dumps({"completed": True, "contextNodeId": context_node_id}),
+        )
+    else:
+        _notify_apollo(apollo_job_id, "error", error=result.get("error", "Unknown error"))
 
 
 def _check_api_key(x_api_key: Optional[str]):
@@ -356,8 +482,71 @@ def run_agent(
 
     Requires x-api-key header (AC4).
     Supports sync (default) and async modes (AC2, AC7).
+    Supports fan-out: provide context_node_ids (plural) to run N threads simultaneously.
     """
     _check_api_key(x_api_key)
+
+    # --- Fan-out path: context_node_ids (plural) ---
+    if request.context_node_ids:
+        if request.async_mode:
+            # Create a job per node, start ALL threads simultaneously, return immediately
+            job_ids = []
+            threads = []
+            for node_id in request.context_node_ids:
+                job_id = _generate_job_id()
+                with _job_lock:
+                    _job_store[job_id] = {
+                        "status": JobStatus.ACCEPTED,
+                        "result": None,
+                        "created_at": datetime.now(timezone.utc),
+                    }
+                job_ids.append(job_id)
+                t = threading.Thread(
+                    target=_run_agent_job,
+                    args=(job_id, request.agent, request.workflow_id, node_id),
+                    kwargs={
+                        "directory_code": request.directory_code,
+                        "target_research": request.target_research,
+                        "metadata": request.metadata,
+                        "batch_id": request.batch_id,
+                        "accumulator": accumulator,
+                        "neo4j_job_id": (request.job_ids or {}).get(node_id),
+                    },
+                    daemon=True,
+                )
+                threads.append(t)
+            # CRITICAL: start ALL before joining ANY (batch accumulator window alignment)
+            for t in threads:
+                t.start()
+            return JSONResponse(
+                status_code=202,
+                content={"job_ids": job_ids, "status": "accepted"},
+            )
+        else:
+            # Synchronous fan-out: start all, then join all
+            results = [None] * len(request.context_node_ids)
+
+            def _run_sync(index, node_id):
+                results[index] = _load_and_run_agent(
+                    agent=request.agent,
+                    workflow_id=request.workflow_id,
+                    context_node_id=node_id,
+                    directory_code=request.directory_code,
+                    target_research=request.target_research,
+                    metadata=request.metadata,
+                )
+
+            threads = [
+                threading.Thread(target=_run_sync, args=(i, node_id))
+                for i, node_id in enumerate(request.context_node_ids)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            return {"results": results}
+
+    # --- Single node path (backward compatible) ---
     assert request.context_node_id  # guaranteed by model_validator
 
     if request.async_mode:
@@ -371,6 +560,14 @@ def run_agent(
         thread = threading.Thread(
             target=_run_agent_job,
             args=(job_id, request.agent, request.workflow_id, request.context_node_id),
+            kwargs={
+                "directory_code": request.directory_code,
+                "target_research": request.target_research,
+                "metadata": request.metadata,
+                "batch_id": request.batch_id,
+                "accumulator": None,  # AW.1.4 will inject the real accumulator
+                "neo4j_job_id": request.job_id,
+            },
             daemon=True,
         )
         thread.start()
@@ -383,6 +580,9 @@ def run_agent(
         agent=request.agent,
         workflow_id=request.workflow_id,
         context_node_id=request.context_node_id,
+        directory_code=request.directory_code,
+        target_research=request.target_research,
+        metadata=request.metadata,
     )
     return result
 
@@ -446,6 +646,7 @@ def _load_and_run_prompt(
         engine = YAMLEngine()
         register_actions(engine.actions_registry, engine)
         register_agent_actions(engine.actions_registry, engine)
+        register_analysis_actions(engine.actions_registry, engine)
 
         engine.variables["GRAPHOLOGY_URL"] = os.environ.get("GRAPHOLOGY_URL", "http://localhost:4000")
         engine.variables["GRAPHOLOGY_API_KEY"] = os.environ.get("GRAPHOLOGY_API_KEY", "")
@@ -496,6 +697,63 @@ def _load_and_run_prompt(
     finally:
         with _active_requests_lock:
             _active_requests -= 1
+
+
+# In-memory store for completed LlamaExtract webhook results.
+# Key: extraction_job_id (str), Value: webhook payload dict.
+# Consumed by file_extraction agents that poll this endpoint via /extract-callback/{job_id}.
+_extract_results: dict[str, dict] = {}
+_extract_results_lock = threading.Lock()
+
+
+@app.post("/extract-callback")
+async def extract_callback(request: Request, x_api_key: Optional[str] = Header(None)):
+    """
+    Receive LlamaExtract webhook callbacks.
+
+    LlamaExtract posts here when an extraction job completes (extract.success / extract.error).
+    Stores the result keyed by job_id so that file_extraction agents can retrieve it
+    without polling LlamaExtract directly.
+
+    Expects JSON body with at minimum: {"id": "<job_id>", "status": "SUCCESS"|"ERROR", ...}
+    """
+    _check_api_key(x_api_key)
+
+    body = await request.json()
+    job_id = body.get("id") or body.get("job_id")
+    if not job_id:
+        raise HTTPException(status_code=400, detail="Missing job id in webhook payload")
+
+    status = body.get("status", "unknown")
+    logger.info(f"extract-callback: job_id={job_id} status={status}")
+
+    with _extract_results_lock:
+        _extract_results[job_id] = body
+        # Keep store bounded — evict oldest when over 500 entries
+        if len(_extract_results) > 500:
+            oldest_key = next(iter(_extract_results))
+            del _extract_results[oldest_key]
+
+    return {"received": True, "job_id": job_id}
+
+
+@app.get("/extract-callback/{job_id}")
+async def get_extract_result(job_id: str, x_api_key: Optional[str] = Header(None)):
+    """
+    Poll for a LlamaExtract webhook result by job_id.
+
+    Returns 404 if the webhook has not yet been received.
+    Returns 200 with the full webhook payload once available.
+    """
+    _check_api_key(x_api_key)
+
+    with _extract_results_lock:
+        result = _extract_results.get(job_id)
+
+    if result is None:
+        raise HTTPException(status_code=404, detail="Webhook not yet received for this job")
+
+    return {"job_id": job_id, "received": True, "payload": result}
 
 
 @app.post("/run-prompt")

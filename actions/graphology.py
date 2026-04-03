@@ -67,17 +67,6 @@ query GetWorkflowQuestions($workflowId: ID!) {
 }
 """
 
-CREATE_PROMPT_EXECUTION_MUTATION = """
-mutation CreatePromptExecution($input: [PromptExecutionCreateInput!]!) {
-  createPromptExecution(input: $input) {
-    promptExecution {
-      id
-    }
-  }
-}
-"""
-
-
 # =============================================================================
 # HELPERS
 # =============================================================================
@@ -248,188 +237,6 @@ def get_workflow_questions(
         "questions": questions,
         "count": len(questions),
         "workflow_id": workflow_id,
-    }
-
-
-def save_workflow_responses(
-    state: Dict[str, Any],
-    workflow_id: str,
-    matter_id: str,
-    responses: List[Dict[str, Any]],
-    context_node_id: str = "",
-    context_node_type: str = "",
-    **kwargs,
-) -> Dict[str, Any]:
-    """
-    Save LLM responses as PromptExecution nodes in graphology.
-
-    TEA Custom Action: graphology.save_responses
-
-    Each response dict must contain:
-        - versionId: PromptVersion ID to link execution to
-        - llmRequest: The request sent to the LLM
-        - llmResponse: The LLM's response
-
-    When context_node_id and context_node_type are provided, links each
-    PromptExecution to the existing node via HAS_CONTEXT (connect) instead
-    of creating a new ContextNode. Uses union type syntax for the GraphQL
-    mutation (hasContext is a union: ContextNode | ProtoMatter | Matter).
-
-    Args:
-        state: Current agent state
-        workflow_id: Workflow ID (for tracking)
-        matter_id: Client/matter ID (stored as clientId)
-        responses: List of response dicts
-        context_node_id: (optional) ID of existing node to link as context
-        context_node_type: (optional) GraphQL type name (e.g. "ProtoMatter", "Matter")
-        graphql_url: (optional kwarg) GraphQL endpoint URL
-
-    Returns:
-        Dict with success, executionIds list, count
-    """
-    logger.info(
-        f"graphology.save_responses: workflow_id={workflow_id}, "
-        f"matter_id={matter_id}, response_count={len(responses) if responses else 0}"
-    )
-
-    if not workflow_id:
-        return {"success": False, "error": "workflow_id is required"}
-    if not matter_id:
-        return {"success": False, "error": "matter_id is required"}
-    if not responses:
-        return {"success": False, "error": "responses list is required and must not be empty"}
-
-    url = _get_graphql_url(kwargs, state)
-    api_key = _get_graphql_api_key(kwargs, state)
-
-    # Build all execution inputs upfront, validating before any network call
-    execution_inputs = []
-    for i, resp in enumerate(responses):
-        version_id = resp.get("versionId")
-        llm_request = resp.get("llmRequest", "")
-        llm_response = resp.get("llmResponse", "")
-
-        if not version_id:
-            return {
-                "success": False,
-                "error": f"Response at index {i} must include versionId",
-                "executionIds": [],
-                "saved_count": 0,
-            }
-
-        execution_status = resp.get("status", "completed")
-        resp_error = resp.get("error", "")
-        llm_resp_str = llm_response if isinstance(llm_response, str) else json.dumps(llm_response)
-
-        # For failed executions, store the error in llmResponse and metadata
-        # so it's visible in the graph (PromptExecution has no error field).
-        if execution_status == "failed" and not llm_resp_str:
-            llm_resp_str = json.dumps({"error": resp_error or "Unknown error"})
-        metadata = json.dumps({"error": resp_error}) if resp_error else None
-
-        # Separate context from the question to keep llmRequest lightweight.
-        # The full document context goes into ContextNode only.
-        if isinstance(llm_request, dict):
-            context_content = llm_request.pop("context", "")
-            llm_req_str = json.dumps(llm_request)
-        else:
-            context_content = ""
-            llm_req_str = llm_request if isinstance(llm_request, str) else json.dumps(llm_request)
-
-        exec_input = {
-            "clientId": matter_id,
-            "status": execution_status,
-            "llmRequest": llm_req_str,
-            "llmResponse": llm_resp_str,
-            "hasResponse": {
-                "create": [{
-                    "node": {
-                        "responseData": llm_resp_str,
-                    }
-                }]
-            },
-            "hasExecutionFrom": {
-                "connect": [{
-                    "where": {
-                        "node": {"id_EQ": version_id}
-                    }
-                }]
-            },
-        }
-
-        # HAS_CONTEXT: connect to existing node or create new ContextNode
-        # Uses union type syntax: hasContext.{TypeName}.{connect|create}
-        if context_node_id and context_node_type:
-            exec_input["contextNodeId"] = context_node_id
-            exec_input["hasContext"] = {
-                context_node_type: {
-                    "connect": [{
-                        "where": {
-                            "node": {"id_EQ": context_node_id}
-                        }
-                    }]
-                }
-            }
-        else:
-            context_node_content = context_content if context_content else llm_req_str
-            exec_input["hasContext"] = {
-                "ContextNode": {
-                    "create": [{
-                        "node": {
-                            "content": context_node_content,
-                            "contextType": "DOCUMENT",
-                        }
-                    }]
-                }
-            }
-        if metadata:
-            exec_input["metadata"] = metadata
-        execution_inputs.append(exec_input)
-
-    # Batched GraphQL mutations — chunk to avoid 413 Payload Too Large
-    # Use smaller batches when ContextNode contains large documents
-    max_ctx = max(
-        (len(e.get("hasContext", {}).get("create", [{}])[0].get("node", {}).get("content", ""))
-         for e in execution_inputs),
-        default=0,
-    )
-    BATCH_SIZE = 1 if max_ctx > 5000 else 10
-    execution_ids = []
-    for batch_start in range(0, len(execution_inputs), BATCH_SIZE):
-        batch = execution_inputs[batch_start:batch_start + BATCH_SIZE]
-        try:
-            data = _execute_graphql(
-                url,
-                CREATE_PROMPT_EXECUTION_MUTATION,
-                {"input": batch},
-                api_key=api_key,
-            )
-        except (ConnectionError, RuntimeError) as e:
-            logger.error("graphology.save_responses batch failed: %s", e)
-            return {
-                "success": False,
-                "error": str(e),
-                "executionIds": execution_ids,
-                "saved_count": len(execution_ids),
-            }
-
-        batch_ids = [
-            ex.get("id")
-            for ex in data.get("createPromptExecution", {}).get("promptExecution", [])
-        ]
-        execution_ids.extend(batch_ids)
-
-    logger.info(
-        "graphology.save_responses: Created %d executions for matter %s",
-        len(execution_ids), matter_id,
-    )
-
-    return {
-        "success": True,
-        "executionIds": execution_ids,
-        "count": len(execution_ids),
-        "workflow_id": workflow_id,
-        "matter_id": matter_id,
     }
 
 
@@ -1118,7 +925,6 @@ def register_actions(registry: Dict[str, Callable], engine: Any) -> None:
         engine: YAMLEngine instance
     """
     registry["graphology.get_questions"] = get_workflow_questions
-    registry["graphology.save_responses"] = save_workflow_responses
     registry["graphology.collect_answers"] = collect_parallel_answers
     registry["graphology.get_node"] = get_node
     registry["graphology.update_node"] = update_node
@@ -1127,7 +933,7 @@ def register_actions(registry: Dict[str, Callable], engine: Any) -> None:
 
     logger.info(
         "Graphology actions registered: "
-        "graphology.get_questions, graphology.save_responses, "
+        "graphology.get_questions, "
         "graphology.collect_answers, graphology.get_node, "
         "graphology.update_node, graphology.create_node, "
         "graphology.connect_nodes"

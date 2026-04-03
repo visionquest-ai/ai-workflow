@@ -1,0 +1,26 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - build
+      - -t
+      - us-central1-docker.pkg.dev/rankellix-law/cloud-run-source-deploy/ai-workflow:$BUILD_ID
+      - .
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - push
+      - us-central1-docker.pkg.dev/rankellix-law/cloud-run-source-deploy/ai-workflow:$BUILD_ID
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ai-workflow
+      - --image
+      - us-central1-docker.pkg.dev/rankellix-law/cloud-run-source-deploy/ai-workflow:$BUILD_ID
+      - --region
+      - us-central1
+      - --project
+      - rankellix-law
+      - --quiet
+images:
+  - us-central1-docker.pkg.dev/rankellix-law/cloud-run-source-deploy/ai-workflow:$BUILD_ID

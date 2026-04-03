@@ -40,10 +40,10 @@ settings:
     model: gpt-5.3-chat
     temperature: 1
   parallel:
-    max_concurrency: 5
+    max_concurrency: 100
   rate_limiters:
     llm_qa:
-      rpm: 60
+      rpm: 500
   opik:
     project_name: "import-matter-qa"
   # Response control — governs tone, verbosity, and accuracy of QA answers
@@ -74,11 +74,21 @@ state_schema:
   source_node_type: str        # Node type of context_node_id (Matter or ProtoMatter)
   proto_matter_id: str         # ProtoMatter node ID (set when source is ProtoMatter)
 
+  step_config: dict            # Result from analysis.get_step_config
+
   # Output
   save_result: dict            # Result from graphology.save_responses
   execution_ids: list          # Created PromptExecution IDs
 
 nodes:
+  - name: fetch_step_config
+    uses: analysis.get_step_config
+    with:
+      step_name: "answer_question"
+      workflow_name: "MatterQA"
+      graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
+    output: step_config
+
   # Node 0: Fetch context node if context_node_id is provided and matter_context is empty
   # When called via /run-agent, matter_context is pre-populated so this is skipped.
   - name: fetch_context
@@ -143,12 +153,12 @@ nodes:
   # Node 4: Persist all responses to the graph
   # When context_node_id is provided, links PromptExecution -> HAS_CONTEXT -> existing node
   # instead of creating new ContextNode copies. Uses union type syntax with context_node_type.
-  - name: save_responses
-    uses: graphology.save_responses
+  - name: post_process_executions
+    uses: analysis.post_process_batch
     with:
-      workflow_id: "{{ state.workflow_id }}"
+      step_config: "{{ state.step_config }}"
+      answers: "{{ state.answers.answers }}"
       matter_id: "{{ state.matter_id or state.context_node_id }}"
-      responses: "{{ state.answers.answers }}"
       context_node_id: "{{ state.context_node_id }}"
       context_node_type: "{{ state.context_result.node_type if state.context_result else '' }}"
       graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
@@ -247,9 +257,11 @@ nodes:
 
 edges:
   - from: __start__
+    to: fetch_step_config
+  - from: fetch_step_config
     to: fetch_context
     condition: "{{ state.context_node_id and not state.matter_context }}"
-  - from: __start__
+  - from: fetch_step_config
     to: fetch_questions
     condition: "{{ state.matter_context or not state.context_node_id }}"
   - from: fetch_context
@@ -259,11 +271,11 @@ edges:
   - from: answer_questions
     to: collect_answers
   - from: collect_answers
-    to: save_responses
-  - from: save_responses
+    to: post_process_executions
+  - from: post_process_executions
     to: finalize_proto_matter
     condition: "{{ state.context_result and state.context_result.node_type == 'ProtoMatter' }}"
-  - from: save_responses
+  - from: post_process_executions
     to: __end__
     condition: "{{ not state.context_result or state.context_result.node_type != 'ProtoMatter' }}"
   - from: finalize_proto_matter

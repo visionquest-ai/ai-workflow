@@ -29,18 +29,27 @@ logger = logging.getLogger(__name__)
 # GraphQL QUERIES
 # =============================================================================
 
+# Maps short directory codes used by agents to the full Directory node name in Neo4j
+DIRECTORY_CODE_TO_NAME: Dict[str, str] = {
+    "CH": "Chambers and Partners",
+    "L500": "The Legal 500",
+    "LL": "Leaders League",
+    "ITR": "ITR World Tax",
+    "IFLR": "IFLR1000",
+}
+
 GET_ANALYSIS_STAGE_QUERY = """
-query GetAnalysisStage($workflowName: String!, $directoryCode: String!, $stageKey: String!) {
-  analysisWorkflows(where: { name_EQ: $workflowName }) {
+query GetAnalysisStage($workflowName: String!, $directoryName: String!, $stageKey: String!) {
+  analysisWorkflow(where: { name_EQ: $workflowName }) {
     hasStage(where: { stageKey_EQ: $stageKey }) {
       id stageKey stageOrder executionMode
-      hasStep(orderBy: stepOrder_ASC) {
+      stageHasStep {
         id name stepOrder executionMode batchSize
         hasPromptTemplate {
           systemTemplate userTemplate
           hasSlot {
             slotName slotType staticValue
-            hasPathNode { sourcePath transform targetSlot }
+            hasPathNode { sourcePath transform targetPath }
             hasProjection { id }
           }
         }
@@ -53,8 +62,8 @@ query GetAnalysisStage($workflowName: String!, $directoryCode: String!, $stageKe
       }
     }
   }
-  directories(where: { shortCode_EQ: $directoryCode }) {
-    id name narrativeTone avoidPatterns
+  directory(where: { name_EQ: $directoryName }) {
+    id name
     hasCriterionWeightConnection {
       edges { properties { weightClass } node { code } }
     }
@@ -73,9 +82,9 @@ query GetAnalysisStage($workflowName: String!, $directoryCode: String!, $stageKe
 
 GET_STEP_CONFIG_QUERY = """
 query GetStepConfig($stepName: String!, $workflowName: String!) {
-  analysisWorkflows(where: { name_EQ: $workflowName }) {
+  analysisWorkflow(where: { name_EQ: $workflowName }) {
     hasStage {
-      hasStep(where: { name_EQ: $stepName }) {
+      stageHasStep(where: { name_EQ: $stepName }) {
         id name batchSize
         hasResponseFormatConnection {
           edges {
@@ -91,11 +100,11 @@ query GetStepConfig($stepName: String!, $workflowName: String!) {
 
 GET_STAGE_A_RESULTS_QUERY = """
 query GetStageAResults($matterId: ID!) {
-  matters(where: { id_EQ: $matterId }) {
+  matter(where: { id_EQ: $matterId }) {
     matterHasStrategyConnection {
       edges { node { id } }
     }
-    matterHasContextConnection(where: { node: {} }) {
+    hasContextFromConnection {
       edges {
         node {
           ... on PromptExecution {
@@ -150,7 +159,7 @@ query GetResponseSchemaPathNodes($schemaId: ID!) {
 def _normalize_stage(stage_raw: dict) -> dict:
     """Flatten nested GraphQL stage + step structure into clean Python dicts."""
     steps = []
-    for step in stage_raw.get("hasStep", []):
+    for step in stage_raw.get("stageHasStep", []):
         template_raw = step.get("hasPromptTemplate") or {}
         slots = []
         for slot in template_raw.get("hasSlot", []):
@@ -163,7 +172,7 @@ def _normalize_stage(stage_raw: dict) -> dict:
                 "pathNode": {
                     "sourcePath": path_node_raw.get("sourcePath", ""),
                     "transform": path_node_raw.get("transform", ""),
-                    "targetSlot": path_node_raw.get("targetSlot", ""),
+                    "targetSlot": path_node_raw.get("targetPath", ""),
                 } if path_node_raw else None,
                 "projectionSchemaId": projection_raw.get("id") if projection_raw else None,
             })
@@ -245,8 +254,8 @@ def _normalize_directory(dir_raw: dict) -> dict:
 
     return {
         "name": dir_raw.get("name", ""),
-        "narrativeTone": dir_raw.get("narrativeTone", ""),
-        "avoidPatterns": dir_raw.get("avoidPatterns", ""),
+        "narrativeTone": "",
+        "avoidPatterns": "",
         "criteria_by_weight": criteria_by_weight,
         "gate_rules": gate_rules,
         "user_segments": user_segments,
@@ -288,13 +297,15 @@ def get_stage_config(
     url = graphql_url or _get_graphql_url(kwargs, state)
     api_key = _get_graphql_api_key(kwargs, state)
 
+    directory_name = DIRECTORY_CODE_TO_NAME.get(directory_code, directory_code)
+
     try:
         data = _execute_graphql(
             url,
             GET_ANALYSIS_STAGE_QUERY,
             {
                 "workflowName": workflow_name,
-                "directoryCode": directory_code,
+                "directoryName": directory_name,
                 "stageKey": stage_key,
             },
             api_key=api_key,
@@ -304,12 +315,12 @@ def get_stage_config(
         return {"success": False, "error": str(e)}
 
     # Validate directory found
-    directories = data.get("directories", [])
+    directories = data.get("directory", [])
     if not directories:
         return {"success": False, "error": f"Directory not found: {directory_code}"}
 
     # Validate workflow + stage found
-    workflows = data.get("analysisWorkflows", [])
+    workflows = data.get("analysisWorkflow", [])
     if not workflows:
         return {"success": False, "error": f"Workflow not found: {workflow_name}"}
 
@@ -386,14 +397,14 @@ def get_step_config(
         logger.error("analysis.get_step_config GraphQL failed: %s", e)
         return {"success": False, "error": str(e)}
 
-    workflows = data.get("analysisWorkflows", [])
+    workflows = data.get("analysisWorkflow", [])
     if not workflows:
         return {"success": False, "error": f"Workflow not found: {workflow_name}"}
 
     # Flatten stages → steps
     step_raw = None
     for stage in workflows[0].get("hasStage", []):
-        for step in stage.get("hasStep", []):
+        for step in stage.get("stageHasStep", []):
             if step.get("name") == step_name:
                 step_raw = step
                 break
@@ -482,7 +493,7 @@ def get_stage_a_results(
         logger.error("analysis.get_stage_a_results GraphQL failed: %s", e)
         return {"success": False, "error": str(e)}
 
-    matters = data.get("matters", [])
+    matters = data.get("matter", [])
     if not matters:
         return {
             "success": True,
@@ -492,7 +503,7 @@ def get_stage_a_results(
         }
 
     matter = matters[0]
-    context_edges = matter.get("matterHasContextConnection", {}).get("edges", [])
+    context_edges = matter.get("hasContextFromConnection", {}).get("edges", [])
 
     raw_executions = []
     original_matter = ""
