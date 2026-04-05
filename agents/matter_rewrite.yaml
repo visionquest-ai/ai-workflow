@@ -6,7 +6,7 @@ description: |
 
 settings:
   llm:
-    model: claude-sonnet-4-6
+    model: gpt-5.3-chat
     temperature: 0.7
   rate_limiters:
     rewrite_llm:

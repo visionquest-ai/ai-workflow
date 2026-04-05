@@ -21,6 +21,10 @@ steps:
       - us-central1
       - --project
       - rankellix-law
+      - --set-secrets
+      - GRAPHOLOGY_URL=GRAPHOLOGY_URL:latest,GRAPHOLOGY_API_KEY=GRAPHOLOGY_API_KEY:latest,RUN_AGENT_API_KEY=RUN_AGENT_API_KEY:latest,LLAMAEXTRACT_API_KEY=LLAMAEXTRACT_API_KEY:latest,AZURE_OPENAI_API_KEY=azure-openai-api-key:latest,AZURE_OPENAI_ENDPOINT=azure-openai-endpoint:latest
+      - --update-env-vars
+      - AZURE_OPENAI_DEPLOYMENT=gpt-5.3-chat,OPENAI_API_VERSION=2025-01-01-preview
       - --quiet
 images:
   - us-central1-docker.pkg.dev/rankellix-law/cloud-run-source-deploy/ai-workflow:$BUILD_ID
