@@ -29,6 +29,8 @@ logger = logging.getLogger(__name__)
 GRAPHOLOGY_URL = os.environ.get("GRAPHOLOGY_URL", "").rstrip("/")
 GRAPHOLOGY_API_KEY = os.environ.get("GRAPHOLOGY_API_KEY", "")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+LLAMAEXTRACT_API_KEY = os.environ.get("LLAMAEXTRACT_API_KEY", "")
+LLAMAEXTRACT_BASE_URL = "https://api.cloud.llamaindex.ai/api/v1/extraction"
 
 
 # =============================================================================
@@ -339,7 +341,8 @@ def handle_webhook(request):
             logger.error("extract_callback: failed to mark node as failed: %s", e)
         return json.dumps({"received": True, "nodeId": node_id, "result": "failed"}), 200, {"Content-Type": "application/json"}
 
-    # Get extraction data — LlamaExtract webhook puts it in "data", manual calls use "result"
+    # Get extraction data — LlamaExtract webhook sends job metadata in "data",
+    # NOT the actual extraction results. We must fetch results via the API.
     raw_data = body.get("data") or body.get("result") or {}
     if isinstance(raw_data, str):
         try:
@@ -352,6 +355,31 @@ def handle_webhook(request):
         data = raw_data["data"]
     else:
         data = raw_data
+
+    # If the data is just job metadata (id + job_id), fetch the actual extraction results
+    if isinstance(data, dict) and set(data.keys()) <= {"id", "job_id", "status", "created_at", "updated_at", "extraction_agent_id", "project_id", "name"}:
+        fetch_job_id = data.get("job_id") or data.get("id") or job_id
+        if fetch_job_id and LLAMAEXTRACT_API_KEY:
+            logger.info("extract_callback: webhook data is job metadata only, fetching results for job %s", fetch_job_id)
+            try:
+                resp = requests.get(
+                    f"{LLAMAEXTRACT_BASE_URL}/jobs/{fetch_job_id}/result",
+                    headers={"Authorization": f"Bearer {LLAMAEXTRACT_API_KEY}"},
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                result_payload = resp.json()
+                # Result shape: list of extraction results, one per file
+                # Each has "data" with the extracted fields
+                if isinstance(result_payload, list) and result_payload:
+                    data = result_payload[0].get("data", result_payload[0])
+                elif isinstance(result_payload, dict):
+                    data = result_payload.get("data", result_payload)
+                logger.info("extract_callback: fetched extraction result, keys=%s", list(data.keys()) if isinstance(data, dict) else type(data).__name__)
+            except Exception as e:
+                logger.error("extract_callback: failed to fetch extraction results for job %s: %s", fetch_job_id, e)
+        elif not LLAMAEXTRACT_API_KEY:
+            logger.warning("extract_callback: LLAMAEXTRACT_API_KEY not set, cannot fetch extraction results")
 
     # --- Fetch file node to get directory context ---
     try:
