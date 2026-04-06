@@ -913,6 +913,175 @@ def connect_nodes(
 
 
 # =============================================================================
+# MATTER CONTEXT ACTION (Story MA-3a)
+# =============================================================================
+
+# Map directory codes to their MatterDetail subtype names in the GraphQL schema.
+DIRECTORY_CODE_TO_MATTER_DETAIL_TYPE: Dict[str, str] = {
+    "CH": "ChambersMatterDetail",
+    "L500": "Legal500MatterDetail",
+    "LL": "LeadersLeagueMatterDetail",
+    "ITR": "ItrMatterDetail",
+    "IFLR": "Iflr1000MatterDetail",
+}
+
+
+def _build_matter_context_query(detail_type: str, detail_scalar_fields: List[str]) -> str:
+    """
+    Build a GraphQL query that fetches Matter + MatterDetail + Client + Department.
+
+    Uses an inline fragment for the specific MatterDetail subtype so only
+    the fields relevant to that directory are returned.
+
+    Args:
+        detail_type: MatterDetail subtype name (e.g. "ChambersMatterDetail")
+        detail_scalar_fields: Scalar field names for the detail subtype
+
+    Returns:
+        GraphQL query string
+    """
+    detail_fields_str = " ".join(detail_scalar_fields) if detail_scalar_fields else "id"
+
+    return f"""
+    query GetMatterContext($matterId: ID!, $detailId: ID!) {{
+      matter(where: {{ id_EQ: $matterId }}) {{
+        id
+        mTitle
+        mStatus
+        mValue
+        isCrossBorder
+        isConfidential
+        dateClosed
+        dateOpened
+        firmRole
+        jurisdiction
+        industrySector
+        matterSubCategory
+        matterHasMatterDetail(where: {{ id_EQ: $detailId }}) {{
+          ... on {detail_type} {{ {detail_fields_str} }}
+        }}
+        matterHasClient {{
+          id
+          name
+          industry
+        }}
+        departmentHasMatterFrom {{
+          id
+          deptName
+          legalFirmHasDepartmentFrom {{
+            id
+            firmName
+          }}
+        }}
+      }}
+    }}
+    """
+
+
+def get_matter_context(
+    state: Dict[str, Any],
+    matter_id: str,
+    matter_detail_id: str,
+    directory_code: str,
+    **kwargs,
+) -> Dict[str, Any]:
+    """
+    Fetch structured context from Matter + MatterDetail graph nodes.
+
+    TEA Custom Action: graphology.get_matter_context
+
+    Queries Matter scalar fields, the specific MatterDetail via inline fragment,
+    Client context, and Department context. Returns a structured response
+    suitable for analysis agents.
+
+    Args:
+        state: Current agent state
+        matter_id: ID of the Matter node
+        matter_detail_id: ID of the MatterDetail node
+        directory_code: Directory code (CH, L500, LL, ITR, IFLR)
+        graphql_url: (optional kwarg) GraphQL endpoint URL
+
+    Returns:
+        Dict with success, matter, detail, directory, client, department
+    """
+    logger.info(
+        f"graphology.get_matter_context: matter_id={matter_id}, "
+        f"detail_id={matter_detail_id}, directory={directory_code}"
+    )
+
+    if not matter_id:
+        return {"success": False, "error": "matter_id is required"}
+    if not matter_detail_id:
+        return {"success": False, "error": "matter_detail_id is required"}
+    if not directory_code:
+        return {"success": False, "error": "directory_code is required"}
+
+    detail_type = DIRECTORY_CODE_TO_MATTER_DETAIL_TYPE.get(directory_code)
+    if not detail_type:
+        valid_codes = ", ".join(sorted(DIRECTORY_CODE_TO_MATTER_DETAIL_TYPE.keys()))
+        return {
+            "success": False,
+            "error": f"Invalid directory_code '{directory_code}'. "
+                     f"Valid codes: {valid_codes}",
+        }
+
+    url = _get_graphql_url(kwargs, state)
+    api_key = _get_graphql_api_key(kwargs, state)
+
+    try:
+        # Introspect the detail type's scalar fields (cached with TTL)
+        fields_cache_key = f"type_fields:{url}:{detail_type}"
+        detail_scalar_fields = _cache_get(fields_cache_key)
+        if detail_scalar_fields is None:
+            detail_scalar_fields = _get_type_scalar_fields(url, detail_type, api_key=api_key)
+            _cache_set(fields_cache_key, detail_scalar_fields)
+
+        query = _build_matter_context_query(detail_type, detail_scalar_fields)
+        data = _execute_graphql(
+            url, query, {"matterId": matter_id, "detailId": matter_detail_id},
+            api_key=api_key,
+        )
+    except (ConnectionError, RuntimeError) as e:
+        logger.error(f"graphology.get_matter_context failed: {e}")
+        return {"success": False, "error": str(e)}
+
+    matters = data.get("matter", [])
+    if not matters:
+        return {"success": False, "error": f"Matter not found: {matter_id}"}
+
+    matter_node = matters[0]
+
+    # Extract related nodes from the Matter response
+    details = matter_node.pop("matterHasMatterDetail", [])
+    detail_node = details[0] if details else None
+
+    clients = matter_node.pop("matterHasClient", [])
+    client_node = clients[0] if clients else None
+
+    departments = matter_node.pop("departmentHasMatterFrom", [])
+    dept_node = departments[0] if departments else None
+
+    logger.info(
+        f"graphology.get_matter_context: Retrieved Matter context "
+        f"(detail={'yes' if detail_node else 'no'}, "
+        f"client={'yes' if client_node else 'no'}, "
+        f"department={'yes' if dept_node else 'no'})"
+    )
+
+    result = {
+        "success": True,
+        "matter": matter_node,
+        "detail": detail_node,
+        "directory": directory_code,
+        "client": client_node,
+        "department": dept_node,
+    }
+    result["matter_context_json"] = json.dumps(result, default=str)
+
+    return result
+
+
+# =============================================================================
 # ACTION REGISTRATION
 # =============================================================================
 
@@ -930,11 +1099,12 @@ def register_actions(registry: Dict[str, Callable], engine: Any) -> None:
     registry["graphology.update_node"] = update_node
     registry["graphology.create_node"] = create_node
     registry["graphology.connect_nodes"] = connect_nodes
+    registry["graphology.get_matter_context"] = get_matter_context
 
     logger.info(
         "Graphology actions registered: "
         "graphology.get_questions, "
         "graphology.collect_answers, graphology.get_node, "
         "graphology.update_node, graphology.create_node, "
-        "graphology.connect_nodes"
+        "graphology.connect_nodes, graphology.get_matter_context"
     )

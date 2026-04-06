@@ -1,18 +1,16 @@
 # TEA YAML Agent - Import Matter Q&A Agent
 # Story: 15.2 - ImportMatter YAML Workflow Agent
 # Updated: Story 16.1 - Added context_node_id support
-# Updated: Story RX.40 - ProtoMatter traceability (PROTO_MATTER_IMPORTED_AS + status update)
+# Updated: Story MA-3b - Rewrite for Matter+MatterDetail (replaces ProtoMatter)
 #
 # Purpose: Orchestrates the full Q&A pipeline for a matter using only TEA
 # built-in patterns and the graphology custom action.
 # Fetches questions from graphology, runs parallel LLM calls,
 # and persists responses back to the graph.
 #
-# When triggered from a ProtoMatter NODE_CREATED event (Story RX.40),
-# after Q&A completion: updates ProtoMatter.status to "imported" and
-# creates PROTO_MATTER_IMPORTED_AS relation to the Matter.
+# After Q&A completion: updates Matter.analysisStatus to "completed" (or "error" on failure).
 #
-# Key constraint: Uses `uses:` actions for core Q&A; `run:` block for ProtoMatter post-processing
+# Key constraint: Uses `uses:` actions for core Q&A; `uses:` action for finalize
 #
 # Rate Limiting (NFR-QA1):
 #   - max_concurrency: controls how many LLM calls run simultaneously
@@ -23,8 +21,9 @@
 #   1. Via /run-agent (app.py pre-fetches context):
 #      POST /run-agent { "agent": "import_matter_qa", "workflow_id": "...", "context_node_id": "..." }
 #
-#   2. Direct TEA engine with context_node_id (agent self-fetches):
-#      input: { "workflow_id": "...", "matter_id": "...", "context_node_id": "..." }
+#   2. Direct TEA engine with context_node_id + matter_detail_id + directory_code:
+#      input: { "workflow_id": "...", "matter_id": "...", "context_node_id": "...",
+#               "matter_detail_id": "...", "directory_code": "CH" }
 #
 #   3. Direct TEA engine with pre-loaded matter_context:
 #      input: { "workflow_id": "...", "matter_id": "...", "matter_context": "..." }
@@ -58,23 +57,24 @@ state_schema:
   workflow_id: str
 
   # Input (optional — provide context_node_id OR matter_context)
-  context_node_id: str         # If set, agent fetches the node via graphology.get_node
+  context_node_id: str         # If set, agent fetches matter context via graphology.get_matter_context
   matter_id: str               # Defaults to context_node_id if not provided
+  matter_detail_id: str        # MatterDetail node ID (required for fetch_context)
+  directory_code: str          # Directory code: CH | L500 | LL | ITR | IFLR
   matter_context: str          # Text content of the matter document (JSON, markdown, plain text)
   system_prompt: str           # Custom system prompt for LLM calls
 
   # Intermediate
-  context_result: dict         # Result from graphology.get_node (when using context_node_id)
+  context_result: dict         # Result from graphology.get_matter_context (when using context_node_id)
   fetch_result: dict           # Result from graphology.get_questions
   parallel_results: list       # Raw results from dynamic_parallel fan-out
   answers: list                # Mapped responses from collect_answers
   answer_count: int            # Count of collected answers
 
-  # ProtoMatter traceability (Story RX.40)
-  source_node_type: str        # Node type of context_node_id (Matter or ProtoMatter)
-  proto_matter_id: str         # ProtoMatter node ID (set when source is ProtoMatter)
-
   step_config: dict            # Result from analysis.get_step_config
+
+  # Finalize
+  finalize_result: dict        # Result from graphology.update_node (analysisStatus update)
 
   # Output
   save_result: dict            # Result from graphology.save_responses
@@ -89,12 +89,15 @@ nodes:
       graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
     output: step_config
 
-  # Node 0: Fetch context node if context_node_id is provided and matter_context is empty
-  # When called via /run-agent, matter_context is pre-populated so this is skipped.
+  # Node 0: Fetch structured matter context if context_node_id is provided and matter_context is empty
+  # Uses graphology.get_matter_context to fetch Matter + MatterDetail + Client + Department.
+  # When called via /run-agent, matter_context may be pre-populated so this is skipped.
   - name: fetch_context
-    uses: graphology.get_node
+    uses: graphology.get_matter_context
     with:
-      node_id: "{{ state.context_node_id }}"
+      matter_id: "{{ state.matter_id or state.context_node_id }}"
+      matter_detail_id: "{{ state.matter_detail_id }}"
+      directory_code: "{{ state.directory_code }}"
       graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
     output: context_result
 
@@ -133,7 +136,7 @@ nodes:
                 {{ state.prompt.systemPrompt or state.system_prompt }}
             - role: user
               content: >-
-                {% set context = state.matter_context or (state.context_result.data_json if state.context_result else '') %}{% if context %}MATTER CONTEXT:
+                {% set context = state.matter_context or (state.context_result.matter_context_json if state.context_result else '') %}{% if context %}MATTER CONTEXT:
 
                 {{ context }}
 
@@ -160,100 +163,31 @@ nodes:
       answers: "{{ state.answers.answers }}"
       matter_id: "{{ state.matter_id or state.context_node_id }}"
       context_node_id: "{{ state.context_node_id }}"
-      context_node_type: "{{ state.context_result.node_type if state.context_result else '' }}"
+      context_node_type: "Matter"
       graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
     output: save_result
 
-  # Node 5 (Story RX.40): Post-processing for ProtoMatter traceability
-  # When the source context_node is a ProtoMatter:
-  #   - Updates ProtoMatter.status to "imported" (or "error" on failure)
-  #   - Creates PROTO_MATTER_IMPORTED_AS relation from ProtoMatter to Matter
-  - name: finalize_proto_matter
-    goto: __end__
-    run: |
-      import json
-      import os
+  # Node 5 (Story MA-3b): Finalize — update Matter.analysisStatus
+  # Sets analysisStatus to "completed" on success or "error" on failure.
+  - name: finalize_success
+    uses: graphology.update_node
+    with:
+      node_id: "{{ state.matter_id or state.context_node_id }}"
+      node_type: "Matter"
+      updates:
+        analysisStatus: "completed"
+      graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
+    output: finalize_result
 
-      context_result = state.get("context_result", {})
-      node_type = context_result.get("node_type", "")
-      save_result = state.get("save_result", {})
-      context_node_id = state.get("context_node_id", "")
-      matter_id = state.get("matter_id") or context_node_id
-
-      # Only run for ProtoMatter sources
-      if node_type != "ProtoMatter":
-          return {"source_node_type": node_type}
-
-      graphql_url = os.environ.get("GRAPHOLOGY_URL", "http://localhost:4000/graphql")
-      proto_matter_id = context_node_id
-
-      # Determine status based on save result
-      save_success = save_result.get("success", False) if save_result else False
-      new_status = "imported" if save_success else "error"
-
-      import requests
-      errors = []
-
-      # Update ProtoMatter.status
-      try:
-          update_mutation = """
-          mutation UpdateProtoMatter($id: ID!, $status: String!) {
-            updateProtoMatter(
-              where: { id_EQ: $id }
-              update: { status: $status }
-            ) { protoMatter { id status } }
-          }
-          """
-          api_key = os.environ.get("GRAPHOLOGY_API_KEY", "")
-          headers = {"Content-Type": "application/json"}
-          if api_key:
-              headers["x-api-key"] = api_key
-          resp = requests.post(
-              graphql_url,
-              json={"query": update_mutation, "variables": {"id": proto_matter_id, "status": new_status}},
-              headers=headers,
-              timeout=30
-          )
-          resp.raise_for_status()
-          result = resp.json()
-          if result.get("errors"):
-              errors.append(f"Status update: {result['errors'][0].get('message', '')}")
-      except Exception as e:
-          errors.append(f"Status update: {str(e)}")
-
-      # Create PROTO_MATTER_IMPORTED_AS relation (only on success)
-      if save_success and matter_id and matter_id != proto_matter_id:
-          try:
-              link_mutation = """
-              mutation LinkProtoMatterToMatter($protoMatterId: ID!, $matterId: ID!) {
-                updateProtoMatter(
-                  where: { id_EQ: $protoMatterId }
-                  update: {
-                    protoMatterImportedAs: {
-                      connect: { where: { node: { id_EQ: $matterId } } }
-                    }
-                  }
-                ) { protoMatter { id } }
-              }
-              """
-              resp = requests.post(
-                  graphql_url,
-                  json={"query": link_mutation, "variables": {"protoMatterId": proto_matter_id, "matterId": matter_id}},
-                  headers=headers,
-                  timeout=30
-              )
-              resp.raise_for_status()
-              result = resp.json()
-              if result.get("errors"):
-                  errors.append(f"Link creation: {result['errors'][0].get('message', '')}")
-          except Exception as e:
-              errors.append(f"Link creation: {str(e)}")
-
-      return {
-          "source_node_type": "ProtoMatter",
-          "proto_matter_id": proto_matter_id,
-          "error": "; ".join(errors) if errors else "",
-      }
+  - name: finalize_error
+    uses: graphology.update_node
+    with:
+      node_id: "{{ state.matter_id or state.context_node_id }}"
+      node_type: "Matter"
+      updates:
+        analysisStatus: "error"
+      graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
+    output: finalize_result
 
 edges:
   - from: __start__
@@ -273,12 +207,14 @@ edges:
   - from: collect_answers
     to: post_process_executions
   - from: post_process_executions
-    to: finalize_proto_matter
-    condition: "{{ state.context_result and state.context_result.node_type == 'ProtoMatter' }}"
+    to: finalize_success
+    condition: "{{ state.save_result and state.save_result.success }}"
   - from: post_process_executions
+    to: finalize_error
+    condition: "{{ not state.save_result or not state.save_result.success }}"
+  - from: finalize_success
     to: __end__
-    condition: "{{ not state.context_result or state.context_result.node_type != 'ProtoMatter' }}"
-  - from: finalize_proto_matter
+  - from: finalize_error
     to: __end__
 
 config:

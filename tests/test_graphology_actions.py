@@ -15,9 +15,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from actions.graphology import (
+    DIRECTORY_CODE_TO_MATTER_DETAIL_TYPE,
     _relationship_to_field_name,
     connect_nodes,
     create_node,
+    get_matter_context,
     register_actions,
 )
 
@@ -236,6 +238,244 @@ class TestConnectNodes:
 
 
 # =============================================================================
+# get_matter_context tests (Story MA-3a)
+# =============================================================================
+
+class TestDirectoryCodeMapping:
+    """Tests for directory code to MatterDetail subtype mapping."""
+
+    def test_ch_maps_to_chambers(self):
+        assert DIRECTORY_CODE_TO_MATTER_DETAIL_TYPE["CH"] == "ChambersMatterDetail"
+
+    def test_l500_maps_to_legal500(self):
+        assert DIRECTORY_CODE_TO_MATTER_DETAIL_TYPE["L500"] == "Legal500MatterDetail"
+
+    def test_ll_maps_to_leaders_league(self):
+        assert DIRECTORY_CODE_TO_MATTER_DETAIL_TYPE["LL"] == "LeadersLeagueMatterDetail"
+
+    def test_itr_maps_to_itr(self):
+        assert DIRECTORY_CODE_TO_MATTER_DETAIL_TYPE["ITR"] == "ItrMatterDetail"
+
+    def test_iflr_maps_to_iflr1000(self):
+        assert DIRECTORY_CODE_TO_MATTER_DETAIL_TYPE["IFLR"] == "Iflr1000MatterDetail"
+
+
+class TestGetMatterContext:
+    """Tests for graphology.get_matter_context action."""
+
+    def test_missing_matter_id(self):
+        result = get_matter_context(
+            {}, matter_id="", matter_detail_id="d-1", directory_code="CH",
+        )
+        assert result["success"] is False
+        assert "matter_id is required" in result["error"]
+
+    def test_missing_matter_detail_id(self):
+        result = get_matter_context(
+            {}, matter_id="m-1", matter_detail_id="", directory_code="CH",
+        )
+        assert result["success"] is False
+        assert "matter_detail_id is required" in result["error"]
+
+    def test_missing_directory_code(self):
+        result = get_matter_context(
+            {}, matter_id="m-1", matter_detail_id="d-1", directory_code="",
+        )
+        assert result["success"] is False
+        assert "directory_code is required" in result["error"]
+
+    def test_invalid_directory_code(self):
+        result = get_matter_context(
+            {}, matter_id="m-1", matter_detail_id="d-1", directory_code="INVALID",
+        )
+        assert result["success"] is False
+        assert "Invalid directory_code" in result["error"]
+        assert "INVALID" in result["error"]
+        # Should list valid codes
+        assert "CH" in result["error"]
+        assert "IFLR" in result["error"]
+
+    @patch("actions.graphology._get_type_scalar_fields")
+    @patch("actions.graphology._execute_graphql")
+    def test_success_ch(self, mock_gql, mock_fields):
+        mock_fields.return_value = ["id", "description", "otherLawyers", "otherInformation"]
+        mock_gql.return_value = {
+            "matter": [{
+                "id": "m-1",
+                "mTitle": "Test Matter",
+                "mStatus": "open",
+                "mValue": "high",
+                "isCrossBorder": False,
+                "isConfidential": False,
+                "dateClosed": None,
+                "dateOpened": "2025-01-01",
+                "firmRole": "lead",
+                "jurisdiction": "UK",
+                "industrySector": "finance",
+                "matterSubCategory": None,
+                "matterHasMatterDetail": [{
+                    "id": "d-1",
+                    "__typename": "ChambersMatterDetail",
+                    "description": "A complex deal",
+                    "otherLawyers": "Smith & Co",
+                    "otherInformation": "Notable",
+                }],
+                "matterHasClient": [{
+                    "id": "c-1",
+                    "name": "Acme Corp",
+                    "industry": "tech",
+                }],
+                "departmentHasMatterFrom": [{
+                    "id": "dept-1",
+                    "deptName": "Corporate",
+                    "legalFirmHasDepartmentFrom": [{
+                        "id": "firm-1",
+                        "firmName": "BigLaw LLP",
+                    }],
+                }],
+            }],
+        }
+
+        result = get_matter_context(
+            {},
+            matter_id="m-1",
+            matter_detail_id="d-1",
+            directory_code="CH",
+            graphql_url="http://localhost:4000",
+        )
+
+        assert result["success"] is True
+        assert result["directory"] == "CH"
+        assert result["matter"]["id"] == "m-1"
+        assert result["matter"]["mTitle"] == "Test Matter"
+        # Relations should be extracted out of matter
+        assert "matterHasMatterDetail" not in result["matter"]
+        assert "matterHasClient" not in result["matter"]
+        assert "departmentHasMatterFrom" not in result["matter"]
+        # Detail
+        assert result["detail"]["id"] == "d-1"
+        assert result["detail"]["description"] == "A complex deal"
+        # Client
+        assert result["client"]["id"] == "c-1"
+        assert result["client"]["name"] == "Acme Corp"
+        # Department
+        assert result["department"]["id"] == "dept-1"
+        assert result["department"]["deptName"] == "Corporate"
+        # JSON serialization
+        assert "matter_context_json" in result
+
+    @patch("actions.graphology._get_type_scalar_fields")
+    @patch("actions.graphology._execute_graphql")
+    def test_query_uses_inline_fragment(self, mock_gql, mock_fields):
+        """Verify the GraphQL query includes an inline fragment for the correct subtype."""
+        mock_fields.return_value = ["id", "summary"]
+        mock_gql.return_value = {"matter": []}
+
+        get_matter_context(
+            {},
+            matter_id="m-1",
+            matter_detail_id="d-1",
+            directory_code="L500",
+            graphql_url="http://localhost:4000",
+        )
+
+        # Inspect the query string passed to _execute_graphql
+        call_args = mock_gql.call_args
+        query = call_args[0][1]
+        assert "... on Legal500MatterDetail" in query
+        assert "id summary" in query
+
+    @patch("actions.graphology._get_type_scalar_fields")
+    @patch("actions.graphology._execute_graphql")
+    def test_matter_not_found(self, mock_gql, mock_fields):
+        mock_fields.return_value = ["id"]
+        mock_gql.return_value = {"matter": []}
+
+        result = get_matter_context(
+            {},
+            matter_id="nonexistent",
+            matter_detail_id="d-1",
+            directory_code="ITR",
+            graphql_url="http://localhost:4000",
+        )
+
+        assert result["success"] is False
+        assert "Matter not found" in result["error"]
+
+    @patch("actions.graphology._get_type_scalar_fields")
+    @patch("actions.graphology._execute_graphql")
+    def test_missing_relations_returns_none(self, mock_gql, mock_fields):
+        """When Matter has no Client or Department, those fields should be None."""
+        mock_fields.return_value = ["id"]
+        mock_gql.return_value = {
+            "matter": [{
+                "id": "m-1",
+                "mTitle": "Solo Matter",
+                "mStatus": None,
+                "mValue": None,
+                "isCrossBorder": None,
+                "isConfidential": None,
+                "dateClosed": None,
+                "dateOpened": None,
+                "firmRole": None,
+                "jurisdiction": None,
+                "industrySector": None,
+                "matterSubCategory": None,
+                "matterHasMatterDetail": [],
+                "matterHasClient": [],
+                "departmentHasMatterFrom": [],
+            }],
+        }
+
+        result = get_matter_context(
+            {},
+            matter_id="m-1",
+            matter_detail_id="d-1",
+            directory_code="LL",
+            graphql_url="http://localhost:4000",
+        )
+
+        assert result["success"] is True
+        assert result["detail"] is None
+        assert result["client"] is None
+        assert result["department"] is None
+
+    @patch("actions.graphology._get_type_scalar_fields")
+    @patch("actions.graphology._execute_graphql")
+    def test_graphql_error(self, mock_gql, mock_fields):
+        mock_fields.return_value = ["id"]
+        mock_gql.side_effect = RuntimeError("GraphQL errors: Type not found")
+
+        result = get_matter_context(
+            {},
+            matter_id="m-1",
+            matter_detail_id="d-1",
+            directory_code="IFLR",
+            graphql_url="http://localhost:4000",
+        )
+
+        assert result["success"] is False
+        assert "Type not found" in result["error"]
+
+    @patch("actions.graphology._get_type_scalar_fields")
+    @patch("actions.graphology._execute_graphql")
+    def test_connection_error(self, mock_gql, mock_fields):
+        mock_fields.return_value = ["id"]
+        mock_gql.side_effect = ConnectionError("Cannot connect")
+
+        result = get_matter_context(
+            {},
+            matter_id="m-1",
+            matter_detail_id="d-1",
+            directory_code="CH",
+            graphql_url="http://localhost:4000",
+        )
+
+        assert result["success"] is False
+        assert "Cannot connect" in result["error"]
+
+
+# =============================================================================
 # Registration test
 # =============================================================================
 
@@ -253,3 +493,9 @@ class TestRegistration:
         register_actions(registry, MagicMock())
         assert "graphology.connect_nodes" in registry
         assert registry["graphology.connect_nodes"] is connect_nodes
+
+    def test_get_matter_context_registered(self):
+        registry = {}
+        register_actions(registry, MagicMock())
+        assert "graphology.get_matter_context" in registry
+        assert registry["graphology.get_matter_context"] is get_matter_context
