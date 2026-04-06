@@ -840,6 +840,55 @@ nodes:
       )
       return {"status": "success", "completed": True}
 
+  # POST extraction result to Cloud Function, mimicking the LlamaExtract webhook payload.
+  # Used by cache-hit path and polling fallback path.
+  - name: call_cloud_function
+    goto:
+      - to: __end__
+    run: |
+      import json
+      import os
+      import logging
+
+      _logger = logging.getLogger(__name__)
+
+      extract_result = state.get("extract_result", {})
+      context_node_id = state.get("context_node_id", "")
+      job_id = state.get("extraction_job_id", "")
+
+      callback_url = os.environ.get("EXTRACT_CALLBACK_URL", "").rstrip("/")
+      api_key = os.environ.get("RUN_AGENT_API_KEY", "")
+
+      if not callback_url:
+          _logger.error("call_cloud_function: EXTRACT_CALLBACK_URL not set")
+          return {"status": "error", "error": "EXTRACT_CALLBACK_URL not configured", "completed": True}
+
+      if not context_node_id:
+          _logger.error("call_cloud_function: no context_node_id")
+          return {"status": "error", "error": "No context_node_id", "completed": True}
+
+      # Build webhook-compatible payload (same shape LlamaExtract would send)
+      webhook_payload = {
+          "id": job_id,
+          "status": "SUCCESS" if extract_result.get("success") else "ERROR",
+          "result": extract_result.get("data", {}),
+      }
+
+      url = f"{callback_url}?nodeId={context_node_id}"
+      headers = {"Content-Type": "application/json"}
+      if api_key:
+          headers["x-api-key"] = api_key
+
+      try:
+          import requests
+          resp = requests.post(url, json=webhook_payload, headers=headers, timeout=30)
+          resp.raise_for_status()
+          _logger.info("call_cloud_function: posted to %s — status %s", url, resp.status_code)
+          return {"status": "success", "completed": True}
+      except Exception as e:
+          _logger.error("call_cloud_function: failed to call cloud function: %s", e)
+          return {"status": "error", "error": str(e), "completed": True}
+
   # Step 4c: Poll until extraction is done (poll_interval: 15s, max_wait: 700s)
   - name: poll_extraction_status
     goto:
@@ -916,7 +965,7 @@ nodes:
     with:
       job_id: "{{ state.extraction_job_id }}"
     output: extract_result
-    goto: prepare_payload
+    goto: call_cloud_function
 
   # Error exit for extraction failures
   - name: extraction_error
@@ -1868,165 +1917,15 @@ nodes:
     output: update_result
 
   # Step 7: Expand ProtoMatter nodes from extraction payload (Story 16.4)
+  # DISABLED (MA-1): ProtoMatter pipeline deprecated — Matter+MatterDetail used instead
   - name: expand_proto_matters
     goto:
       - to: finalize
     run: |
-      import json
       import logging
-
       logger = logging.getLogger(__name__)
-
-      # AC7: Skip if extraction failed
-      if state.get("status") == "error":
-          logger.debug("expand_proto_matters: skipping — extraction status is error")
-          return {"proto_matter_ids": [], "department_id": ""}
-
-      payload_json = state.get("payload_json", "")
-      if not payload_json:
-          logger.debug("expand_proto_matters: no payload_json, skipping")
-          return {"proto_matter_ids": [], "department_id": ""}
-
-      try:
-          payload_dict = json.loads(payload_json)
-      except (json.JSONDecodeError, TypeError):
-          logger.debug("expand_proto_matters: invalid payload_json, skipping")
-          return {"proto_matter_ids": [], "department_id": ""}
-
-      directory_name = (state.get("directory_name") or "").lower().strip()
-
-      # --- Matter extraction helper (Task 4, AC1, AC8) ---
-      MATTERS_KEY_MAP = {
-          "chambers": [
-              ("workHighlights", "publishableInformation", "matters"),
-              ("workHighlights", "confidentialInformation", "matters"),
-          ],
-          "iflr1000": [
-              ("dealHighlights", "deals"),
-          ],
-          "legal500": [
-              ("workHighlightsDetailed",),
-              ("workHighlightsDetailed_nonPublishable",),
-          ],
-          "itr": [
-              ("section_2_deal_and_case_highlights",),
-          ],
-          "leadersleague": [
-              ("work_highlights",),
-          ],
-      }
-
-      def _extract_matters(pd, dn):
-          key_paths = MATTERS_KEY_MAP.get(dn, [])
-          matters = []
-          for path in key_paths:
-              obj = pd
-              for key in path:
-                  obj = obj.get(key, {}) if isinstance(obj, dict) else {}
-              if isinstance(obj, list):
-                  matters.extend(obj)
-          return matters
-
-      matters = _extract_matters(payload_dict, directory_name)
-
-      # AC8: Empty matters array — no error
-      if not matters:
-          logger.debug("No matters found in payload")
-          return {"proto_matter_ids": [], "department_id": ""}
-
-      # --- Department discovery (AC3) ---
-      department_id = ""
-      file_id = state.get("context_node_id", "")
-
-      try:
-          dept_query = '''
-          query FindDepartment($fileId: ID!) {
-            departments(where: { departmentHasFiles_SOME: { id: $fileId } }) {
-              id
-            }
-          }
-          '''
-          import os
-          gql_url = (
-              state.get("variables", {}).get("GRAPHOLOGY_URL")
-              or os.environ.get("GRAPHOLOGY_URL")
-              or "http://localhost:4000"
-          )
-          gql_api_key = (
-              state.get("variables", {}).get("GRAPHOLOGY_API_KEY")
-              or os.environ.get("GRAPHOLOGY_API_KEY")
-          )
-          import requests as req
-          headers = {"Content-Type": "application/json"}
-          if gql_api_key:
-              headers["x-api-key"] = gql_api_key
-          resp = req.post(gql_url, json={"query": dept_query, "variables": {"fileId": file_id}}, timeout=30, headers=headers)
-          resp.raise_for_status()
-          dept_data = resp.json().get("data", {})
-          depts = dept_data.get("departments", [])
-          if depts:
-              department_id = depts[0].get("id", "")
-      except Exception as e:
-          logger.warning(f"expand_proto_matters: Department discovery failed: {e}")
-
-      if not department_id:
-          logger.warning("expand_proto_matters: No Department found for file %s — ProtoMatters will be created without Department link", file_id)
-
-      # --- Create ProtoMatter nodes and connect (AC1, AC2, AC4) ---
-      proto_matter_ids = []
-
-      for matter in matters:
-          matter_payload = json.dumps(matter) if not isinstance(matter, str) else matter
-
-          # Create ProtoMatter node via graphology.create_node action
-          create_result = actions["graphology.create_node"](
-              state=state,
-              node_type="ProtoMatter",
-              properties={
-                  "payload": matter_payload,
-                  "directory": directory_name,
-                  "status": "pending",
-              },
-              graphql_url=gql_url,
-          )
-
-          if not create_result.get("success"):
-              logger.error("expand_proto_matters: Failed to create ProtoMatter: %s", create_result.get("error"))
-              continue
-
-          proto_id = create_result["node_id"]
-          proto_matter_ids.append(proto_id)
-
-          # AC2: Connect ApplicationFormFile → ProtoMatter via FILE_HAS_PROTO_MATTER
-          connect_result = actions["graphology.connect_nodes"](
-              state=state,
-              source_id=file_id,
-              source_type="ApplicationFormFile",
-              relationship_name="FILE_HAS_PROTO_MATTER",
-              target_id=proto_id,
-              target_type="ProtoMatter",
-              graphql_url=gql_url,
-          )
-          if not connect_result.get("success"):
-              logger.error("expand_proto_matters: Failed to connect FILE_HAS_PROTO_MATTER: %s", connect_result.get("error"))
-
-          # AC4: Connect Department → ProtoMatter via DEPARTMENT_HAS_PROTO_MATTER (if department found)
-          if department_id:
-              dept_connect = actions["graphology.connect_nodes"](
-                  state=state,
-                  source_id=department_id,
-                  source_type="Department",
-                  relationship_name="DEPARTMENT_HAS_PROTO_MATTER",
-                  target_id=proto_id,
-                  target_type="ProtoMatter",
-                  graphql_url=gql_url,
-              )
-              if not dept_connect.get("success"):
-                  logger.error("expand_proto_matters: Failed to connect DEPARTMENT_HAS_PROTO_MATTER: %s", dept_connect.get("error"))
-
-      logger.info("expand_proto_matters: Created %d ProtoMatter nodes (department_id=%s)", len(proto_matter_ids), department_id or "none")
-
-      return {"proto_matter_ids": proto_matter_ids, "department_id": department_id}
+      logger.info("expand_proto_matters: DISABLED (MA-1) — ProtoMatter pipeline deprecated, returning empty result")
+      return {"proto_matter_ids": [], "department_id": ""}
 
   # Step 8: Finalize
 

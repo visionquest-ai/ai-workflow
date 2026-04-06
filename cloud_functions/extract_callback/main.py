@@ -310,9 +310,26 @@ def handle_webhook(request):
     except Exception:
         return json.dumps({"error": "Invalid JSON body"}), 400, {"Content-Type": "application/json"}
 
-    job_id = body.get("id", "")
-    status = body.get("status", "")
-    logger.info("extract_callback: nodeId=%s jobId=%s status=%s", node_id, job_id, status)
+    # LlamaExtract webhook sends: {"event_id", "event_type", "timestamp", "data": {...}}
+    # Manual/agent calls send: {"id", "status", "result": {...}}
+    # Normalize both formats:
+    if "event_type" in body:
+        # LlamaExtract native webhook format
+        event_type = body.get("event_type", "")
+        job_id = body.get("event_id", "")
+        # event_type is "extract.success" or "extract.error"
+        if "success" in event_type:
+            status = "SUCCESS"
+        elif "error" in event_type:
+            status = "ERROR"
+        else:
+            status = event_type
+    else:
+        # Manual/agent callback format
+        job_id = body.get("id", "")
+        status = body.get("status", "")
+
+    logger.info("extract_callback: nodeId=%s jobId=%s status=%s keys=%s", node_id, job_id, status, list(body.keys()))
 
     # On extraction failure — mark node and return
     if status not in ("SUCCESS", "PARTIAL_SUCCESS"):
@@ -322,13 +339,19 @@ def handle_webhook(request):
             logger.error("extract_callback: failed to mark node as failed: %s", e)
         return json.dumps({"received": True, "nodeId": node_id, "result": "failed"}), 200, {"Content-Type": "application/json"}
 
-    # Get extraction data — LlamaExtract puts it in "result" or "data"
-    data = body.get("result") or body.get("data") or {}
-    if isinstance(data, str):
+    # Get extraction data — LlamaExtract webhook puts it in "data", manual calls use "result"
+    raw_data = body.get("data") or body.get("result") or {}
+    if isinstance(raw_data, str):
         try:
-            data = json.loads(data)
+            raw_data = json.loads(raw_data)
         except Exception:
-            data = {}
+            raw_data = {}
+
+    # LlamaExtract webhook may nest the extraction result in data.data
+    if isinstance(raw_data, dict) and "data" in raw_data:
+        data = raw_data["data"]
+    else:
+        data = raw_data
 
     # --- Fetch file node to get directory context ---
     try:
@@ -399,7 +422,7 @@ def handle_webhook(request):
     # --- Build update payload ---
     updates = {
         "payload": json.dumps(data),
-        "status": "succeeded",
+        "status": "extracted",
     }
     if detected_year:
         updates["detectedYear"] = detected_year
