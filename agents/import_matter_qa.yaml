@@ -36,7 +36,7 @@ description: |
 
 settings:
   llm:
-    model: gpt-5.3-chat
+    model: gpt-5.2-chat
     temperature: 1
   parallel:
     max_concurrency: 100
@@ -71,6 +71,8 @@ state_schema:
   answers: list                # Mapped responses from collect_answers
   answer_count: int            # Count of collected answers
 
+  title_result: dict            # Result from analysis.generate_title
+
   step_config: dict            # Result from analysis.get_step_config
 
   # Finalize
@@ -100,6 +102,18 @@ nodes:
       directory_code: "{{ state.directory_code }}"
       graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
     output: context_result
+
+  # Title Generation: Generate title if mTitle is null
+  # Runs as an isolated step between fetch_context and fetch_questions.
+  # Skipped when mTitle already exists (edge condition routes past it).
+  - name: generate_title
+    uses: analysis.generate_title
+    with:
+      matter_id: "{{ state.matter_id or state.context_node_id }}"
+      matter_context_json: "{{ state.context_result.matter_context_json if state.context_result else state.matter_context }}"
+      workflow_id: "{{ state.workflow_id }}"
+      graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
+    output: title_result
 
   # Node 1: Fetch all active questions for the workflow
   - name: fetch_questions
@@ -189,6 +203,35 @@ nodes:
       graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
     output: finalize_result
 
+  # Node 6: AI Review — rewrite the matter description using Q&A answers
+  # Uses llm.call directly (not sub-agent) for reliable Azure OpenAI execution
+  - name: rewrite_matter
+    uses: llm.call
+    with:
+      model: "{{ settings.llm.model }}"
+      system: |
+        You are a legal directory submission writer. Rewrite the matter description
+        to enrich it with concrete details about complexity, impact, innovation,
+        team leadership, and client service. Write in the same language as the
+        original. Be concise but comprehensive. Return ONLY the rewritten
+        description text, no JSON or headers.
+      prompt: |
+        Original matter data:
+        {{ state.matter_context }}
+
+        Rewrite the matter description into a compelling legal directory submission.
+    output: rewrite_result
+
+  # Node 7: Create AI MatterDetail with rewritten description
+  - name: create_ai_detail
+    uses: analysis.create_ai_matter_detail
+    with:
+      matter_id: "{{ state.matter_id or state.context_node_id }}"
+      directory_code: "{{ state.directory_code }}"
+      rewritten_matter: "{{ state.rewrite_result.content or state.rewrite_result.result or state.rewrite_result }}"
+      graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
+    output: ai_detail_result
+
 edges:
   - from: __start__
     to: fetch_step_config
@@ -198,7 +241,15 @@ edges:
   - from: fetch_step_config
     to: fetch_questions
     condition: "{{ state.matter_context or not state.context_node_id }}"
+  # Title generation: only when mTitle is null/empty
   - from: fetch_context
+    to: generate_title
+    condition: "{{ state.context_result and state.context_result.matter and not state.context_result.matter.mTitle }}"
+  # Skip title generation when mTitle already exists
+  - from: fetch_context
+    to: fetch_questions
+    condition: "{{ not state.context_result or not state.context_result.matter or state.context_result.matter.mTitle }}"
+  - from: generate_title
     to: fetch_questions
   - from: fetch_questions
     to: answer_questions
@@ -213,6 +264,14 @@ edges:
     to: finalize_error
     condition: "{{ not state.save_result or not state.save_result.success }}"
   - from: finalize_success
+    to: rewrite_matter
+    condition: "{{ state.directory_code and state.matter_detail_id }}"
+  - from: finalize_success
+    to: __end__
+    condition: "{{ not state.directory_code or not state.matter_detail_id }}"
+  - from: rewrite_matter
+    to: create_ai_detail
+  - from: create_ai_detail
     to: __end__
   - from: finalize_error
     to: __end__

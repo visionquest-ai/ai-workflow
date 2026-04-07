@@ -25,6 +25,15 @@ from graphology import _execute_graphql, _get_graphql_url, _get_graphql_api_key
 logger = logging.getLogger(__name__)
 
 
+def _first_or_dict(val: Any) -> dict:
+    """Normalize a GraphQL relationship field: list→first element, dict→as-is, else→{}."""
+    if isinstance(val, list):
+        return val[0] if val else {}
+    if isinstance(val, dict):
+        return val
+    return {}
+
+
 # =============================================================================
 # GraphQL QUERIES
 # =============================================================================
@@ -160,11 +169,11 @@ def _normalize_stage(stage_raw: dict) -> dict:
     """Flatten nested GraphQL stage + step structure into clean Python dicts."""
     steps = []
     for step in stage_raw.get("stageHasStep", []):
-        template_raw = step.get("hasPromptTemplate") or {}
+        template_raw = _first_or_dict(step.get("hasPromptTemplate"))
         slots = []
         for slot in template_raw.get("hasSlot", []):
-            path_node_raw = slot.get("hasPathNode") or {}
-            projection_raw = slot.get("hasProjection") or {}
+            path_node_raw = _first_or_dict(slot.get("hasPathNode"))
+            projection_raw = _first_or_dict(slot.get("hasProjection"))
             slots.append({
                 "slotName": slot.get("slotName", ""),
                 "slotType": slot.get("slotType", ""),
@@ -532,7 +541,7 @@ def get_stage_a_results(
             original_matter = context_nodes.get("content", "")
 
         # Map to criteria via PromptVersion.MAPS_TO_CRITERION
-        version_raw = node.get("hasExecutionFrom") or {}
+        version_raw = _first_or_dict(node.get("hasExecutionFrom"))
         version_id = version_raw.get("id", "")
         criterion_edges = (
             version_raw.get("mapsToCriterionConnection", {}).get("edges", [])
@@ -1421,6 +1430,329 @@ def post_process_batch(
 # ACTION REGISTRATION
 # =============================================================================
 
+# ============================================================================
+# Stage C: Create AI MatterDetail node
+# ============================================================================
+
+# Map directory code → (concrete type, relation field on Matter, description field)
+DIRECTORY_CODE_TO_DETAIL_INFO: Dict[str, tuple] = {
+    "CH": ("ChambersMatterDetail", "matterHasCpDetail", "description"),
+    "L500": ("Legal500MatterDetail", "matterHasL500Detail", "matterDescription"),
+    "LL": ("LeadersLeagueMatterDetail", "matterHasLlDetail", "matterDescription"),
+    "ITR": ("ItrMatterDetail", "matterHasItrDetail", "matterDescription"),
+    "IFLR": ("Iflr1000MatterDetail", "matterHasIflrDetail", "matterDescription"),
+}
+
+
+def create_ai_matter_detail(
+    state: Dict[str, Any],
+    matter_id: str,
+    directory_code: str,
+    rewritten_matter: str,
+    **kwargs,
+) -> Dict[str, Any]:
+    """
+    Create a new [Dir]MatterDetail node with AI-rewritten content and connect
+    it to the Matter. The node gets version="AI_YYMMDD_[Index]" and appears
+    in the versioned tab dropdown.
+
+    TEA Custom Action: analysis.create_ai_matter_detail
+
+    Args:
+        state: Current agent state
+        matter_id: Matter node ID
+        directory_code: Directory code (CH, L500, LL, ITR, IFLR)
+        rewritten_matter: The AI-rewritten matter description text
+        graphql_url: (optional kwarg) GraphQL endpoint URL
+
+    Returns:
+        Dict with success, ai_detail_id, version
+    """
+    from datetime import date
+
+    logger.info(f"analysis.create_ai_matter_detail: matter={matter_id}, dir={directory_code}")
+
+    if not matter_id:
+        return {"success": False, "error": "matter_id is required"}
+    if not directory_code:
+        return {"success": False, "error": "directory_code is required"}
+    if not rewritten_matter:
+        return {"success": False, "error": "rewritten_matter is required"}
+
+    info = DIRECTORY_CODE_TO_DETAIL_INFO.get(directory_code)
+    if not info:
+        return {"success": False, "error": f"Unknown directory_code: {directory_code}"}
+
+    detail_type, relation_field, desc_field = info
+
+    # Import graphology helpers
+    from actions.graphology import _get_graphql_url, _get_graphql_api_key, _execute_graphql
+
+    url = _get_graphql_url(kwargs, state)
+    api_key = _get_graphql_api_key(kwargs, state)
+
+    # Count existing AI versions to determine index
+    count_query = f"""
+    query CountAiVersions($matterId: ID!) {{
+      matter(where: {{ id_EQ: $matterId }}) {{
+        {relation_field} {{
+          version
+        }}
+      }}
+    }}
+    """
+    try:
+        count_result = _execute_graphql(url, count_query, {"matterId": matter_id}, api_key)
+        details = count_result.get("data", {}).get("matter", [{}])[0].get(relation_field, [])
+        ai_count = sum(1 for d in details if (d.get("version") or "").startswith("AI_"))
+    except Exception:
+        ai_count = 0
+
+    today_str = date.today().strftime("%y%m%d")
+    version = f"AI_{today_str}_{ai_count + 1}"
+
+    # Create the detail node via nested create inside Matter update
+    # Same pattern as frontend useSelectColumnState (nested create)
+    create_mutation = f"""
+    mutation CreateAiMatterDetail($matterId: ID!, $version: String!, $description: String!) {{
+      updateMatter(
+        where: {{ id_EQ: $matterId }}
+        update: {{
+          {relation_field}: [{{
+            create: [{{
+              node: {{
+                version: $version
+                {desc_field}: $description
+                aiGenerated: true
+              }}
+            }}]
+          }}]
+        }}
+      ) {{
+        matter {{
+          {relation_field}(sort: [{{ createdAt: DESC }}], limit: 1) {{
+            id
+            version
+          }}
+        }}
+      }}
+    }}
+    """
+
+    try:
+        result = _execute_graphql(
+            url,
+            create_mutation,
+            {"matterId": matter_id, "version": version, "description": rewritten_matter},
+            api_key,
+        )
+        created = result.get("data", {}).get("updateMatter", {}).get("matter", [{}])[0]
+        new_details = created.get(relation_field, [])
+        ai_detail_id = new_details[0]["id"] if new_details else None
+
+        logger.info(
+            f"analysis.create_ai_matter_detail: created {detail_type} {ai_detail_id} "
+            f"(version={version}) on Matter {matter_id}"
+        )
+
+        return {"success": True, "ai_detail_id": ai_detail_id, "version": version}
+    except Exception as e:
+        logger.error(f"analysis.create_ai_matter_detail failed: {e}")
+        return {"success": False, "error": str(e)}
+
+
+# =============================================================================
+# Title Generator: generate mTitle from matter context via LLM
+# =============================================================================
+
+# GraphQL query to fetch the Title Generator PromptVersion from the workflow graph
+_TITLE_PROMPT_QUERY = """
+query GetTitlePrompt($workflowId: ID!) {
+  workflow(where: { id_EQ: $workflowId }) {
+    hasStep(where: { name_EQ: "Title Generation" }) {
+      hasPrompt {
+        id
+        hasVersion(where: { status_EQ: "active" }) {
+          id
+          systemPrompt
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def generate_title(
+    state: Dict[str, Any],
+    matter_id: str,
+    matter_context_json: str,
+    workflow_id: str,
+    **kwargs,
+) -> Dict[str, Any]:
+    """
+    Generate a concise matter title from matter context via LLM.
+
+    TEA Custom Action: analysis.generate_title
+
+    1. Fetches the Title Generator PromptVersion from the graph
+    2. Calls the LLM with system prompt + matter context
+    3. Parses the JSON response to extract matter_title
+    4. Writes mTitle to the Matter node via graphology.update_node
+    5. Creates a PromptExecution node for audit trail
+
+    Args:
+        state: Current agent state
+        matter_id: Matter node ID
+        matter_context_json: Full matter context as JSON string
+        workflow_id: Workflow ID to find the Title Generator prompt
+        graphql_url: (optional kwarg) GraphQL endpoint URL
+
+    Returns:
+        Dict with success, matter_title, execution_id, confidence
+    """
+    logger.info("analysis.generate_title: matter=%s", matter_id)
+
+    if not matter_id:
+        return {"success": False, "error": "matter_id is required"}
+    if not matter_context_json:
+        return {"success": False, "error": "matter_context_json is required"}
+    if not workflow_id:
+        return {"success": False, "error": "workflow_id is required"}
+
+    url = _get_graphql_url(kwargs, state)
+    api_key = _get_graphql_api_key(kwargs, state)
+
+    # --- Step 1: Fetch prompt from graph ---
+    try:
+        prompt_data = _execute_graphql(
+            url, _TITLE_PROMPT_QUERY, {"workflowId": workflow_id}, api_key=api_key
+        )
+    except Exception as e:
+        logger.error("analysis.generate_title: failed to fetch prompt: %s", e)
+        return {"success": False, "error": f"Failed to fetch Title Generator prompt: {e}"}
+
+    workflows = prompt_data.get("workflow", [])
+    steps = workflows[0].get("hasStep", []) if workflows else []
+    prompts = steps[0].get("hasPrompt", []) if steps else []
+    versions = prompts[0].get("hasVersion", []) if prompts else []
+
+    if not versions:
+        logger.error("analysis.generate_title: no active PromptVersion found for Title Generation")
+        return {"success": False, "error": "Title Generator prompt not found in graph"}
+
+    prompt_version = versions[0]
+    prompt_version_id = prompt_version["id"]
+    system_prompt = prompt_version["systemPrompt"]
+
+    if not system_prompt:
+        return {"success": False, "error": "Title Generator PromptVersion has empty systemPrompt"}
+
+    # --- Step 2: Call LLM ---
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": matter_context_json},
+    ]
+
+    try:
+        import os
+        from openai import AzureOpenAI
+
+        client = AzureOpenAI(
+            api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+            api_version=os.getenv("OPENAI_API_VERSION", "2025-01-01-preview"),
+        )
+        deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-5.2-chat")
+
+        response = client.chat.completions.create(
+            model=deployment,
+            messages=messages,
+        )
+        raw_content = response.choices[0].message.content
+        if raw_content is None:
+            return {"success": False, "error": "LLM returned no content (possible refusal)"}
+        llm_response_text = raw_content.strip()
+    except Exception as e:
+        logger.error("analysis.generate_title: LLM call failed: %s", e)
+        return {"success": False, "error": f"LLM call failed: {e}"}
+
+    # --- Step 3: Parse JSON response ---
+    matter_title = None
+    confidence = "low"
+    title_rationale = ""
+
+    # Strip markdown code fences if present (common LLM response wrapping)
+    clean_text = llm_response_text
+    fence_match = re.match(r"```(?:json)?\s*\n?(.*?)\n?\s*```", clean_text, re.DOTALL)
+    if fence_match:
+        clean_text = fence_match.group(1).strip()
+
+    try:
+        parsed = json.loads(clean_text)
+        matter_title = parsed.get("matter_title", "").strip()
+        confidence = parsed.get("confidence", "medium")
+        title_rationale = parsed.get("title_rationale", "")
+    except (json.JSONDecodeError, AttributeError):
+        logger.warning(
+            "analysis.generate_title: failed to parse LLM JSON, using raw text fallback"
+        )
+        matter_title = llm_response_text[:200].strip()
+        confidence = "low"
+
+    if not matter_title:
+        logger.warning("analysis.generate_title: empty matter_title from LLM")
+        return {"success": False, "error": "LLM returned empty matter_title"}
+
+    # --- Step 4: Write mTitle to Matter ---
+    from actions.graphology import update_node
+
+    update_result = update_node(
+        state, matter_id, "Matter", {"mTitle": matter_title}, **kwargs
+    )
+    if not update_result.get("success"):
+        logger.error(
+            "analysis.generate_title: failed to write mTitle: %s",
+            update_result.get("error"),
+        )
+        return {"success": False, "error": f"Failed to write mTitle: {update_result.get('error')}"}
+
+    # --- Step 5: Create PromptExecution for audit trail ---
+    exec_props: dict = {
+        "llmResponse": llm_response_text,
+        "llmRequest": json.dumps(messages),
+        "status": "completed",
+        "clientId": matter_id,
+        "hasExecutionFrom": {
+            "connect": [{"where": {"node": {"id_EQ": prompt_version_id}}}],
+        },
+        "hasContext": {
+            "Matter": {
+                "connect": [{"where": {"node": {"id_EQ": matter_id}}}],
+            },
+        },
+    }
+
+    exec_id = _create_center_entity("PromptExecution", exec_props, url, api_key)
+    if not exec_id:
+        logger.warning(
+            "analysis.generate_title: PromptExecution creation failed (non-blocking)"
+        )
+
+    logger.info(
+        "analysis.generate_title: wrote mTitle='%s' (confidence=%s) on Matter %s, exec=%s",
+        matter_title, confidence, matter_id, exec_id,
+    )
+
+    return {
+        "success": True,
+        "matter_title": matter_title,
+        "execution_id": exec_id,
+        "confidence": confidence,
+        "title_rationale": title_rationale,
+    }
+
+
 def register_actions(registry: Dict[str, Callable], engine: Any) -> None:
     """
     Register analysis actions with the TEA YAMLEngine.
@@ -1435,9 +1767,12 @@ def register_actions(registry: Dict[str, Callable], engine: Any) -> None:
     registry["analysis.render_prompt"] = render_prompt
     registry["analysis.post_process"] = post_process
     registry["analysis.post_process_batch"] = post_process_batch
+    registry["analysis.create_ai_matter_detail"] = create_ai_matter_detail
+    registry["analysis.generate_title"] = generate_title
 
     logger.info(
         "Analysis actions registered: "
         "analysis.get_stage_config, analysis.get_step_config, analysis.get_stage_a_results, "
-        "analysis.render_prompt, analysis.post_process, analysis.post_process_batch"
+        "analysis.render_prompt, analysis.post_process, analysis.post_process_batch, "
+        "analysis.create_ai_matter_detail, analysis.generate_title"
     )
