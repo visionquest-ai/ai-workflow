@@ -246,22 +246,15 @@ def _load_and_run_agent(
                 "context_node_id": context_node_id,
                 "context_result": node_result,
             }
-            # AI Review path: when BOTH matter_detail_id AND directory_code are provided,
-            # don't pre-populate matter_context so fetch_context runs and gets full
-            # Matter + MatterDetail + Client + Department context.
-            # Import trigger path: matter_detail_id may come from path resolution but
-            # we still need matter_context for the parallel Q&A.
-            if matter_detail_id and directory_code:
-                # AI Review button dispatch — let fetch_context get full context
+            # When matter_detail_id is provided (AI Review), DON'T pre-populate matter_context.
+            # This forces fetch_context to run, which calls get_matter_context and fetches
+            # Matter + MatterDetail (with description) + Client + Department — full context.
+            if matter_detail_id:
                 input_state["matter_detail_id"] = matter_detail_id
-                input_state["directory_code"] = directory_code
             else:
-                # Import trigger or other paths — use pre-fetched matter_context
                 input_state["matter_context"] = matter_context
-                if directory_code:
-                    input_state["directory_code"] = directory_code
-                if matter_detail_id:
-                    input_state["matter_detail_id"] = matter_detail_id
+            if directory_code:
+                input_state["directory_code"] = directory_code
 
         invoke_config = {"accumulator": agent_accumulator, "batch_id": batch_id}
 
@@ -334,8 +327,6 @@ def _notify_apollo(job_id: str, status: str, result: str = None, error: str = No
     }
     """
     try:
-        from auth.identity_token import get_auth_header
-        auth_headers = get_auth_header(os.environ.get("GRAPHOLOGY_URL", ""))
         response = requests.post(
             os.environ["GRAPHOLOGY_URL"],
             json={
@@ -348,7 +339,7 @@ def _notify_apollo(job_id: str, status: str, result: str = None, error: str = No
                 },
             },
             headers={
-                **auth_headers,
+                "X-API-Key": os.environ["GRAPHOLOGY_API_KEY"],
                 "Content-Type": "application/json",
             },
             timeout=10.0,
@@ -430,29 +421,6 @@ def _check_api_key(x_api_key: Optional[str]):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-def _check_auth(authorization: Optional[str] = None, x_api_key: Optional[str] = None):
-    """Validate auth: OIDC Bearer token OR API key. Raises 401 if neither is valid."""
-    # Try OIDC Bearer token first
-    if authorization and authorization.startswith("Bearer "):
-        try:
-            from auth.identity_token import verify_oidc_token
-            verify_oidc_token(authorization[7:])
-            return  # OIDC verified
-        except Exception:
-            pass  # Fall through to API key
-
-    # Fall back to API key
-    if x_api_key:
-        expected_key = os.environ.get("RUN_AGENT_API_KEY", "")
-        if expected_key and hmac.compare_digest(x_api_key, expected_key):
-            return  # API key valid
-
-    # Neither worked
-    if not authorization and not x_api_key:
-        raise HTTPException(status_code=401, detail="No auth credentials. Send Authorization: Bearer {token} or x-api-key.")
-    raise HTTPException(status_code=401, detail="Unauthorized")
-
-
 # =============================================================================
 # ENDPOINTS
 # =============================================================================
@@ -520,7 +488,6 @@ async def health():
 def run_agent(
     request: RunAgentRequest,
     x_api_key: Optional[str] = Header(None),
-    authorization: Optional[str] = Header(None),
 ):
     """
     Run a TEA agent with a context node from graphology.
@@ -529,7 +496,7 @@ def run_agent(
     Supports sync (default) and async modes (AC2, AC7).
     Supports fan-out: provide context_node_ids (plural) to run N threads simultaneously.
     """
-    _check_auth(authorization, x_api_key)
+    _check_api_key(x_api_key)
 
     # --- Fan-out path: context_node_ids (plural) ---
     if request.context_node_ids:
@@ -638,14 +605,13 @@ def run_agent(
 def get_job_status(
     job_id: str,
     x_api_key: Optional[str] = Header(None),
-    authorization: Optional[str] = Header(None),
 ):
     """
     Poll async job status (AC3, AC4, AC6).
 
     Returns current job state with result when complete.
     """
-    _check_auth(authorization, x_api_key)
+    _check_api_key(x_api_key)
 
     with _job_lock:
         if job_id not in _job_store:
@@ -755,7 +721,7 @@ _extract_results_lock = threading.Lock()
 
 
 @app.post("/extract-callback")
-async def extract_callback(request: Request, x_api_key: Optional[str] = Header(None), authorization: Optional[str] = Header(None)):
+async def extract_callback(request: Request, x_api_key: Optional[str] = Header(None)):
     """
     Receive LlamaExtract webhook callbacks.
 
@@ -765,7 +731,7 @@ async def extract_callback(request: Request, x_api_key: Optional[str] = Header(N
 
     Expects JSON body with at minimum: {"id": "<job_id>", "status": "SUCCESS"|"ERROR", ...}
     """
-    _check_auth(authorization, x_api_key)
+    _check_api_key(x_api_key)
 
     body = await request.json()
     job_id = body.get("id") or body.get("job_id")
@@ -786,14 +752,14 @@ async def extract_callback(request: Request, x_api_key: Optional[str] = Header(N
 
 
 @app.get("/extract-callback/{job_id}")
-async def get_extract_result(job_id: str, x_api_key: Optional[str] = Header(None), authorization: Optional[str] = Header(None)):
+async def get_extract_result(job_id: str, x_api_key: Optional[str] = Header(None)):
     """
     Poll for a LlamaExtract webhook result by job_id.
 
     Returns 404 if the webhook has not yet been received.
     Returns 200 with the full webhook payload once available.
     """
-    _check_auth(authorization, x_api_key)
+    _check_api_key(x_api_key)
 
     with _extract_results_lock:
         result = _extract_results.get(job_id)
@@ -818,7 +784,6 @@ class ImportRequest(BaseModel):
 def import_file(
     file_id: str,
     x_api_key: Optional[str] = Header(None),
-    authorization: Optional[str] = Header(None),
 ):
     """
     Import a directory submission file into the graph.
@@ -830,7 +795,7 @@ def import_file(
     4. Intra-file dedup
     5. Visibility Cypher
     """
-    _check_auth(authorization, x_api_key)
+    _check_api_key(x_api_key)
 
     # Import here to avoid startup dependency on neo4j driver.
     # In Docker: module is at /app/rankellix_import/ (copied by cloudbuild).
@@ -873,7 +838,6 @@ def import_file(
 def run_prompt(
     request: RunPromptRequest,
     x_api_key: Optional[str] = Header(None),
-    authorization: Optional[str] = Header(None),
 ):
     """
     Run a TEA agent with arbitrary input state (no graphology context).
@@ -881,7 +845,7 @@ def run_prompt(
     Designed for agents like llm_prompt that don't need a context node.
     Requires x-api-key header.
     """
-    _check_auth(authorization, x_api_key)
+    _check_api_key(x_api_key)
 
     result = _load_and_run_prompt(
         agent=request.agent,
