@@ -168,10 +168,15 @@ def invoke_agent(
 
         engine = YAMLEngine()
 
-        # Register all actions (graphology + agents)
+        # Register all actions (graphology + agents + analysis)
         from graphology import register_actions as register_graphology
         register_graphology(engine.actions_registry, engine)
         register_actions(engine.actions_registry, engine)
+        try:
+            from analysis import register_actions as register_analysis
+            register_analysis(engine.actions_registry, engine)
+        except ImportError:
+            pass  # analysis module not available in all environments
 
         # Copy variables from parent
         parent_variables = state.get("variables", {})

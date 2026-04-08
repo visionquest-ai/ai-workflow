@@ -72,13 +72,17 @@ query GetWorkflowQuestions($workflowId: ID!) {
 # =============================================================================
 
 def _get_graphql_url(kwargs: dict, state: dict = None) -> str:
-    """Resolve the GraphQL endpoint URL from kwargs, state variables, or env."""
-    return (
+    """Resolve the GraphQL endpoint URL from kwargs, state variables, or env.
+    Ensures the URL ends with /graphql (Apollo Server serves GraphQL at this path)."""
+    url = (
         kwargs.get("graphql_url")
         or (state.get("variables", {}).get("GRAPHOLOGY_URL") if state else None)
         or os.environ.get("GRAPHOLOGY_URL")
         or DEFAULT_GRAPHOLOGY_URL
     )
+    if not url.endswith("/graphql"):
+        url = url.rstrip("/") + "/graphql"
+    return url
 
 
 def _execute_graphql(url: str, query: str, variables: dict = None, api_key: str = None) -> dict:

@@ -76,6 +76,7 @@ class RunAgentRequest(BaseModel):
     job_ids: Optional[dict] = Field(None, alias="job_ids")  # context_node_id -> agentJob_id
     application_form_id: Optional[str] = None
     directory_code: Optional[str] = None    # for matter_strategy + matter_rewrite
+    matter_detail_id: Optional[str] = None  # for AI Review (Stage A→B→C chaining)
     target_research: Optional[str] = None   # for matter_strategy + matter_rewrite
     metadata: Optional[dict] = None         # for matter_strategy + matter_rewrite
     async_mode: bool = Field(False, alias="asyncMode")
@@ -175,6 +176,7 @@ def _load_and_run_agent(
     agents_dir: Optional[str] = None,
     actions_dir: Optional[str] = None,
     directory_code: Optional[str] = None,
+    matter_detail_id: Optional[str] = None,
     target_research: Optional[str] = None,
     metadata: Optional[dict] = None,
     batch_id: Optional[str] = None,
@@ -245,6 +247,11 @@ def _load_and_run_agent(
                 "matter_context": matter_context,
                 "context_result": node_result,
             }
+            # Pass directory_code and matter_detail_id for AI Review chaining (Stage A→B→C)
+            if directory_code:
+                input_state["directory_code"] = directory_code
+            if matter_detail_id:
+                input_state["matter_detail_id"] = matter_detail_id
 
         invoke_config = {"accumulator": agent_accumulator, "batch_id": batch_id}
 
@@ -346,6 +353,7 @@ def _run_agent_job(
     workflow_id: Optional[str],
     context_node_id: str,
     directory_code: Optional[str] = None,
+    matter_detail_id: Optional[str] = None,
     target_research: Optional[str] = None,
     metadata: Optional[dict] = None,
     batch_id: Optional[str] = None,
@@ -373,6 +381,7 @@ def _run_agent_job(
             workflow_id=workflow_id,
             context_node_id=context_node_id,
             directory_code=directory_code,
+            matter_detail_id=matter_detail_id,
             target_research=target_research,
             metadata=metadata,
             batch_id=batch_id,
@@ -562,6 +571,7 @@ def run_agent(
             args=(job_id, request.agent, request.workflow_id, request.context_node_id),
             kwargs={
                 "directory_code": request.directory_code,
+                "matter_detail_id": request.matter_detail_id,
                 "target_research": request.target_research,
                 "metadata": request.metadata,
                 "batch_id": request.batch_id,
@@ -581,6 +591,7 @@ def run_agent(
         workflow_id=request.workflow_id,
         context_node_id=request.context_node_id,
         directory_code=request.directory_code,
+        matter_detail_id=request.matter_detail_id,
         target_research=request.target_research,
         metadata=request.metadata,
     )
@@ -754,6 +765,70 @@ async def get_extract_result(job_id: str, x_api_key: Optional[str] = Header(None
         raise HTTPException(status_code=404, detail="Webhook not yet received for this job")
 
     return {"job_id": job_id, "received": True, "payload": result}
+
+
+# ============================================================================
+# Import Endpoint — 5-phase directory submission import
+# ============================================================================
+
+
+class ImportRequest(BaseModel):
+    """Request body for /api/import/{file_id}."""
+    model_config = ConfigDict(extra="forbid")
+
+
+@app.post("/api/import/{file_id}")
+def import_file(
+    file_id: str,
+    x_api_key: Optional[str] = Header(None),
+):
+    """
+    Import a directory submission file into the graph.
+
+    5-phase pipeline:
+    1. Read payload + normalize
+    2. Create DptLegalField + Submission via GraphQL (triggers skeleton)
+    3. Bulk Cypher for People, Matters, Clients, Awards
+    4. Intra-file dedup
+    5. Visibility Cypher
+    """
+    _check_api_key(x_api_key)
+
+    # Import here to avoid startup dependency on neo4j driver.
+    # In Docker: module is at /app/rankellix_import/ (copied by cloudbuild).
+    # In dev: module is at ../../scripts/ relative to this file.
+    _scripts_dir = str(Path(__file__).parent.parent.parent / "scripts")
+    if _scripts_dir not in sys.path:
+        sys.path.insert(0, _scripts_dir)
+    from rankellix_import.executor import execute_import
+
+    graphology_url = os.environ.get("GRAPHOLOGY_URL", "http://localhost:4000")
+    graphql_endpoint = graphology_url + ("/graphql" if not graphology_url.endswith("/graphql") else "")
+    graphql_api_key = os.environ.get("GRAPHOLOGY_API_KEY", "")
+    neo4j_uri = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
+    neo4j_user = os.environ.get("NEO4J_USER", "neo4j")
+    neo4j_password = os.environ.get("NEO4J_PASSWORD", "")
+    neo4j_database = os.environ.get("NEO4J_DATABASE", "neo4j")
+
+    try:
+        result = execute_import(
+            file_id=file_id,
+            neo4j_uri=neo4j_uri,
+            neo4j_user=neo4j_user,
+            neo4j_password=neo4j_password,
+            graphql_endpoint=graphql_endpoint,
+            database=neo4j_database,
+            graphql_api_key=graphql_api_key,
+        )
+        return result
+    except Exception as e:
+        logger.exception("Import failed for file %s", file_id)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# Run Prompt Endpoint
+# ============================================================================
 
 
 @app.post("/run-prompt")

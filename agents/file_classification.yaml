@@ -23,7 +23,7 @@ description: |
 
 settings:
   llm:
-    model: gpt-5.3-chat
+    model: gpt-5.2-chat
     temperature: 1
     max_completion_tokens: 200
 

@@ -1503,13 +1503,27 @@ def create_ai_matter_detail(
     """
     try:
         count_result = _execute_graphql(url, count_query, {"matterId": matter_id}, api_key)
-        details = count_result.get("data", {}).get("matter", [{}])[0].get(relation_field, [])
-        ai_count = sum(1 for d in details if (d.get("version") or "").startswith("AI_"))
-    except Exception:
-        ai_count = 0
+        # _execute_graphql returns data dict directly (already unwrapped from {"data": ...})
+        matters = count_result.get("matter", [])
+        details = matters[0].get(relation_field, []) if matters else []
+        logger.info(f"analysis.create_ai_matter_detail: found {len(details)} details: {[d.get('version') for d in details]}")
+        # Find the max index across ALL AI versions (any date) to avoid duplicates
+        max_index = 0
+        for d in details:
+            v = d.get("version") or ""
+            if v.startswith("AI_"):
+                parts = v.split("_")
+                if len(parts) >= 3:
+                    try:
+                        max_index = max(max_index, int(parts[-1]))
+                    except ValueError:
+                        pass
+    except Exception as e:
+        logger.error(f"analysis.create_ai_matter_detail: count query failed: {e}")
+        max_index = 0
 
     today_str = date.today().strftime("%y%m%d")
-    version = f"AI_{today_str}_{ai_count + 1}"
+    version = f"AI_{today_str}_{max_index + 1}"
 
     # Create the detail node via nested create inside Matter update
     # Same pattern as frontend useSelectColumnState (nested create)

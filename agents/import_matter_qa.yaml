@@ -82,6 +82,15 @@ state_schema:
   save_result: dict            # Result from graphology.save_responses
   execution_ids: list          # Created PromptExecution IDs
 
+  # AI Review pipeline (Stage A→B→C)
+  stage_a_result: dict
+  stage_b_result: dict
+  rewrite_result: dict
+  ai_detail_result: dict
+  persist_a_result: dict
+  persist_b_result: dict
+  persist_c_result: dict
+
 nodes:
   - name: fetch_step_config
     uses: analysis.get_step_config
@@ -203,26 +212,125 @@ nodes:
       graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
     output: finalize_result
 
-  # Node 6: AI Review — rewrite the matter description using Q&A answers
-  # Uses llm.call directly (not sub-agent) for reliable Azure OpenAI execution
-  - name: rewrite_matter
+  # =========================================================================
+  # AI Review Pipeline (Stage A → B → C) — triggered by AI Review button
+  # Uses sequential llm.call for reliable Azure OpenAI execution.
+  # Each stage persists its prompt+response as a PromptExecution node.
+  # =========================================================================
+
+  # Stage A: Q&A — answer all workflow questions in a single LLM call
+  - name: stage_a_qa
+    uses: llm.call
+    with:
+      model: "{{ settings.llm.model }}"
+      system: |
+        You are a legal directory analyst. You will receive a matter description
+        and a list of questions about it. Answer each question based on the matter
+        data provided. If the information is not available, say "Not available from
+        the provided data." Write in the same language as the original matter.
+        Return your answers as a numbered list matching the question numbers.
+      prompt: |
+        MATTER DATA:
+        {{ state.matter_context }}
+
+        QUESTIONS:
+        {% for q in state.fetch_result.questions %}
+        {{ loop.index }}. [{{ q.name }}] {{ q.description or q.content }}
+        {% endfor %}
+
+        Answer each question based on the matter data above.
+    output: stage_a_result
+
+  - name: persist_stage_a
+    uses: graphology.create_node
+    with:
+      node_type: "PromptExecution"
+      properties:
+        llmRequest: "Stage A Q&A — {{ state.fetch_result.questions | length }} questions | detail={{ state.matter_detail_id }} dir={{ state.directory_code }}"
+        llmResponse: "{{ state.stage_a_result.content }}"
+        status: "success"
+        contextNodeId: "{{ state.matter_id or state.context_node_id }}"
+        contextType: "{{ state.directory_code }}"
+        
+      graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
+    output: persist_a_result
+
+  # Stage B: Strategy — analyze Q&A answers and produce a writing strategy
+  - name: stage_b_strategy
+    uses: llm.call
+    with:
+      model: "{{ settings.llm.model }}"
+      system: |
+        You are a legal directory submission strategist. Given a matter description
+        and Q&A analysis, produce a writing strategy for a compelling directory
+        submission. Identify: key strengths to emphasize, complexity and innovation
+        angles, impact evidence, team leadership highlights, and areas where the
+        description needs enrichment. Be specific about WHAT to include and WHY.
+        Write in the same language as the matter.
+      prompt: |
+        ORIGINAL MATTER:
+        {{ state.matter_context }}
+
+        Q&A ANALYSIS (Stage A):
+        {{ state.stage_a_result.content }}
+
+        Produce a detailed writing strategy for rewriting this matter description
+        into a compelling legal directory submission. Focus on concrete improvements.
+    output: stage_b_result
+
+  - name: persist_stage_b
+    uses: graphology.create_node
+    with:
+      node_type: "PromptExecution"
+      properties:
+        llmRequest: "Stage B Strategy | detail={{ state.matter_detail_id }} dir={{ state.directory_code }}"
+        llmResponse: "{{ state.stage_b_result.content }}"
+        status: "success"
+        contextNodeId: "{{ state.matter_id or state.context_node_id }}"
+        contextType: "{{ state.directory_code }}"
+        
+      graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
+    output: persist_b_result
+
+  # Stage C: Rewrite — produce the final matter description using A+B context
+  - name: stage_c_rewrite
     uses: llm.call
     with:
       model: "{{ settings.llm.model }}"
       system: |
         You are a legal directory submission writer. Rewrite the matter description
-        to enrich it with concrete details about complexity, impact, innovation,
-        team leadership, and client service. Write in the same language as the
-        original. Be concise but comprehensive. Return ONLY the rewritten
-        description text, no JSON or headers.
+        following the strategy provided. Use the Q&A answers to add concrete details.
+        Write in the same language as the original. Be concise but comprehensive
+        (4-6 paragraphs). Return ONLY the rewritten description text.
       prompt: |
-        Original matter data:
+        ORIGINAL MATTER:
         {{ state.matter_context }}
 
-        Rewrite the matter description into a compelling legal directory submission.
+        Q&A ANSWERS (Stage A):
+        {{ state.stage_a_result.content }}
+
+        WRITING STRATEGY (Stage B):
+        {{ state.stage_b_result.content }}
+
+        Now rewrite the matter description following the strategy above,
+        incorporating the Q&A insights. Produce a polished submission.
     output: rewrite_result
 
-  # Node 7: Create AI MatterDetail with rewritten description
+  - name: persist_stage_c
+    uses: graphology.create_node
+    with:
+      node_type: "PromptExecution"
+      properties:
+        llmRequest: "Stage C Rewrite | detail={{ state.matter_detail_id }} dir={{ state.directory_code }}"
+        llmResponse: "{{ state.rewrite_result.content }}"
+        status: "success"
+        contextNodeId: "{{ state.matter_id or state.context_node_id }}"
+        contextType: "{{ state.directory_code }}"
+        
+      graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
+    output: persist_c_result
+
+  # Create AI MatterDetail with the rewritten description
   - name: create_ai_detail
     uses: analysis.create_ai_matter_detail
     with:
@@ -264,12 +372,22 @@ edges:
     to: finalize_error
     condition: "{{ not state.save_result or not state.save_result.success }}"
   - from: finalize_success
-    to: rewrite_matter
+    to: stage_a_qa
     condition: "{{ state.directory_code and state.matter_detail_id }}"
   - from: finalize_success
     to: __end__
     condition: "{{ not state.directory_code or not state.matter_detail_id }}"
-  - from: rewrite_matter
+  - from: stage_a_qa
+    to: persist_stage_a
+  - from: persist_stage_a
+    to: stage_b_strategy
+  - from: stage_b_strategy
+    to: persist_stage_b
+  - from: persist_stage_b
+    to: stage_c_rewrite
+  - from: stage_c_rewrite
+    to: persist_stage_c
+  - from: persist_stage_c
     to: create_ai_detail
   - from: create_ai_detail
     to: __end__

@@ -6,7 +6,7 @@ description: |
 
 settings:
   llm:
-    model: gpt-5.3-chat
+    model: gpt-5.2-chat
     temperature: 0.7
   rate_limiters:
     rewrite_llm:
@@ -124,6 +124,17 @@ nodes:
       graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
     output: step_result
 
+  # Create a new [Dir]MatterDetail node with the AI rewrite.
+  # Appears in the versioned tab dropdown with version="AI_YYMMDD_[Index]".
+  - name: create_ai_detail
+    uses: analysis.create_ai_matter_detail
+    with:
+      matter_id: "{{ state.matter_id }}"
+      directory_code: "{{ state.directory_code }}"
+      rewritten_matter: "{{ state.step_result.rewritten_matter or '' }}"
+      graphql_url: "{{ variables.GRAPHOLOGY_URL }}"
+    output: ai_detail_result
+
 edges:
   - from: __start__
     to: fetch_stage_config
@@ -136,6 +147,8 @@ edges:
   - from: run_integrity_audit
     to: post_process
   - from: post_process
+    to: create_ai_detail
+  - from: create_ai_detail
     to: __end__
 
 config:
