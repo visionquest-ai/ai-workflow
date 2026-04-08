@@ -231,7 +231,7 @@ nodes:
         Return your answers as a numbered list matching the question numbers.
       prompt: |
         MATTER DATA:
-        {{ state.matter_context }}
+        {{ state.context_result.matter_context_json if state.context_result else state.matter_context }}
 
         QUESTIONS:
         {% for q in state.fetch_result.questions %}
@@ -269,7 +269,7 @@ nodes:
         Write in the same language as the matter.
       prompt: |
         ORIGINAL MATTER:
-        {{ state.matter_context }}
+        {{ state.context_result.matter_context_json if state.context_result else state.matter_context }}
 
         Q&A ANALYSIS (Stage A):
         {{ state.stage_a_result.content }}
@@ -304,7 +304,7 @@ nodes:
         (4-6 paragraphs). Return ONLY the rewritten description text.
       prompt: |
         ORIGINAL MATTER:
-        {{ state.matter_context }}
+        {{ state.context_result.matter_context_json if state.context_result else state.matter_context }}
 
         Q&A ANSWERS (Stage A):
         {{ state.stage_a_result.content }}

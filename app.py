@@ -244,14 +244,17 @@ def _load_and_run_agent(
             input_state = {
                 "workflow_id": workflow_id,
                 "context_node_id": context_node_id,
-                "matter_context": matter_context,
                 "context_result": node_result,
             }
-            # Pass directory_code and matter_detail_id for AI Review chaining (Stage A→B→C)
-            if directory_code:
-                input_state["directory_code"] = directory_code
+            # When matter_detail_id is provided (AI Review), DON'T pre-populate matter_context.
+            # This forces fetch_context to run, which calls get_matter_context and fetches
+            # Matter + MatterDetail (with description) + Client + Department — full context.
             if matter_detail_id:
                 input_state["matter_detail_id"] = matter_detail_id
+            else:
+                input_state["matter_context"] = matter_context
+            if directory_code:
+                input_state["directory_code"] = directory_code
 
         invoke_config = {"accumulator": agent_accumulator, "batch_id": batch_id}
 
