@@ -1,10 +1,13 @@
 steps:
+  # Copy rankellix_import module into build context
+  - name: 'ubuntu'
+    args: ['cp', '-r', 'scripts/rankellix_import', 'visionQuest/ai-workflow/rankellix_import']
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - build
       - -t
       - us-central1-docker.pkg.dev/rankellix-law/cloud-run-source-deploy/ai-workflow:$BUILD_ID
-      - .
+      - visionQuest/ai-workflow
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - push
@@ -22,7 +25,7 @@ steps:
       - --project
       - rankellix-law
       - --set-secrets
-      - GRAPHOLOGY_URL=GRAPHOLOGY_URL:latest,GRAPHOLOGY_API_KEY=GRAPHOLOGY_API_KEY:latest,RUN_AGENT_API_KEY=RUN_AGENT_API_KEY:latest,LLAMAEXTRACT_API_KEY=LLAMAEXTRACT_API_KEY:latest,AZURE_OPENAI_API_KEY=azure-openai-api-key:latest,AZURE_OPENAI_ENDPOINT=azure-openai-endpoint:latest
+      - GRAPHOLOGY_URL=GRAPHOLOGY_URL:latest,GRAPHOLOGY_API_KEY=GRAPHOLOGY_API_KEY:latest,RUN_AGENT_API_KEY=RUN_AGENT_API_KEY:latest,LLAMAEXTRACT_API_KEY=LLAMAEXTRACT_API_KEY:latest,AZURE_OPENAI_API_KEY=azure-openai-api-key:latest,AZURE_OPENAI_ENDPOINT=azure-openai-endpoint:latest,NEO4J_URI=NEO4J_URI:latest,NEO4J_USER=NEO4J_USER:latest,NEO4J_PASSWORD=NEO4J_PASSWORD:latest,NEO4J_DATABASE=NEO4J_DATABASE:latest
       - --update-env-vars
       - AZURE_OPENAI_DEPLOYMENT=gpt-5.3-chat,OPENAI_API_VERSION=2025-01-01-preview
       - --quiet

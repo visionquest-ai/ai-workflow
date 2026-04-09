@@ -7,6 +7,9 @@ FROM python:3.11.14-slim-trixie
 #   GRAPHOLOGY_API_KEY           - API key for Graphology authentication (required)
 #   LLAMAEXTRACT_API_KEY         - API key for LlamaExtract SDK (required for file extraction)
 #   GOOGLE_APPLICATION_CREDENTIALS - Path to GCS service account JSON (required for GCS access)
+#   NEO4J_URI                    - Neo4j connection URI (required for import pipeline)
+#   NEO4J_USER                   - Neo4j username (required for import pipeline)
+#   NEO4J_PASSWORD               - Neo4j password (required for import pipeline)
 #
 # Optional environment variables:
 #   AGENT_NAME_PREFIX            - Namespace prefix for LlamaExtract agent names (optional)
@@ -28,8 +31,14 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir ./the_edge_agent/python && \
     pip install --no-cache-dir -r requirements.txt
 
+# Install import pipeline deps (neo4j driver + httpx for GraphQL client)
+RUN pip install --no-cache-dir neo4j>=5.0.0 httpx>=0.24.0
+
 # Copy app code (after deps for layer caching) with appuser ownership
 COPY --chown=appuser:appuser . .
+
+# Copy rankellix_import module (copied into build context by cloudbuild.yaml)
+COPY --chown=appuser:appuser rankellix_import/ /app/rankellix_import/
 
 USER appuser
 
