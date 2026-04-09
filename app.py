@@ -967,17 +967,40 @@ def _trigger_matter_analysis(
             f'update: {{ visibilityStatus_SET: true, resolvedStatus_SET: "invalid" }}'
             f') {{ menuElementInstance {{ id type firmId visibilityStatus resolvedStatus }} }}'
         )
+    mei_ids: list[str] = []
+    firm_id: str | None = None
     for batch_start in range(0, len(page_parts), 10):
         batch = page_parts[batch_start:batch_start + 10]
         try:
-            requests.post(
+            resp = requests.post(
                 graphql_endpoint,
                 json={"query": "mutation { " + " ".join(batch) + " }"},
                 headers=headers,
                 timeout=30.0,
-            ).raise_for_status()
+            )
+            resp.raise_for_status()
+            data = resp.json().get("data") or {}
+            for val in data.values():
+                for inst in (val or {}).get("menuElementInstance") or []:
+                    if inst.get("id"):
+                        mei_ids.append(inst["id"])
+                    if not firm_id:
+                        firm_id = inst.get("firmId")
         except Exception as e:
-            logger.warning("Failed to set page loading for batch %d: %s", batch_start, e)
+            logger.warning("Failed to set page visible for batch %d: %s", batch_start, e)
+
+    # Broadcast so subscribed UIs update without refresh
+    if mei_ids and firm_id:
+        ids_str = ", ".join(f'"{mid}"' for mid in mei_ids)
+        try:
+            requests.post(
+                graphql_endpoint,
+                json={"query": f'mutation {{ broadcastMenuInstanceChanges(instanceIds: [{ids_str}], firmId: "{firm_id}") {{ published errors }} }}'},
+                headers=headers, timeout=15.0,
+            )
+        except Exception as e:
+            logger.warning("Broadcast matter page visibility failed: %s", e)
+
     logger.info("Set PAGE visible+invalid on %d matters (via GraphQL)", len(matter_ids))
 
     # Step 2: Look up MatterDetail IDs, then set analysisStatus='pending' +
