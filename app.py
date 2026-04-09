@@ -448,9 +448,9 @@ def _clear_tab_loading_status(
             node: { entityId_EQ: $matterId, type_EQ: "PAGE" }
           }
         }
-        update: { resolvedStatus_SET: "valid" }
+        update: { resolvedStatus_SET: "valid", loadingStatus_SET: false }
       ) {
-        menuElementInstance { id type firmId resolvedStatus }
+        menuElementInstance { id type firmId resolvedStatus loadingStatus }
       }
     }
     """
