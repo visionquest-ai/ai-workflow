@@ -260,31 +260,48 @@ def _load_and_run_agent(
 
         final_state = None
         for event in graph.invoke(input_state, config=invoke_config):
-            logger.info(f"TEA event type: {type(event).__name__}")
+            tea_type = event.get("type") if isinstance(event, dict) else type(event).__name__
+            logger.info(f"TEA event type: {tea_type}")
             final_state = event
 
         agent_state = {}
+        tea_event_type = None
         if final_state and isinstance(final_state, dict):
             # TEA returns {"type": ..., "state": {...}, "output": ...}
-            # The actual agent state is nested under "state" key
-            agent_state = final_state.get("state", final_state)
-            logger.info(f"Agent state keys: {list(agent_state.keys()) if isinstance(agent_state, dict) else 'N/A'}")
+            # "type" is "final" (success) or "error" (exception during execution)
+            tea_event_type = final_state.get("type")
+            agent_state_raw = final_state.get("state")
+            if isinstance(agent_state_raw, dict):
+                agent_state = agent_state_raw
+            else:
+                # Fallback: state not nested (old TEA format)
+                agent_state = final_state
+            logger.info(f"TEA event type: {tea_event_type}, agent state keys: {list(agent_state.keys()) if isinstance(agent_state, dict) else 'N/A'}")
         else:
             logger.warning(f"Unexpected final_state type: {type(final_state)}, value: {str(final_state)[:500]}")
 
-        agent_status = agent_state.get("status", "unknown")
-        agent_error = agent_state.get("error")
+        # Determine success from TEA event type — most reliable signal.
+        # "final" = graph reached __end__ without exception (both finalize_success and
+        # finalize_error paths yield "final"). "error" = unhandled exception in a node.
+        agent_error = None
+        if tea_event_type == "final":
+            agent_status = "success"
+        elif tea_event_type == "error":
+            agent_status = "error"
+            # Error string is in the event dict, not the state dict
+            agent_error = final_state.get("error") or agent_state.get("error")
+        else:
+            # Unknown/missing TEA event type — fall back to state-based inference
+            agent_status = agent_state.get("status", "unknown")
+            agent_error = agent_state.get("error")
+            if agent_status == "unknown" and not agent_error:
+                save_result = agent_state.get("save_result")
+                if save_result and isinstance(save_result, dict) and save_result.get("success"):
+                    agent_status = "success"
+                elif agent_state.get("answers") or agent_state.get("save_result"):
+                    agent_status = "success"
 
-        # Infer success from agent output when no explicit status field exists.
-        # YAML agents like import_matter_qa populate save_result on completion
-        # but do not set a top-level "status" key in state.
-        if agent_status == "unknown" and not agent_error:
-            # Check for evidence of successful completion in agent state
-            save_result = agent_state.get("save_result")
-            if save_result and isinstance(save_result, dict) and save_result.get("success"):
-                agent_status = "success"
-            elif agent_state.get("answers") or agent_state.get("save_result"):
-                agent_status = "success"
+        logger.info(f"Agent status: {agent_status}, error: {agent_error}")
 
         result = {
             "success": agent_status == "success",
@@ -788,25 +805,40 @@ def _load_and_run_prompt(
 
         final_state = None
         for event in graph.invoke(input_state):
-            logger.info(f"TEA event type: {type(event).__name__}")
+            tea_type = event.get("type") if isinstance(event, dict) else type(event).__name__
+            logger.info(f"TEA event type: {tea_type}")
             final_state = event
 
         agent_state = {}
+        tea_event_type = None
         if final_state and isinstance(final_state, dict):
-            agent_state = final_state.get("state", final_state)
-            logger.info(f"Agent state keys: {list(agent_state.keys()) if isinstance(agent_state, dict) else 'N/A'}")
+            tea_event_type = final_state.get("type")
+            agent_state_raw = final_state.get("state")
+            if isinstance(agent_state_raw, dict):
+                agent_state = agent_state_raw
+            else:
+                agent_state = final_state
+            logger.info(f"TEA event type: {tea_event_type}, agent state keys: {list(agent_state.keys()) if isinstance(agent_state, dict) else 'N/A'}")
         else:
             logger.warning(f"Unexpected final_state type: {type(final_state)}, value: {str(final_state)[:500]}")
 
-        agent_status = agent_state.get("status", "unknown")
-        agent_error = agent_state.get("error")
+        agent_error = None
+        if tea_event_type == "final":
+            agent_status = "success"
+        elif tea_event_type == "error":
+            agent_status = "error"
+            agent_error = final_state.get("error") or agent_state.get("error")
+        else:
+            agent_status = agent_state.get("status", "unknown")
+            agent_error = agent_state.get("error")
+            if agent_status == "unknown" and not agent_error:
+                save_result = agent_state.get("save_result")
+                if save_result and isinstance(save_result, dict) and save_result.get("success"):
+                    agent_status = "success"
+                elif agent_state.get("answers") or agent_state.get("save_result"):
+                    agent_status = "success"
 
-        if agent_status == "unknown" and not agent_error:
-            save_result = agent_state.get("save_result")
-            if save_result and isinstance(save_result, dict) and save_result.get("success"):
-                agent_status = "success"
-            elif agent_state.get("answers") or agent_state.get("save_result"):
-                agent_status = "success"
+        logger.info(f"Agent status: {agent_status}, error: {agent_error}")
 
         result = {
             "success": agent_status == "success",
