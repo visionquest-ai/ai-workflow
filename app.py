@@ -350,6 +350,117 @@ def _notify_apollo(job_id: str, status: str, result: str = None, error: str = No
         # Do NOT re-raise — notification failure must not discard job result
 
 
+# Directory code → tab name mapping for clearing loading status after agent completes
+_DIRECTORY_CODE_TO_TAB_NAME: dict[str, str] = {
+    "CH": "C&P Details",
+    "ITR": "ITR Details",
+    "IFLR": "IFLR Details",
+    "L500": "L500 Details",
+    "LL": "LL Details",
+}
+
+
+def _set_tab_loading_status(
+    matter_id: str,
+    directory_code: str,
+):
+    """Set resolvedStatus='loading' on the directory details tab when AI agent starts."""
+    tab_name = _DIRECTORY_CODE_TO_TAB_NAME.get(directory_code)
+    if not tab_name:
+        return
+
+    query = """
+    mutation SetTabLoading($matterId: String!, $tabName: String!) {
+      updateMenuElementInstance(
+        where: {
+          type_EQ: "TAB"
+          name_EQ: $tabName
+          hasChildMenuElementFromConnection_SOME: {
+            node: { entityId_EQ: $matterId, type_EQ: "PAGE" }
+          }
+        }
+        update: { resolvedStatus_SET: "loading" }
+      ) {
+        menuElementInstance { id type firmId resolvedStatus }
+      }
+    }
+    """
+    try:
+        response = requests.post(
+            os.environ["GRAPHOLOGY_URL"],
+            json={
+                "query": query,
+                "variables": {"matterId": matter_id, "tabName": tab_name},
+            },
+            headers={
+                "X-API-Key": os.environ["GRAPHOLOGY_API_KEY"],
+                "Content-Type": "application/json",
+            },
+            timeout=10.0,
+        )
+        response.raise_for_status()
+        data = response.json()
+        updated = data.get("data", {}).get("updateMenuElementInstance", {}).get("menuElementInstance", [])
+        if updated:
+            logger.info("Set loading on tab '%s' for matter %s", tab_name, matter_id[:8])
+    except Exception as e:
+        logger.warning("Failed to set tab loading for matter %s: %s", matter_id[:8], e)
+
+
+def _clear_tab_loading_status(
+    matter_id: str,
+    directory_code: str,
+):
+    """Clear resolvedStatus='loading' on the directory details tab after AI agent completes.
+
+    Finds the matter's PAGE MenuElementInstance, then its child TAB matching
+    the directory details name, and sets resolvedStatus='valid'.
+    """
+    tab_name = _DIRECTORY_CODE_TO_TAB_NAME.get(directory_code)
+    if not tab_name:
+        return
+
+    # Single query+mutation: find the tab by matter entityId + tab name, then update
+    query = """
+    mutation ClearTabLoading($matterId: String!, $tabName: String!) {
+      updateMenuElementInstance(
+        where: {
+          type_EQ: "TAB"
+          name_EQ: $tabName
+          hasChildMenuElementFromConnection_SOME: {
+            node: { entityId_EQ: $matterId, type_EQ: "PAGE" }
+          }
+        }
+        update: { resolvedStatus_SET: "valid" }
+      ) {
+        menuElementInstance { id type firmId resolvedStatus }
+      }
+    }
+    """
+    try:
+        response = requests.post(
+            os.environ["GRAPHOLOGY_URL"],
+            json={
+                "query": query,
+                "variables": {"matterId": matter_id, "tabName": tab_name},
+            },
+            headers={
+                "X-API-Key": os.environ["GRAPHOLOGY_API_KEY"],
+                "Content-Type": "application/json",
+            },
+            timeout=10.0,
+        )
+        response.raise_for_status()
+        data = response.json()
+        updated = data.get("data", {}).get("updateMenuElementInstance", {}).get("menuElementInstance", [])
+        if updated:
+            logger.info("Cleared loading status on tab '%s' for matter %s", tab_name, matter_id[:8])
+        else:
+            logger.debug("No tab '%s' found for matter %s (may not exist)", tab_name, matter_id[:8])
+    except Exception as e:
+        logger.warning("Failed to clear tab loading status for matter %s: %s", matter_id[:8], e)
+
+
 def _run_agent_job(
     job_id: str,
     agent: str,
@@ -378,6 +489,11 @@ def _run_agent_job(
 
     with _job_lock:
         _job_store[job_id]["status"] = JobStatus.RUNNING
+
+    # Set directory detail tab to "loading" when AI agent starts
+    if directory_code and context_node_id:
+        _set_tab_loading_status(context_node_id, directory_code)
+
     try:
         result = _load_and_run_agent(
             agent=agent,
@@ -410,6 +526,9 @@ def _run_agent_job(
             "success",
             result=json.dumps({"completed": True, "contextNodeId": context_node_id}),
         )
+        # Clear the loading status on the directory details tab
+        if directory_code and context_node_id:
+            _clear_tab_loading_status(context_node_id, directory_code)
     else:
         _notify_apollo(apollo_job_id, "error", error=result.get("error", "Unknown error"))
 
@@ -780,6 +899,114 @@ class ImportRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+def _trigger_matter_analysis(
+    matter_ids: list[str],
+    directory_code: str,
+    graphql_endpoint: str,
+    graphql_api_key: str,
+):
+    """Trigger AI analysis for imported matters.
+
+    1. Set matter PAGEs to resolvedStatus='loading' via GraphQL (user sees page-level spinner)
+    2. Set analysisStatus='pending' on each matter (triggers Apollo AI Workflow Middleware)
+
+    Tab-level loading is the AI workflow's responsibility (set on agent start, clear on complete).
+    """
+    headers = {
+        "X-API-Key": graphql_api_key,
+        "Content-Type": "application/json",
+    }
+
+    # Step 1: Set matter PAGE instances to visible + loading via GraphQL (single batch)
+    page_parts = []
+    for i, mid in enumerate(matter_ids):
+        page_parts.append(
+            f'p{i}: updateMenuElementInstance('
+            f'where: {{ entityId_EQ: "{mid}", type_EQ: "PAGE" }}, '
+            f'update: {{ visibilityStatus_SET: true, resolvedStatus_SET: "invalid" }}'
+            f') {{ menuElementInstance {{ id type firmId visibilityStatus resolvedStatus }} }}'
+        )
+    for batch_start in range(0, len(page_parts), 10):
+        batch = page_parts[batch_start:batch_start + 10]
+        try:
+            requests.post(
+                graphql_endpoint,
+                json={"query": "mutation { " + " ".join(batch) + " }"},
+                headers=headers,
+                timeout=30.0,
+            ).raise_for_status()
+        except Exception as e:
+            logger.warning("Failed to set page loading for batch %d: %s", batch_start, e)
+    logger.info("Set PAGE visible+invalid on %d matters (via GraphQL)", len(matter_ids))
+
+    # Step 2: Look up MatterDetail IDs, then set analysisStatus='pending' +
+    # pendingAnalysisMatterDetailId on each matter (one-by-one, NOT aliased).
+    # The Apollo Trigger Middleware needs pendingAnalysisMatterDetailId to resolve
+    # the dispatch path, and cannot parse aliased mutation names.
+    _DIR_CODE_TO_DETAIL_RELATION = {
+        "CH": "matterHasCpDetail",
+        "ITR": "matterHasItrDetail",
+        "IFLR": "matterHasIflrDetail",
+        "L500": "matterHasL500Detail",
+        "LL": "matterHasLlDetail",
+    }
+    detail_relation = _DIR_CODE_TO_DETAIL_RELATION.get(directory_code)
+
+    # Batch-query all matter detail IDs in one request
+    detail_ids: dict[str, str] = {}
+    if detail_relation:
+        parts = []
+        for i, mid in enumerate(matter_ids):
+            parts.append(f'm{i}: matter(where: {{ id_EQ: "{mid}" }}) {{ {detail_relation} {{ id }} }}')
+        for batch_start in range(0, len(parts), 10):
+            batch = parts[batch_start:batch_start + 10]
+            try:
+                resp = requests.post(
+                    graphql_endpoint,
+                    json={"query": "{ " + " ".join(batch) + " }"},
+                    headers=headers,
+                    timeout=30.0,
+                )
+                resp.raise_for_status()
+                data = resp.json().get("data", {})
+                for i, mid in enumerate(matter_ids[batch_start:batch_start + len(batch)]):
+                    details = data.get(f"m{i}", [{}])
+                    if details:
+                        detail_list = details[0].get(detail_relation, [])
+                        if detail_list:
+                            detail_ids[mid] = detail_list[0]["id"]
+            except Exception as e:
+                logger.warning("Failed to query matter details for batch %d: %s", batch_start, e)
+
+    # Trigger analysis one-by-one
+    triggered = 0
+    for mid in matter_ids:
+        detail_id = detail_ids.get(mid)
+        update_fields = 'analysisStatus_SET: "pending"'
+        if detail_id:
+            update_fields += f', pendingAnalysisMatterDetailId_SET: "{detail_id}", pendingAnalysisDirectoryCode_SET: "{directory_code}"'
+        query = f"""mutation {{
+            updateMatter(
+                where: {{ id_EQ: "{mid}" }}
+                update: {{ {update_fields} }}
+            ) {{ matter {{ id analysisStatus }} }}
+        }}"""
+        try:
+            resp = requests.post(
+                graphql_endpoint,
+                json={"query": query},
+                headers=headers,
+                timeout=30.0,
+            )
+            resp.raise_for_status()
+            triggered += 1
+        except Exception as e:
+            logger.warning("Failed to trigger analysis for matter %s: %s", mid[:8], e)
+
+    if triggered:
+        logger.info("Triggered AI analysis for %d/%d matters (%d with detail IDs)", triggered, len(matter_ids), len(detail_ids))
+
+
 @app.post("/api/import/{file_id}")
 def import_file(
     file_id: str,
@@ -823,6 +1050,18 @@ def import_file(
             database=neo4j_database,
             graphql_api_key=graphql_api_key,
         )
+
+        # Trigger AI matter analysis by setting analysisStatus="pending" on each matter.
+        # This fires a GraphQL updateMatter mutation which the Apollo AI Workflow
+        # Trigger Middleware intercepts (PROPERTY_CHANGED on analysisStatus) and
+        # dispatches /run-agent with the matter_rewrite agent.
+        matter_ids = result.get("matterIds") or []
+        directory = result.get("directory", "")
+        dir_to_code = {"chambers": "CH", "itr": "ITR", "iflr1000": "IFLR", "legal500": "L500", "leadersleague": "LL"}
+        dir_code = dir_to_code.get(directory.lower().strip(), "")
+        if matter_ids and result.get("success") and dir_code:
+            _trigger_matter_analysis(matter_ids, dir_code, graphql_endpoint, graphql_api_key)
+
         return result
     except Exception as e:
         logger.exception("Import failed for file %s", file_id)
