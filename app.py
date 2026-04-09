@@ -899,6 +899,47 @@ class ImportRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+# Content fields per directory (excluding metadata) — used for change detection.
+_DETAIL_CONTENT_FIELDS: dict[str, str] = {
+    "CH":   "matterDescription summary firmRoleAndOutput clientRole otherInformation whyHighlight ranking feedback otherLawyers innovationOrImpactReason impactAwardNomination description",
+    "ITR":  "matterDescription summary firmRoleAndOutput clientRole otherInformation whyHighlight ranking feedback otherLawyers innovationOrImpactReason impactAwardNomination specialisms description",
+    "IFLR": "matterDescription summary firmRoleAndOutput clientRole otherInformation whyHighlight ranking feedback otherLawyers innovationOrImpactReason nominateForIflrAwards leadOrLocalCounsel dealDescription description",
+    "L500": "matterDescription summary firmRoleAndOutput clientRole otherInformation whyHighlight ranking feedback otherLawyers innovationOrImpactReason crossBorderStatus description",
+    "LL":   "matterDescription summary firmRoleAndOutput clientRole otherInformation whyHighlight ranking feedback otherLawyers innovationOrImpactReason pressCoverage description",
+}
+_DETAIL_METADATA = {"id", "version", "createdAt", "updatedAt", "lastEditedAt", "createdByUid", "lastEditedByUid"}
+
+
+def _content_fingerprint(detail: dict) -> str:
+    """Stable hash of a MatterDetail's content fields (metadata excluded)."""
+    import json
+    entries = sorted(
+        (k, v) for k, v in detail.items()
+        if k not in _DETAIL_METADATA and v not in (None, "", [])
+    )
+    return json.dumps(entries)
+
+
+def _matter_data_changed(analysisStatus: str | None, details: list[dict]) -> bool:
+    """Return True if AI analysis should be triggered for this matter.
+
+    Logic mirrors TypeScript matter-change-detector.ts:
+    - No details → skip (nothing to analyze)
+    - First import (no analysisStatus) OR single import detail → trigger
+    - Multiple import details → compare newest vs previous fingerprint
+    """
+    import_details = sorted(
+        [d for d in details if not (d.get("version") or "").startswith("AI_")],
+        key=lambda d: d.get("createdAt") or "",
+        reverse=True,  # newest first
+    )
+    if not import_details:
+        return False
+    if not analysisStatus or len(import_details) <= 1:
+        return True
+    return _content_fingerprint(import_details[0]) != _content_fingerprint(import_details[1])
+
+
 def _trigger_matter_analysis(
     matter_ids: list[str],
     directory_code: str,
@@ -952,12 +993,20 @@ def _trigger_matter_analysis(
     }
     detail_relation = _DIR_CODE_TO_DETAIL_RELATION.get(directory_code)
 
-    # Batch-query all matter detail IDs in one request
-    detail_ids: dict[str, str] = {}
+    # Batch-query matter details (ID + content fields) and analysisStatus for change detection
+    content_fields = _DETAIL_CONTENT_FIELDS.get(directory_code, "")
+    detail_fields = f"id version createdAt {content_fields}".strip()
+
+    detail_ids: dict[str, str] = {}       # matter_id → newest detail id
+    skip_ids: set[str] = set()            # matter_ids where content is unchanged
+
     if detail_relation:
         parts = []
         for i, mid in enumerate(matter_ids):
-            parts.append(f'm{i}: matter(where: {{ id_EQ: "{mid}" }}) {{ {detail_relation} {{ id }} }}')
+            parts.append(
+                f'm{i}: matter(where: {{ id_EQ: "{mid}" }}) '
+                f'{{ analysisStatus {detail_relation} {{ {detail_fields} }} }}'
+            )
         for batch_start in range(0, len(parts), 10):
             batch = parts[batch_start:batch_start + 10]
             try:
@@ -970,17 +1019,32 @@ def _trigger_matter_analysis(
                 resp.raise_for_status()
                 data = resp.json().get("data", {})
                 for i, mid in enumerate(matter_ids[batch_start:batch_start + len(batch)]):
-                    details = data.get(f"m{i}", [{}])
+                    matters = data.get(f"m{i}", [])
+                    if not matters:
+                        continue
+                    matter = matters[0]
+                    analysis_status = matter.get("analysisStatus")
+                    details = matter.get(detail_relation) or []
                     if details:
-                        detail_list = details[0].get(detail_relation, [])
-                        if detail_list:
-                            detail_ids[mid] = detail_list[0]["id"]
+                        # Newest non-AI detail by createdAt
+                        import_details = sorted(
+                            [d for d in details if not (d.get("version") or "").startswith("AI_")],
+                            key=lambda d: d.get("createdAt") or "",
+                            reverse=True,
+                        )
+                        if import_details:
+                            detail_ids[mid] = import_details[0]["id"]
+                    if not _matter_data_changed(analysis_status, details):
+                        skip_ids.add(mid)
+                        logger.info("Matter %s: content unchanged — skipping AI trigger", mid[:8])
             except Exception as e:
                 logger.warning("Failed to query matter details for batch %d: %s", batch_start, e)
 
-    # Trigger analysis one-by-one
+    # Trigger analysis one-by-one (skip unchanged matters)
     triggered = 0
     for mid in matter_ids:
+        if mid in skip_ids:
+            continue
         detail_id = detail_ids.get(mid)
         update_fields = 'analysisStatus_SET: "pending"'
         if detail_id:
