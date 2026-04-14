@@ -996,8 +996,8 @@ def _trigger_matter_analysis(
         page_parts.append(
             f'p{i}: updateMenuElementInstance('
             f'where: {{ entityId_EQ: "{mid}", type_EQ: "PAGE" }}, '
-            f'update: {{ visibilityStatus_SET: true, resolvedStatus_SET: "invalid" }}'
-            f') {{ menuElementInstance {{ id type firmId visibilityStatus resolvedStatus }} }}'
+            f'update: {{ visibilityStatus_SET: true, resolvedStatus_SET: "valid", loadingStatus_SET: false }}'
+            f') {{ menuElementInstance {{ id type firmId visibilityStatus resolvedStatus loadingStatus }} }}'
         )
     mei_ids: list[str] = []
     firm_id: str | None = None
@@ -1033,7 +1033,65 @@ def _trigger_matter_analysis(
         except Exception as e:
             logger.warning("Broadcast matter page visibility failed: %s", e)
 
-    logger.info("Set PAGE visible+invalid on %d matters (via GraphQL)", len(matter_ids))
+    logger.info("Set PAGE visible+valid on %d matters (via GraphQL)", len(matter_ids))
+
+    # Step 1b: Set Matters PARENT (collection) to loadingStatus=false, lockedStatus=false,
+    # resolvedStatus="invalid" — signals "new unreviewed data" up the menu tree.
+    # Then broadcast cascade so subscribed UIs update immediately.
+    parent_ids: list[str] = []
+    if mei_ids:
+        ids_str_mei = ", ".join(f'"{mid}"' for mid in mei_ids)
+        try:
+            resp = requests.post(
+                graphql_endpoint,
+                json={"query": f'{{ menuElementInstance(where: {{ hasChildMenuElement_SOME: {{ id_IN: [{ids_str_mei}] }} }}) {{ id firmId }} }}'},
+                headers=headers,
+                timeout=15.0,
+            )
+            resp.raise_for_status()
+            parents = resp.json().get("data", {}).get("menuElementInstance", [])
+            for p in parents:
+                parent_ids.append(p["id"])
+                if not firm_id:
+                    firm_id = p.get("firmId")
+        except Exception as e:
+            logger.warning("Failed to query matter parent instances: %s", e)
+
+    if parent_ids:
+        parent_parts = []
+        for i, pid in enumerate(parent_ids):
+            parent_parts.append(
+                f'q{i}: updateMenuElementInstance('
+                f'where: {{ id_EQ: "{pid}" }}, '
+                f'update: {{ loadingStatus_SET: false, lockedStatus_SET: false, resolvedStatus_SET: "invalid" }}'
+                f') {{ menuElementInstance {{ id type firmId resolvedStatus loadingStatus lockedStatus }} }}'
+            )
+        for batch_start in range(0, len(parent_parts), 10):
+            batch = parent_parts[batch_start:batch_start + 10]
+            try:
+                resp = requests.post(
+                    graphql_endpoint,
+                    json={"query": "mutation { " + " ".join(batch) + " }"},
+                    headers=headers,
+                    timeout=30.0,
+                )
+                resp.raise_for_status()
+            except Exception as e:
+                logger.warning("Failed to update matter parent instances: %s", e)
+
+        # Cascade broadcast to parent instances
+        if firm_id:
+            parent_ids_str = ", ".join(f'"{pid}"' for pid in parent_ids)
+            try:
+                requests.post(
+                    graphql_endpoint,
+                    json={"query": f'mutation {{ broadcastMenuInstanceChanges(instanceIds: [{parent_ids_str}], firmId: "{firm_id}") {{ published errors }} }}'},
+                    headers=headers, timeout=15.0,
+                )
+            except Exception as e:
+                logger.warning("Broadcast matter parent cascade failed: %s", e)
+
+        logger.info("Set PARENT instances to loading=false, locked=false, resolved=invalid for %d parents", len(parent_ids))
 
     # Step 2: Look up MatterDetail IDs, then set analysisStatus='pending' +
     # pendingAnalysisMatterDetailId on each matter (one-by-one, NOT aliased).

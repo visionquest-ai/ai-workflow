@@ -107,13 +107,16 @@ def _execute_graphql(url: str, query: str, variables: dict = None, api_key: str 
         payload["variables"] = variables
 
     headers = {"Content-Type": "application/json"}
-    # Try OIDC first, fall back to API key
+    # Try OIDC first (for firebase+oidc mode servers)
     try:
         from auth.identity_token import get_auth_header
         headers.update(get_auth_header(url))
     except Exception:
-        if api_key:
-            headers["x-api-key"] = api_key
+        pass
+    # Always include API key if available — required when server is in apikey mode.
+    # Safe in oidc mode too: the server ignores x-api-key when Authorization is present.
+    if api_key:
+        headers["x-api-key"] = api_key
 
     try:
         response = requests.post(
