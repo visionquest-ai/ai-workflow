@@ -40,18 +40,23 @@ variables:
     chambers:
       extraction_mode: balanced
       agent_base_name: chambers-partners
+      config_suffix: default
     iflr1000:
       extraction_mode: balanced
       agent_base_name: iflr-1000
+      config_suffix: default
     legal500:
       extraction_mode: premium
       agent_base_name: the-legal-500
+      config_suffix: default
     itr:
       extraction_mode: balanced
       agent_base_name: itr-world-tax
+      config_suffix: default
     leadersleague:
       extraction_mode: balanced
       agent_base_name: leaders-league
+      config_suffix: default
 
   # Aliases — map alternate directory names to a key above
   directory_aliases:
@@ -69,6 +74,7 @@ state_schema:
   file_name: str             # Original filename from node data
   year: str                  # Year from node data (fast path for year detection)
   file_mime_type: str        # MIME type of the file
+  config_suffix: str         # Config file suffix used (default, per_table_row, etc.)
   agent_name_used: str       # Resolved LlamaExtract agent name
   extraction_agent_id: str   # Resolved LlamaExtract agent ID (from agent_name_used)
   extraction_job_id: str     # Async extraction job ID (from submit_job)
@@ -710,7 +716,9 @@ nodes:
               "completed": True
           }
 
-      # Build agent name: [prefix-]rankellix-{base_name}-{mode}
+      # Build agent name: [prefix-]rankellix-{base_name}-{mode}[-{config_suffix}]
+      config_suffix = dir_entry.get("config_suffix", "default")
+
       prefix = os.environ.get("AGENT_NAME_PREFIX", "").strip()
       if prefix and not re.match(r'^[a-z0-9-]+$', prefix):
           _set_failed()
@@ -726,7 +734,11 @@ nodes:
       else:
           agent_name = f"rankellix-{base_name}-{extraction_mode}"
 
-      return {"agent_name_used": agent_name, "status": "agent_selected"}
+      # Append config suffix for non-default configs (underscores → hyphens)
+      if config_suffix != "default":
+          agent_name = f"{agent_name}-{config_suffix.replace('_', '-')}"
+
+      return {"agent_name_used": agent_name, "config_suffix": config_suffix, "status": "agent_selected"}
 
   # Step 4a: Resolve LlamaExtract agent name → agent ID (required for async submit_job)
   - name: resolve_extraction_agent
